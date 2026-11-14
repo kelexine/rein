@@ -7,6 +7,8 @@
 
 /// In-process event-sourced agent loop.
 pub mod agent;
+/// Built-in slash commands and `~/.rein/skills` + `<workspace>/.rein/skills` loader.
+pub mod commands;
 /// Dual-scope (`~/.rein` and `<workspace>/.rein`) config and command allowlist loader.
 pub mod config;
 /// Mode profiles, context strategy, and runtime switcher.
@@ -103,13 +105,18 @@ fn run_interactive(
     let sandbox_label = format_sandbox_label(policy.sandbox_status());
     let anthropic_cfg = loaded.config.to_anthropic_config();
     let model_label = anthropic_cfg.model.clone();
+    let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
     let event_log = EventLog::new(&loaded.paths.session_log);
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)
-        .with_allowed_commands(loaded.allowed_commands)
+        .with_full_transcript_path(&loaded.paths.full_transcript)
+        .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(mcp_tools);
     let mut provider = AnthropicProvider::new(anthropic_cfg);
-    let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label);
+    let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
+        .with_slash_registry(slash_registry)
+        .with_configured_commands(loaded.allowed_commands)
+        .with_mcp_servers(loaded.config.mcp_servers);
 
     if resume {
         app.extend_transcript(agent.hydrate_from_log()?);

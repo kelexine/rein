@@ -2,13 +2,15 @@
 // Date: 2026-11-14
 // Purpose: In-process typestate agent loop wiring ContextBuilder, Provider, PolicyEngine, and ToolRegistry
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 use rein_core::{
-    EventLog, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent, ToolCall,
-    ToolSpec, Turn,
+    EventLog, MemoryScope, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent,
+    ToolCall, ToolSpec, Turn,
 };
 use rein_policy::{PolicyDecision, PolicyEngine};
-use rein_tools::{JsonlMemoryStore, ToolRegistry, ToolSchema};
+use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema};
 
 use crate::modes::{ContextBuilder, ModeManager, Profile};
 
@@ -30,6 +32,7 @@ pub trait ApprovalPrompter {
 /// Coordinates the single-process agent turn loop across Core, Policy, Tools, and Modes.
 pub struct AgentLoop {
     event_log: EventLog,
+    full_transcript_path: Option<PathBuf>,
     policy: PolicyEngine,
     registry: ToolRegistry,
     memory: JsonlMemoryStore,
@@ -52,6 +55,7 @@ impl AgentLoop {
         let allowed_commands = initial_profile.policy_rules.allowed_commands.clone();
         Self {
             event_log,
+            full_transcript_path: None,
             policy,
             registry,
             memory,
@@ -60,6 +64,19 @@ impl AgentLoop {
             allowed_commands,
             extra_tools: Vec::new(),
         }
+    }
+
+    /// Configures persistent append-only `full-transcript.jsonl` archive preserved across `/compact`.
+    #[must_use]
+    pub fn with_full_transcript_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.full_transcript_path = Some(path.into());
+        self
+    }
+
+    /// Returns the configured full uncompacted transcript path, if any.
+    #[must_use]
+    pub fn full_transcript_path(&self) -> Option<&Path> {
+        self.full_transcript_path.as_deref()
     }
 
     /// Configures persistent allowlisted shell commands merged from global + repo `commands.json`.
@@ -100,12 +117,77 @@ impl AgentLoop {
             ModeId::Coding => ModeId::Personal,
             ModeId::Personal => ModeId::Coding,
         };
-        let next = self.build_profile(next_mode);
+        self.set_mode(next_mode)
+    }
+
+    /// Switches explicitly to `target_mode` (no-op if already active).
+    pub fn set_mode(&mut self, target_mode: ModeId) -> Result<ModeId> {
+        if self.modes.active().mode == target_mode {
+            return Ok(target_mode);
+        }
+        let next = self.build_profile(target_mode);
         let switched = self
             .modes
             .switch_to(next, &mut self.policy, &self.event_log)
             .context("failed to switch mode profile")?;
         Ok(switched)
+    }
+
+    /// Clears active in-memory conversation history (`full-transcript.jsonl` stays preserved).
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Queries the dual-scope memory store for `scope` and substring `query`.
+    pub fn query_memory(&self, scope: MemoryScope, query: &str) -> Result<Vec<MemoryRecord>> {
+        self.memory
+            .query(scope, query)
+            .context("failed to query memory store")
+    }
+
+    /// Summarizes active conversation via `provider` with zero trimming, referencing `full-transcript.jsonl`.
+    pub fn compact_with_provider(
+        &mut self,
+        focus: Option<&str>,
+        provider: &mut dyn Provider,
+    ) -> Result<String> {
+        if self.history.is_empty() {
+            return Ok("Nothing to compact yet.".to_owned());
+        }
+        let prior_count = self.history.len();
+        let digest = format_history_for_summary(&self.history, focus);
+        let events = provider.stream_turn(
+            COMPACT_SYSTEM_PROMPT,
+            &[Message::new(Role::User, digest)],
+            &[],
+        )?;
+        let summary: String = events
+            .into_iter()
+            .filter_map(|ev| match ev {
+                ProviderStreamEvent::TextDelta(delta) => Some(delta),
+                _ => None,
+            })
+            .collect();
+        let summary = summary.trim();
+        if summary.is_empty() {
+            bail!("provider returned empty compaction summary; history left unchanged");
+        }
+
+        let archive_note = self
+            .full_transcript_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".rein/full-transcript.jsonl".to_owned());
+        let compacted = Message::new(
+            Role::User,
+            format!(
+                "[Compacted summary of {prior_count} prior messages; complete verbatim turns are archived in `{archive_note}` and can be inspected anytime with `read` or `grep`]\n\n{summary}"
+            ),
+        );
+        self.history = vec![compacted];
+        Ok(format!(
+            "compacted {prior_count} messages via provider (archive: {archive_note})"
+        ))
     }
 
     /// Hydrates conversation history, active mode, and clean display transcript lines from `session.jsonl`.
@@ -160,7 +242,9 @@ impl AgentLoop {
         provider: &mut dyn Provider,
         prompter: &mut dyn ApprovalPrompter,
     ) -> Result<String> {
-        self.history.push(Message::new(Role::User, prompt));
+        let user_msg = Message::new(Role::User, prompt);
+        record_full_message(self.full_transcript_path.as_deref(), &user_msg)?;
+        self.history.push(user_msg);
         let mut final_text = String::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
@@ -202,11 +286,13 @@ impl AgentLoop {
             if requested_calls.is_empty() {
                 let (_idle, msg) = streaming.finish_response()?;
                 final_text = msg.content.clone();
+                record_full_message(self.full_transcript_path.as_deref(), &msg)?;
                 self.history.push(msg);
                 return Ok(final_text);
             }
             execute_tool_batch(
                 streaming,
+                self.full_transcript_path.as_deref(),
                 &self.policy,
                 &self.registry,
                 &self.modes,
@@ -256,6 +342,7 @@ impl AgentLoop {
 #[allow(clippy::too_many_arguments)]
 fn execute_tool_batch(
     streaming: Turn<'_, rein_core::Streaming>,
+    full_transcript_path: Option<&Path>,
     policy: &PolicyEngine,
     registry: &ToolRegistry,
     modes: &ModeManager,
@@ -266,6 +353,7 @@ fn execute_tool_batch(
 ) -> Result<()> {
     let mut assistant_msg = Message::new(Role::Assistant, streamed_text);
     assistant_msg.tool_calls = calls.clone();
+    record_full_message(full_transcript_path, &assistant_msg)?;
     history.push(assistant_msg);
 
     let mut iter = calls.into_iter();
@@ -274,6 +362,7 @@ fn execute_tool_batch(
     };
     let mut idle = execute_awaiting(
         streaming.request_tool(first)?,
+        full_transcript_path,
         policy,
         registry,
         modes,
@@ -283,6 +372,7 @@ fn execute_tool_batch(
     for call in iter {
         idle = execute_awaiting(
             idle.request_tool(call)?,
+            full_transcript_path,
             policy,
             registry,
             modes,
@@ -295,6 +385,7 @@ fn execute_tool_batch(
 
 fn execute_awaiting<'a>(
     awaiting: Turn<'a, rein_core::AwaitingPolicy>,
+    full_transcript_path: Option<&Path>,
     policy: &PolicyEngine,
     registry: &ToolRegistry,
     modes: &ModeManager,
@@ -325,8 +416,50 @@ fn execute_awaiting<'a>(
 
     let mut tool_msg = Message::new(Role::Tool, output.content);
     tool_msg.tool_calls.push(call);
+    record_full_message(full_transcript_path, &tool_msg)?;
     history.push(tool_msg);
     Ok(idle)
+}
+
+const COMPACT_SYSTEM_PROMPT: &str = "Summarize the conversation faithfully for context continuity. Preserve file paths, symbols, decisions, constraints, tool outcomes, and open tasks without inventing facts.";
+
+fn record_full_message(path: Option<&Path>, message: &Message) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    EventLog::new(path)
+        .append(&SessionEvent::MessageRecorded {
+            message: message.clone(),
+        })
+        .context("failed to append to full-transcript.jsonl")
+}
+
+fn format_history_for_summary(history: &[Message], focus: Option<&str>) -> String {
+    let mut out = String::from("Summarize every important detail from this conversation:\n\n");
+    if let Some(focus_text) = focus.filter(|f| !f.trim().is_empty()) {
+        out.push_str("Focus especially on: ");
+        out.push_str(focus_text.trim());
+        out.push_str("\n\n");
+    }
+    for msg in history {
+        let role_label = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool",
+            Role::System => "System",
+        };
+        out.push_str(role_label);
+        if !msg.tool_calls.is_empty() {
+            let names: Vec<_> = msg.tool_calls.iter().map(|c| c.name.as_str()).collect();
+            out.push_str(" [tools: ");
+            out.push_str(&names.join(", "));
+            out.push(']');
+        }
+        out.push_str(": ");
+        out.push_str(&msg.content);
+        out.push('\n');
+    }
+    out
 }
 
 /// Formats a compact 1-line tool indicator shown inline in the TUI transcript.
@@ -531,6 +664,53 @@ mod tests {
             "confirm?",
         );
         assert!(confirm_msg.contains("edit foo.rs (-bar() / +baz())"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn compacts_via_provider_while_keeping_full_transcript_archive() -> Result<()> {
+        let dir = std::env::temp_dir().join("rein_compact_full_transcript_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let events = vec![
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "first answer"),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "concise summary of first answer"),
+            },
+        ];
+        let mut replay = ReplayProvider::from_events(&events);
+        let sandbox = WorkspaceSandbox::new(&dir);
+        let profile = Profile::coding();
+        let policy = PolicyEngine::new(
+            profile.policy_rules.clone(),
+            sandbox,
+            AuditLog::new(dir.join("audit.jsonl")),
+        );
+        let full_path = dir.join("full-transcript.jsonl");
+        let mut agent = AgentLoop::new(
+            EventLog::new(dir.join("session.jsonl")),
+            policy,
+            ToolRegistry::new(),
+            JsonlMemoryStore::new(dir.join("memory.jsonl")),
+            profile,
+        )
+        .with_full_transcript_path(&full_path);
+
+        let mut prompter = RecordingPrompter::new();
+        let _ = agent.run_user_prompt("first question", &mut replay, &mut prompter)?;
+        let status = agent.compact_with_provider(None, &mut replay)?;
+        assert!(status.contains("compacted 2 messages"));
+        assert_eq!(agent.history().len(), 1);
+        assert!(agent.history()[0].content.contains("concise summary"));
+        assert!(agent.history()[0].content.contains("full-transcript.jsonl"));
+
+        let archived = EventLog::new(&full_path).read_all()?;
+        assert_eq!(archived.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

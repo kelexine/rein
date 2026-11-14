@@ -14,7 +14,7 @@ Rein separates tool execution from model reasoning with an explicit typestate tu
   - Coding: `read`, `write`, `edit`, `glob`, `grep`, `shell` (supports structured `program`/`args` or `command` pipelines).
   - Personal: `memory` (dual Project + Personal JSONL stores), `notes`, `calendar` (RFC 5545 `.ics` export + directory sync), `email` (JSONL spool + Maildir `new/` & `cur/`).
   - External: JSON-RPC 2.0 stdio `mcp` client with automatic `tools/list` discovery.
-- **Minimalist Borderless TUI** (`rein`): Full-bleed scrolling transcript, non-blocking scoped-thread background streaming, inline `write`/`edit` `[y/n]` confirmation previews, `Tab` mode switching (`coding` / `personal`), and `--resume`.
+- **Minimalist Borderless TUI** (`rein`): Full-bleed scrolling transcript, inline `/slash` autocomplete menu (built-ins + `~/.rein/skills/` & `.rein/skills/` `SKILL.md` activation), non-blocking scoped-thread background streaming, inline `write`/`edit` `[y/n]` confirmation previews, `Tab` mode switching (`coding` / `personal`), `--resume`, and `/compact` summarization preserving `.rein/full-transcript.jsonl`.
 
 ## Installation
 
@@ -45,10 +45,17 @@ Optional environment overrides: `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `REIN_H
 
 ### Dual-Scope Configuration Layout
 
-| Scope | Path | Auto-created Files |
+| Scope | Path | Auto-created Files & Directories |
 |---|---|---|
-| Global / Personal | `~/.rein/` | `config.json`, `commands.json`, `memory.jsonl`, `notes.jsonl`, `calendar.jsonl`, `email.jsonl` |
-| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `memory.jsonl`, `session.jsonl`, `audit.jsonl` |
+| Global / Personal | `~/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `notes.jsonl`, `calendar.jsonl`, `email.jsonl` |
+| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `session.jsonl`, `full-transcript.jsonl`, `audit.jsonl` |
+
+### Built-in Slash Commands & Skills
+
+Typing `/` opens an inline autocomplete popup above the prompt (`Up`/`Down` navigate, `Tab` completes, `Enter` runs):
+
+- Built-ins: `/help`, `/mode [coding|personal]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
+- Skills: any `<name>/SKILL.md` inside `~/.rein/skills/` (`(user)`) or `<workspace>/.rein/skills/` (`(repo)`) registers `/<name>` and instructs the model to read `SKILL.md` first before proceeding.
 
 Add pre-approved sandboxed shell commands as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json`:
 

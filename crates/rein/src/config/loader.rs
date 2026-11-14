@@ -30,6 +30,8 @@ pub struct ReinPaths {
     pub email: PathBuf,
     /// Repository event-sourced session transcript (`<workspace>/.rein/session.jsonl`).
     pub session_log: PathBuf,
+    /// Append-only full uncompacted conversation archive (`<workspace>/.rein/full-transcript.jsonl`).
+    pub full_transcript: PathBuf,
     /// Repository policy audit log (`<workspace>/.rein/audit.jsonl`).
     pub audit_log: PathBuf,
     /// Global JSON config (`~/.rein/config.json`).
@@ -40,6 +42,10 @@ pub struct ReinPaths {
     pub global_commands: PathBuf,
     /// Repository accepted shell command array (`<workspace>/.rein/commands.json`).
     pub repo_commands: PathBuf,
+    /// Global skills directory (`~/.rein/skills/`).
+    pub global_skills_dir: PathBuf,
+    /// Repository skills directory (`<workspace>/.rein/skills/`).
+    pub repo_skills_dir: PathBuf,
 }
 
 impl ReinPaths {
@@ -53,11 +59,14 @@ impl ReinPaths {
             email: global_dir.join("email.jsonl"),
             global_config: global_dir.join("config.json"),
             global_commands: global_dir.join("commands.json"),
+            global_skills_dir: global_dir.join("skills"),
             repo_memory: repo_dir.join("memory.jsonl"),
             session_log: repo_dir.join("session.jsonl"),
+            full_transcript: repo_dir.join("full-transcript.jsonl"),
             audit_log: repo_dir.join("audit.jsonl"),
             repo_config: repo_dir.join("config.json"),
             repo_commands: repo_dir.join("commands.json"),
+            repo_skills_dir: repo_dir.join("skills"),
             global_dir,
             repo_dir,
         }
@@ -172,6 +181,10 @@ pub fn ensure_dirs_and_load_in(global_dir: &Path, repo_dir: &Path) -> Result<Loa
         .with_context(|| format!("failed to create repo dir '{}'", repo_dir.display()))?;
 
     let paths = ReinPaths::from_dirs(global_dir.to_path_buf(), repo_dir.to_path_buf());
+    for dir in [&paths.global_skills_dir, &paths.repo_skills_dir] {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
+    }
     let starter_global = serde_json::to_string_pretty(&ReinConfig::global_starter())?;
     ensure_file_if_missing(&paths.global_config, &format!("{starter_global}\n"))?;
     ensure_file_if_missing(&paths.repo_config, "{}\n")?;
@@ -238,6 +251,8 @@ mod tests {
         assert!(initial.paths.repo_config.exists());
         assert!(initial.paths.global_commands.exists());
         assert!(initial.paths.repo_commands.exists());
+        assert!(initial.paths.global_skills_dir.is_dir());
+        assert!(initial.paths.repo_skills_dir.is_dir());
         assert!(initial.allowed_commands.is_empty());
 
         std::fs::write(&initial.paths.global_commands, r#"["cargo", "git"]"#)?;

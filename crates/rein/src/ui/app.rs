@@ -1,7 +1,10 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, and Modes in-process
+// Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, and Slash commands
 
+use rein_tools::McpServerConfig;
+
+use crate::commands::{SlashCommand, SlashRegistry};
 use crate::modes::Profile;
 
 /// State owned by the in-process minimalist Ratatui frontend.
@@ -10,6 +13,10 @@ pub struct AppState {
     active_profile: Profile,
     sandbox_summary: String,
     model_name: String,
+    slash_registry: SlashRegistry,
+    slash_selected: usize,
+    configured_commands: Vec<String>,
+    mcp_servers: Vec<McpServerConfig>,
     transcript: Vec<String>,
     input: String,
     pending_prompt: Option<String>,
@@ -31,6 +38,10 @@ impl AppState {
             active_profile: initial,
             sandbox_summary: sandbox_summary.into(),
             model_name: model_name.into(),
+            slash_registry: SlashRegistry::with_builtins(),
+            slash_selected: 0,
+            configured_commands: Vec::new(),
+            mcp_servers: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
             pending_prompt: None,
@@ -39,6 +50,27 @@ impl AppState {
             busy: false,
             streaming_active: false,
         }
+    }
+
+    /// Attaches the loaded [`SlashRegistry`] (built-ins plus `~/.rein/skills` and `.rein/skills`).
+    #[must_use]
+    pub fn with_slash_registry(mut self, registry: SlashRegistry) -> Self {
+        self.slash_registry = registry;
+        self
+    }
+
+    /// Stores merged `commands.json` entries for `/commands` display.
+    #[must_use]
+    pub fn with_configured_commands(mut self, commands: Vec<String>) -> Self {
+        self.configured_commands = commands;
+        self
+    }
+
+    /// Stores configured stdio MCP servers for `/mcp` display.
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
+        self
     }
 
     /// Updates the displayed active [`Profile`].
@@ -64,13 +96,73 @@ impl AppState {
         &self.model_name
     }
 
+    /// Returns the loaded [`SlashRegistry`].
+    #[must_use]
+    pub fn slash_registry(&self) -> &SlashRegistry {
+        &self.slash_registry
+    }
+
+    /// Returns pre-approved shell commands from global + repo `commands.json`.
+    #[must_use]
+    pub fn configured_commands(&self) -> &[String] {
+        &self.configured_commands
+    }
+
+    /// Returns configured MCP servers.
+    #[must_use]
+    pub fn mcp_servers(&self) -> &[McpServerConfig] {
+        &self.mcp_servers
+    }
+
+    /// Returns matching slash entries while typing a `/command` token (hidden while busy/asking).
+    #[must_use]
+    pub fn slash_matches(&self) -> Vec<&SlashCommand> {
+        if self.busy || self.pending_prompt.is_some() {
+            return Vec::new();
+        }
+        self.slash_registry.matching(&self.input)
+    }
+
+    /// Returns the active selected index inside the slash autocomplete popup.
+    #[must_use]
+    pub fn slash_selected(&self) -> usize {
+        self.slash_selected
+    }
+
+    /// Returns the currently highlighted slash command, if the autocomplete popup is open.
+    #[must_use]
+    pub fn selected_slash(&self) -> Option<&SlashCommand> {
+        let matches = self.slash_matches();
+        matches.get(self.slash_selected).copied()
+    }
+
+    /// Moves the slash autocomplete selection up or down with wrap-around.
+    pub fn move_slash_selection(&mut self, delta: isize) {
+        let count = self.slash_matches().len();
+        if count == 0 {
+            self.slash_selected = 0;
+            return;
+        }
+        let len = count as isize;
+        let current = (self.slash_selected.min(count - 1)) as isize;
+        self.slash_selected = (current + delta).rem_euclid(len) as usize;
+    }
+
     /// Returns the rendered transcript lines.
     #[must_use]
     pub fn transcript(&self) -> &[String] {
         &self.transcript
     }
 
-    /// Replaces the transcript with hydrated lines (used by `--resume`).
+    /// Clears the display transcript and resets scroll position.
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+        self.streaming_active = false;
+    }
+
+    /// Appends hydrated lines (used by `--resume` and `/resume`).
     pub fn extend_transcript(&mut self, lines: impl IntoIterator<Item = String>) {
         self.transcript.extend(lines);
         self.auto_scroll = true;
@@ -82,18 +174,27 @@ impl AppState {
         &self.input
     }
 
+    /// Replaces the input buffer cleanly (e.g. on `Tab` slash completion).
+    pub fn set_input(&mut self, text: impl Into<String>) {
+        self.input = text.into();
+        self.slash_selected = 0;
+    }
+
     /// Pushes a typed character to the input buffer.
     pub fn push_input_char(&mut self, ch: char) {
         self.input.push(ch);
+        self.slash_selected = 0;
     }
 
     /// Removes the last character from the input buffer.
     pub fn pop_input_char(&mut self) {
         let _ = self.input.pop();
+        self.slash_selected = 0;
     }
 
     /// Takes and clears the current input buffer.
     pub fn take_input(&mut self) -> String {
+        self.slash_selected = 0;
         std::mem::take(&mut self.input)
     }
 
@@ -108,7 +209,7 @@ impl AppState {
         self.pending_prompt.as_deref()
     }
 
-    /// Marks whether a background model turn is currently streaming.
+    /// Marks whether a background model turn is currently running.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if !busy {
@@ -116,7 +217,7 @@ impl AppState {
         }
     }
 
-    /// Returns `true` while a turn is streaming on the background worker thread.
+    /// Returns `true` while a turn or compaction is running in the background.
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy
@@ -151,13 +252,7 @@ impl AppState {
         self.auto_scroll = true;
     }
 
-    /// Returns whether auto-scroll to the newest line is active.
-    #[must_use]
-    pub fn auto_scroll(&self) -> bool {
-        self.auto_scroll
-    }
-
-    /// Returns the current manual scroll offset, or updates it relative to max scroll.
+    /// Returns the effective vertical scroll offset against `max_scroll`.
     #[must_use]
     pub fn effective_scroll(&self, max_scroll: u16) -> u16 {
         if self.auto_scroll {
