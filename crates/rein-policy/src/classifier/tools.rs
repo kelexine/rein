@@ -25,7 +25,7 @@ pub fn classify_tool_specific(
         "man" => classify_man(cmd),
         "rg" => classify_rg(cmd, sandbox),
         "git" => classify_git(cmd, sandbox),
-        "cargo" => classify_cargo(cmd),
+        "cargo" => classify_cargo(cmd, sandbox),
         "go" => classify_go(cmd, sandbox),
         "ruff" => classify_ruff(cmd, sandbox),
         "ssh" => classify_ssh(cmd),
@@ -263,9 +263,16 @@ fn classify_git(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shel
             "git flag or -c config executes helper command",
         );
     }
+    let dir_scope = find_flag_value(&cmd.raw_args, &["-C"])
+        .map_or(TargetScope::Workspace, |p| classify_path_token(p, sandbox));
     let Some(sub) = cmd.positionals.first().map(String::as_str) else {
-        return ShellClassification::new(EffectLevel::ReadOnly, "git status/version");
+        return ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            dir_scope,
+            "git status/version",
+        );
     };
+    let tail_scope = dir_scope.max(classify_args_scope(&cmd.positionals[1..], sandbox));
     match sub {
         "config" => ShellClassification::with_target(
             EffectLevel::Exec,
@@ -273,24 +280,26 @@ fn classify_git(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shel
             "git config modifies protected repository/hook settings",
         ),
         "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "blame" | "grep" => {
-            let scope = classify_args_scope(&cmd.positionals[1..], sandbox);
             ShellClassification::with_target(
                 EffectLevel::ReadOnly,
-                scope,
+                tail_scope,
                 format!("git {sub} read-only"),
             )
         }
-        "push" | "fetch" | "pull" | "clone" | "ls-remote" => {
-            ShellClassification::new(EffectLevel::Network, format!("git {sub} network operation"))
-        }
-        _ => ShellClassification::new(
+        "push" | "fetch" | "pull" | "clone" | "ls-remote" => ShellClassification::with_target(
+            EffectLevel::Network,
+            tail_scope.max(TargetScope::OutsideWorkspace),
+            format!("git {sub} network operation"),
+        ),
+        _ => ShellClassification::with_target(
             EffectLevel::WorkspaceWrite,
+            tail_scope,
             format!("git {sub} workspace mutation"),
         ),
     }
 }
 
-fn classify_cargo(cmd: &ParsedCommand) -> ShellClassification {
+fn classify_cargo(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
     if cmd.has_long_prefix("version")
         || cmd.has_short('V')
         || cmd.has_long_prefix("help")
@@ -298,18 +307,39 @@ fn classify_cargo(cmd: &ParsedCommand) -> ShellClassification {
     {
         return ShellClassification::new(EffectLevel::ReadOnly, "cargo version/help");
     }
-    match cmd.positionals.first().map(String::as_str) {
-        Some("fmt") => {
-            ShellClassification::new(EffectLevel::WorkspaceWrite, "cargo fmt formats workspace")
+    let mut scope = TargetScope::Workspace;
+    for flag in ["--manifest-path", "--target-dir", "--root"] {
+        if let Some(val) = find_flag_value(&cmd.raw_args, &[flag])
+            .or_else(|| find_long_opt_value(&cmd.long_options, flag.trim_start_matches("--")))
+        {
+            scope = scope.max(classify_path_token(val, sandbox));
         }
-        Some("fetch" | "publish" | "login") => {
-            ShellClassification::new(EffectLevel::Network, "cargo network command")
-        }
-        Some("install") => ShellClassification::new(
-            EffectLevel::OutsideWrite,
-            "cargo install writes to cargo home",
+    }
+    let sub = cmd.positionals.first().map(String::as_str);
+    if cmd.positionals.len() > 1 {
+        scope = scope.max(classify_args_scope(&cmd.positionals[1..], sandbox));
+    }
+    match sub {
+        Some("fmt") => ShellClassification::with_target(
+            EffectLevel::WorkspaceWrite,
+            scope,
+            "cargo fmt formats workspace",
         ),
-        _ => ShellClassification::new(EffectLevel::Exec, "cargo executes build.rs and proc-macros"),
+        Some("fetch" | "publish" | "login" | "owner" | "yank") => ShellClassification::with_target(
+            EffectLevel::Network,
+            scope.max(TargetScope::OutsideWorkspace),
+            "cargo network command",
+        ),
+        Some("install" | "uninstall") => ShellClassification::with_target(
+            EffectLevel::OutsideWrite,
+            scope.max(TargetScope::OutsideWorkspace),
+            "cargo install/uninstall writes to cargo home",
+        ),
+        _ => ShellClassification::with_target(
+            EffectLevel::Exec,
+            scope,
+            "cargo executes build.rs and proc-macros",
+        ),
     }
 }
 
@@ -321,8 +351,26 @@ fn classify_go(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shell
     {
         return ShellClassification::new(EffectLevel::Exec, "go -vettool/-exec runs binary");
     }
+    let arg_scope = classify_args_scope(&cmd.positionals, sandbox);
+    match cmd.positionals.first().map(String::as_str) {
+        Some("install") => {
+            return ShellClassification::with_target(
+                EffectLevel::OutsideWrite,
+                arg_scope.max(TargetScope::OutsideWorkspace),
+                "go install writes to GOPATH/bin",
+            );
+        }
+        Some("get") => {
+            return ShellClassification::with_target(
+                EffectLevel::Network,
+                arg_scope.max(TargetScope::OutsideWorkspace),
+                "go get downloads remote modules",
+            );
+        }
+        _ => {}
+    }
     if let Some(out_path) = extract_output_option(cmd, "-o", "o") {
-        let scope = classify_path_token(&out_path, sandbox);
+        let scope = arg_scope.max(classify_path_token(&out_path, sandbox));
         let eff = if scope == TargetScope::OutsideWorkspace {
             EffectLevel::OutsideWrite
         } else {
@@ -330,7 +378,7 @@ fn classify_go(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shell
         };
         return ShellClassification::with_target(eff, scope, "go build -o writes binary");
     }
-    ShellClassification::new(EffectLevel::Exec, "go toolchain execution")
+    ShellClassification::with_target(EffectLevel::Exec, arg_scope, "go toolchain execution")
 }
 
 fn classify_ruff(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
@@ -371,6 +419,13 @@ fn classify_network_tool(
         scope,
         format!("'{}' network operation", cmd.binary),
     )
+}
+
+fn find_long_opt_value<'a>(long_opts: &'a [String], key: &str) -> Option<&'a str> {
+    long_opts.iter().find_map(|opt| {
+        let (k, v) = opt.split_once('=')?;
+        (k == key).then_some(v)
+    })
 }
 
 fn find_flag_value<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {

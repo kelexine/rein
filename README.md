@@ -9,12 +9,12 @@ Rein separates tool execution from model reasoning with an explicit typestate tu
 ## Features
 
 - **Compile-time Typestate Turn Loop** (`rein-core`): Forces every tool call through explicit policy evaluation (`PolicyEvaluated`) before execution, with event-sourced `session.jsonl` logging, Anthropic SSE streaming with full HTTP error surfacing, and batched multi-tool rounds.
-- **Kernel-enforced Sandbox & Shell Classifier** (`rein-policy`): Classifies shell pipelines and scripts (`read_only` vs `mutating`, `workspace` vs `external`), enforces Linux Landlock LSM + `PR_SET_NO_NEW_PRIVS` via self `--sandbox-child` re-exec, and fails closed when kernel isolation is unavailable.
+- **Kernel-enforced Sandbox & Bash Classifier** (`rein-policy`): Classifies `bash -c` pipelines and subcommands (`read_only` vs `mutating` vs `network`/`outside_write`, `workspace` vs `outside_workspace` vs `protected`) with scoped allowlisting (allowing `cargo *` permits workspace builds/tests without permitting `cargo install` or `cargo publish`), enforces Linux Landlock LSM + `PR_SET_NO_NEW_PRIVS` via self `--sandbox-child` re-exec with no command timeouts, caps inline `stdout`/`stderr` at 32 KiB per stream while streaming full output logs to `<workspace>/.rein/bash-outputs/`, and fails closed when kernel isolation is unavailable.
 - **Coding, Personal & MCP Tools** (`rein-tools`):
-  - Coding: `read`, `write`, `edit`, `glob`, `grep`, `shell` (supports structured `program`/`args` or `command` pipelines).
+  - Coding: `read`, `write`, `edit`, `glob`, `grep`, `bash` (runs `command` via `bash -c` or structured `program`/`args`).
   - Personal: `memory` (dual Project + Personal JSONL stores), `notes`, `calendar` (RFC 5545 `.ics` export + directory sync), `email` (JSONL spool + Maildir `new/` & `cur/`).
   - External: JSON-RPC 2.0 stdio `mcp` client with automatic `tools/list` discovery.
-- **Minimalist Borderless TUI** (`rein`): Full-bleed scrolling transcript, inline `/slash` autocomplete menu (built-ins + `~/.rein/skills/` & `.rein/skills/` `SKILL.md` activation), non-blocking scoped-thread background streaming, inline `write`/`edit` `[y/n]` confirmation previews, `Tab` mode switching (`coding` / `personal`), `--resume`, and `/compact` summarization preserving `.rein/full-transcript.jsonl`.
+- **Minimalist Borderless TUI** (`rein`): Citadel Owl header, full-bleed scrolling transcript, inline `/slash` autocomplete menu (built-ins + `~/.rein/skills/` & `.rein/skills/` `SKILL.md` activation), non-blocking scoped-thread background streaming, 4-option permission prompt (`1. Allow`, `2. Allow in CWD`, `3. Allow Global`, `4. Deny`) across `bash` and sandboxed tools with `Tab` inline feedback attached to any highlighted option and sent back with the tool result, `Tab` mode switching (`coding` / `personal`), `--resume`, and `/compact` summarization preserving `.rein/full-transcript.jsonl`.
 
 ## Installation
 
@@ -48,7 +48,7 @@ Optional environment overrides: `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `REIN_H
 | Scope | Path | Auto-created Files & Directories |
 |---|---|---|
 | Global / Personal | `~/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `notes.jsonl`, `calendar.jsonl`, `email.jsonl` |
-| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `session.jsonl`, `full-transcript.jsonl`, `audit.jsonl` |
+| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `skills/`, `bash-outputs/`, `memory.jsonl`, `session.jsonl`, `full-transcript.jsonl`, `audit.jsonl` |
 
 ### Built-in Slash Commands & Skills
 
@@ -57,10 +57,10 @@ Typing `/` opens an inline autocomplete popup above the prompt (`Up`/`Down` navi
 - Built-ins: `/help`, `/mode [coding|personal]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
 - Skills: any `<name>/SKILL.md` inside `~/.rein/skills/` (`(user)`) or `<workspace>/.rein/skills/` (`(repo)`) registers `/<name>` and instructs the model to read `SKILL.md` first before proceeding.
 
-Add pre-approved sandboxed shell commands as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json`:
+Add pre-approved sandboxed commands or sandboxed tool patterns as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json` (or persist interactively via Option 2 / Option 3):
 
 ```json
-["cargo", "git", "rg"]
+["cargo *", "git status", "tool:write"]
 ```
 
 Optional keys in `config.json`:

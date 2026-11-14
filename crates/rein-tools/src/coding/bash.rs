@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Classifier-driven ShellTool executing commands inside a Landlock re-exec sandbox
+// Purpose: Classifier-driven BashTool executing commands inside a Landlock sandbox with streamed output files
 
 use std::path::PathBuf;
 
@@ -12,31 +12,43 @@ use serde_json::{Value, json};
 
 use crate::registry::{Tool, ToolError, ToolSchema};
 
-/// Executes commands via `rein --sandbox-child` under Landlock, driven by [`ShellClassifier`].
+/// Executes bash commands via `rein --sandbox-child` under Landlock, driven by [`ShellClassifier`].
 #[derive(Debug, Clone)]
-pub struct ShellTool {
+pub struct BashTool {
     sandbox: WorkspaceSandbox,
+    output_dir: Option<PathBuf>,
 }
 
-impl ShellTool {
-    /// Creates a [`ShellTool`] rooted at `sandbox`.
+impl BashTool {
+    /// Creates a [`BashTool`] rooted at `sandbox`, streaming full logs to `<sandbox>/.rein/bash-outputs`.
     #[must_use]
     pub fn new(sandbox: WorkspaceSandbox) -> Self {
-        Self { sandbox }
+        let output_dir = Some(sandbox.root().join(".rein").join("bash-outputs"));
+        Self {
+            sandbox,
+            output_dir,
+        }
+    }
+
+    /// Overrides the directory where full streamed `stdout`/`stderr` log files are written.
+    #[must_use]
+    pub fn with_output_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.output_dir = Some(dir.into());
+        self
     }
 }
 
-impl Tool for ShellTool {
+impl Tool for BashTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "shell".to_owned(),
-            description: "Execute a command inside the Linux Landlock sandbox (accepts either 'command' shell string or 'program' + 'args')".to_owned(),
+            name: "bash".to_owned(),
+            description: "Execute a bash command inside the Linux Landlock sandbox (accepts either 'command' string run via bash -c or 'program' + 'args', streams full output to a log file, no timeouts)".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command or pipeline executed via sh -c"
+                        "description": "Bash command or pipeline executed via bash -c"
                     },
                     "program": { "type": "string" },
                     "args": {
@@ -63,6 +75,7 @@ impl Tool for ShellTool {
             read_only_paths: DEFAULT_READ_ONLY_DIRS.iter().map(PathBuf::from).collect(),
             program,
             args,
+            output_dir: self.output_dir.clone(),
         };
         let output = run_sandboxed_command(&spec)?;
         Ok(serde_json::to_string(&output)?)
@@ -73,14 +86,14 @@ fn parse_command(arguments: &Value) -> Result<(String, Vec<String>), ToolError> 
     if let Some(command) = arguments.get("command").and_then(Value::as_str)
         && !command.trim().is_empty()
     {
-        return Ok(("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()]));
+        return Ok(("bash".to_owned(), vec!["-c".to_owned(), command.to_owned()]));
     }
     let program = arguments
         .get("program")
         .and_then(Value::as_str)
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| ToolError::InvalidArguments {
-            tool: "shell".to_owned(),
+            tool: "bash".to_owned(),
             reason: "expected non-empty string 'command' or 'program'".to_owned(),
         })?
         .to_owned();
@@ -102,15 +115,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_command_string_and_program_args_equally() -> Result<(), Box<dyn std::error::Error>> {
+    fn parses_command_string_as_bash_c_and_program_args_equally()
+    -> Result<(), Box<dyn std::error::Error>> {
         let sandbox = WorkspaceSandbox::new(std::env::temp_dir());
-        let tool = ShellTool::new(sandbox);
+        let tool = BashTool::new(sandbox);
+        assert_eq!(tool.schema().name, "bash");
 
         let cap_cmd = tool.required_capability(&json!({"command": "git status | head -n 5"}))?;
         assert_eq!(
             cap_cmd,
             Capability::Shell {
-                program: "sh".to_owned(),
+                program: "bash".to_owned(),
                 args: vec!["-c".to_owned(), "git status | head -n 5".to_owned()],
             }
         );

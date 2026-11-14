@@ -11,4 +11,4 @@ pub mod evaluator;
 
 pub use decision::{PolicyDecision, PolicyRuleSet};
 pub use error::PolicyError;
-pub use evaluator::PolicyEngine;
+pub use evaluator::{PolicyEngine, suggest_command_allow_pattern};

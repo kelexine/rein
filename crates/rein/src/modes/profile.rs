@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::modes::ContextStrategy;
 
 /// Tool names enabled in the Coding profile.
-pub const CODING_TOOLS: &[&str] = &["read", "write", "edit", "glob", "grep", "shell", "memory"];
+pub const CODING_TOOLS: &[&str] = &["read", "write", "edit", "glob", "grep", "bash", "memory"];
 
 /// Tool names enabled in the Personal profile.
 pub const PERSONAL_TOOLS: &[&str] = &["memory", "notes", "calendar", "email"];

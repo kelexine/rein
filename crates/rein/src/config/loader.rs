@@ -210,6 +210,31 @@ pub fn ensure_dirs_and_load_in(global_dir: &Path, repo_dir: &Path) -> Result<Loa
     })
 }
 
+/// Appends `pattern` to a `commands.json` JSON array file (`~/.rein/commands.json` or `.rein/commands.json`) if absent.
+pub fn append_allowed_command(path: &Path, pattern: &str) -> Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    }
+    let mut commands: Vec<String> = if path.exists() {
+        read_json_file(path)?
+    } else {
+        Vec::new()
+    };
+    if !commands.iter().any(|existing| existing == trimmed) {
+        commands.push(trimmed.to_owned());
+        let encoded = serde_json::to_string_pretty(&commands)
+            .context("failed to serialize commands allowlist JSON")?;
+        std::fs::write(path, format!("{encoded}\n"))
+            .with_context(|| format!("failed to write allowlist '{}'", path.display()))?;
+    }
+    Ok(())
+}
+
 fn resolve_global_dir() -> Result<PathBuf> {
     if let Some(custom) = std::env::var_os("REIN_HOME") {
         return Ok(PathBuf::from(custom));
@@ -270,6 +295,12 @@ mod tests {
             Some("claude-sonnet-4-20250514")
         );
         assert_eq!(merged.config.max_tokens, Some(2048));
+
+        append_allowed_command(&initial.paths.repo_commands, "cargo *")?;
+        append_allowed_command(&initial.paths.repo_commands, "cargo *")?;
+        let updated: Vec<String> = read_json_file(&initial.paths.repo_commands)?;
+        assert_eq!(updated, vec!["bun", "git", "cargo *"]);
+
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

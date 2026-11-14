@@ -21,9 +21,11 @@ pub use classifier::{
     EffectLevel, ParsedCommand, Redirection, ShellClassification, ShellClassifier, ShellPipeline,
     TargetScope, classify_args_scope, classify_parsed_command, classify_path_token,
 };
-pub use engine::{PolicyDecision, PolicyEngine, PolicyError, PolicyRuleSet};
+pub use engine::{
+    PolicyDecision, PolicyEngine, PolicyError, PolicyRuleSet, suggest_command_allow_pattern,
+};
 pub use sandbox::{
-    DEFAULT_READ_ONLY_DIRS, SANDBOX_CHILD_FLAG, SandboxCommandOutput, SandboxSpec, SandboxStatus,
-    WorkspaceSandbox, apply_sandbox_in_child, execute_sandbox_child, probe_kernel_sandbox,
-    run_sandboxed_command,
+    DEFAULT_READ_ONLY_DIRS, OUTPUT_CAP_BYTES, SANDBOX_CHILD_FLAG, SandboxCommandOutput,
+    SandboxSpec, SandboxStatus, WorkspaceSandbox, apply_sandbox_in_child, execute_sandbox_child,
+    probe_kernel_sandbox, run_sandboxed_command,
 };

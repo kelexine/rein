@@ -9,18 +9,52 @@ use rein_core::{
     EventLog, MemoryScope, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent,
     ToolCall, ToolSpec, Turn,
 };
-use rein_policy::{PolicyDecision, PolicyEngine};
+use rein_policy::{PolicyDecision, PolicyEngine, WorkspaceSandbox, suggest_command_allow_pattern};
 use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema};
 
+use crate::config::append_allowed_command;
 use crate::modes::{ContextBuilder, ModeManager, Profile};
 
 /// Maximum consecutive tool-execution rounds permitted in a single user turn.
 pub const MAX_TOOL_ROUNDS: usize = 16;
 
-/// Interactive callbacks used by [`AgentLoop`] for policy `[y/n]` confirmation, streaming deltas, and tool status.
+/// Structured 4-option approval request presented to the user on [`PolicyDecision::Ask`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// Policy classification summary and prompt description.
+    pub title: String,
+    /// Concise action/command excerpt shown on `1. Allow: <excerpt>`.
+    pub excerpt: String,
+    /// Allowlist pattern shown on `2. Allow in CWD` and `3. Allow Global`.
+    pub pattern: String,
+}
+
+/// Numbered selection chosen by the user for an [`ApprovalRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalAction {
+    /// `1. Allow: <excerpt>` (one-shot execution for this call only).
+    AllowOnce,
+    /// `2. Allow in CWD: <pattern>` (persists to `<workspace>/.rein/commands.json`).
+    AllowCwd(String),
+    /// `3. Allow Global: <pattern>` (persists to `~/.rein/commands.json`).
+    AllowGlobal(String),
+    /// `4. Deny`.
+    Deny,
+}
+
+/// Complete decision returned by [`ApprovalPrompter::confirm`], with optional `Tab` feedback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    /// Chosen option among Allow Once, Allow in CWD, Allow Global, or Deny.
+    pub action: ApprovalAction,
+    /// Optional freeform feedback written via `Tab` on any highlighted option, returned with the tool result.
+    pub feedback: Option<String>,
+}
+
+/// Interactive callbacks used by [`AgentLoop`] for numbered policy confirmation, streaming deltas, and tool status.
 pub trait ApprovalPrompter {
-    /// Displays `prompt` to the user and returns `true` if approved.
-    fn confirm(&mut self, prompt: &str) -> Result<bool>;
+    /// Displays `request` options (`1..=4`) to the user and returns the chosen [`ApprovalDecision`].
+    fn confirm(&mut self, request: &ApprovalRequest) -> Result<ApprovalDecision>;
 
     /// Receives incremental streamed text chunks during a model turn.
     fn on_delta(&mut self, _delta: &str) {}
@@ -33,6 +67,8 @@ pub trait ApprovalPrompter {
 pub struct AgentLoop {
     event_log: EventLog,
     full_transcript_path: Option<PathBuf>,
+    repo_commands_path: Option<PathBuf>,
+    global_commands_path: Option<PathBuf>,
     policy: PolicyEngine,
     registry: ToolRegistry,
     memory: JsonlMemoryStore,
@@ -56,6 +92,8 @@ impl AgentLoop {
         Self {
             event_log,
             full_transcript_path: None,
+            repo_commands_path: None,
+            global_commands_path: None,
             policy,
             registry,
             memory,
@@ -64,6 +102,18 @@ impl AgentLoop {
             allowed_commands,
             extra_tools: Vec::new(),
         }
+    }
+
+    /// Configures persistent CWD (`<workspace>/.rein/commands.json`) and Global (`~/.rein/commands.json`) paths.
+    #[must_use]
+    pub fn with_command_allowlist_paths(
+        mut self,
+        repo_path: impl Into<PathBuf>,
+        global_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.repo_commands_path = Some(repo_path.into());
+        self.global_commands_path = Some(global_path.into());
+        self
     }
 
     /// Configures persistent append-only `full-transcript.jsonl` archive preserved across `/compact`.
@@ -293,7 +343,10 @@ impl AgentLoop {
             execute_tool_batch(
                 streaming,
                 self.full_transcript_path.as_deref(),
-                &self.policy,
+                self.repo_commands_path.as_deref(),
+                self.global_commands_path.as_deref(),
+                &mut self.policy,
+                &mut self.allowed_commands,
                 &self.registry,
                 &self.modes,
                 &mut self.history,
@@ -343,7 +396,10 @@ impl AgentLoop {
 fn execute_tool_batch(
     streaming: Turn<'_, rein_core::Streaming>,
     full_transcript_path: Option<&Path>,
-    policy: &PolicyEngine,
+    repo_commands_path: Option<&Path>,
+    global_commands_path: Option<&Path>,
+    policy: &mut PolicyEngine,
+    allowed_commands: &mut Vec<String>,
     registry: &ToolRegistry,
     modes: &ModeManager,
     history: &mut Vec<Message>,
@@ -363,7 +419,10 @@ fn execute_tool_batch(
     let mut idle = execute_awaiting(
         streaming.request_tool(first)?,
         full_transcript_path,
+        repo_commands_path,
+        global_commands_path,
         policy,
+        allowed_commands,
         registry,
         modes,
         history,
@@ -373,7 +432,10 @@ fn execute_tool_batch(
         idle = execute_awaiting(
             idle.request_tool(call)?,
             full_transcript_path,
+            repo_commands_path,
+            global_commands_path,
             policy,
+            allowed_commands,
             registry,
             modes,
             history,
@@ -383,10 +445,14 @@ fn execute_tool_batch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_awaiting<'a>(
     awaiting: Turn<'a, rein_core::AwaitingPolicy>,
     full_transcript_path: Option<&Path>,
-    policy: &PolicyEngine,
+    repo_commands_path: Option<&Path>,
+    global_commands_path: Option<&Path>,
+    policy: &mut PolicyEngine,
+    allowed_commands: &mut Vec<String>,
     registry: &ToolRegistry,
     modes: &ModeManager,
     history: &mut Vec<Message>,
@@ -397,28 +463,148 @@ fn execute_awaiting<'a>(
 
     let decision =
         registry.evaluate_turn_for_profile(&awaiting, policy, &modes.active().allowed_tools)?;
-    let (idle, output) = match decision {
+    let (idle, mut output) = match decision {
         PolicyDecision::Allow { reason } => {
             let executing = awaiting.approve(reason)?;
             registry.execute_approved(executing)?
         }
         PolicyDecision::Ask { prompt: ask_prompt } => {
-            let rich_prompt = format_confirmation_prompt(&call, &ask_prompt);
-            if prompter.confirm(&rich_prompt)? {
-                let executing = awaiting.approve("user approved in TUI")?;
-                registry.execute_approved(executing)?
-            } else {
-                awaiting.deny("user denied in TUI")?
+            let req = build_approval_request(&call, &ask_prompt, policy.sandbox());
+            let choice = prompter.confirm(&req)?;
+            let feedback = choice
+                .feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            match choice.action {
+                ApprovalAction::AllowOnce => {
+                    let executing = awaiting.approve("user approved once in TUI")?;
+                    let (done, mut res) = registry.execute_approved(executing)?;
+                    if let Some(fb) = feedback {
+                        append_user_feedback(&mut res.content, &fb);
+                    }
+                    (done, res)
+                }
+                ApprovalAction::AllowCwd(pattern) => {
+                    persist_allow_pattern(repo_commands_path, policy, allowed_commands, &pattern)?;
+                    let executing = awaiting.approve(format!("user allowed '{pattern}' in CWD"))?;
+                    let (done, mut res) = registry.execute_approved(executing)?;
+                    if let Some(fb) = feedback {
+                        append_user_feedback(&mut res.content, &fb);
+                    }
+                    (done, res)
+                }
+                ApprovalAction::AllowGlobal(pattern) => {
+                    persist_allow_pattern(
+                        global_commands_path,
+                        policy,
+                        allowed_commands,
+                        &pattern,
+                    )?;
+                    let executing =
+                        awaiting.approve(format!("user allowed '{pattern}' globally"))?;
+                    let (done, mut res) = registry.execute_approved(executing)?;
+                    if let Some(fb) = feedback {
+                        append_user_feedback(&mut res.content, &fb);
+                    }
+                    (done, res)
+                }
+                ApprovalAction::Deny => {
+                    let reason = match feedback {
+                        Some(fb) => format!("user denied in TUI — User feedback: {fb}"),
+                        None => "user denied in TUI".to_owned(),
+                    };
+                    awaiting.deny(reason)?
+                }
             }
         }
         PolicyDecision::Deny { reason } => awaiting.deny(reason)?,
     };
 
+    if output.content.is_empty() {
+        output.content = "(no output)".to_owned();
+    }
     let mut tool_msg = Message::new(Role::Tool, output.content);
     tool_msg.tool_calls.push(call);
     record_full_message(full_transcript_path, &tool_msg)?;
     history.push(tool_msg);
     Ok(idle)
+}
+
+fn persist_allow_pattern(
+    persist_path: Option<&Path>,
+    policy: &mut PolicyEngine,
+    allowed_commands: &mut Vec<String>,
+    pattern: &str,
+) -> Result<()> {
+    if let Some(path) = persist_path {
+        append_allowed_command(path, pattern)?;
+    }
+    policy.allow_command_pattern(pattern);
+    if !allowed_commands.iter().any(|p| p == pattern) {
+        allowed_commands.push(pattern.to_owned());
+    }
+    Ok(())
+}
+
+fn append_user_feedback(content: &mut String, feedback: &str) {
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("[User feedback: ");
+    content.push_str(feedback);
+    content.push(']');
+}
+
+/// Builds a numbered 4-option [`ApprovalRequest`] for any `PolicyDecision::Ask`.
+#[must_use]
+pub fn build_approval_request(
+    call: &ToolCall,
+    base_prompt: &str,
+    sandbox: &WorkspaceSandbox,
+) -> ApprovalRequest {
+    if call.name == "bash" {
+        let (program, args) = if let Some(cmd) = call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            ("bash".to_owned(), vec!["-c".to_owned(), cmd.to_owned()])
+        } else {
+            let prog = call
+                .arguments
+                .get("program")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("bash")
+                .to_owned();
+            let argv = call
+                .arguments
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (prog, argv)
+        };
+        let (excerpt, pattern) = suggest_command_allow_pattern(&program, &args, sandbox);
+        return ApprovalRequest {
+            title: base_prompt.to_owned(),
+            excerpt,
+            pattern,
+        };
+    }
+
+    ApprovalRequest {
+        title: base_prompt.to_owned(),
+        excerpt: format_confirmation_prompt(call, base_prompt),
+        pattern: format!("tool:{}", call.name),
+    }
 }
 
 const COMPACT_SYSTEM_PROMPT: &str = "Summarize the conversation faithfully for context continuity. Preserve file paths, symbols, decisions, constraints, tool outcomes, and open tasks without inventing facts.";
@@ -547,7 +733,8 @@ mod tests {
     struct RecordingPrompter {
         deltas: String,
         statuses: Vec<String>,
-        confirms: Vec<String>,
+        confirms: Vec<ApprovalRequest>,
+        scripted: Vec<ApprovalDecision>,
     }
 
     impl RecordingPrompter {
@@ -556,14 +743,30 @@ mod tests {
                 deltas: String::new(),
                 statuses: Vec::new(),
                 confirms: Vec::new(),
+                scripted: Vec::new(),
+            }
+        }
+
+        fn with_decisions(decisions: Vec<ApprovalDecision>) -> Self {
+            Self {
+                deltas: String::new(),
+                statuses: Vec::new(),
+                confirms: Vec::new(),
+                scripted: decisions,
             }
         }
     }
 
     impl ApprovalPrompter for RecordingPrompter {
-        fn confirm(&mut self, prompt: &str) -> Result<bool> {
-            self.confirms.push(prompt.to_owned());
-            Ok(true)
+        fn confirm(&mut self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+            self.confirms.push(request.clone());
+            if !self.scripted.is_empty() {
+                return Ok(self.scripted.remove(0));
+            }
+            Ok(ApprovalDecision {
+                action: ApprovalAction::AllowOnce,
+                feedback: None,
+            })
         }
 
         fn on_delta(&mut self, delta: &str) {
@@ -711,6 +914,112 @@ mod tests {
 
         let archived = EventLog::new(&full_path).read_all()?;
         assert_eq!(archived.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_cwd_persists_sandboxed_tool_and_attaches_feedback_on_allow_and_deny() -> Result<()>
+    {
+        use rein_tools::{EditTool, WriteTool};
+
+        let dir = std::env::temp_dir().join("rein_agent_approval_feedback_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("target.txt"), "hello world")?;
+
+        let events = vec![
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_w1".to_owned(),
+                    name: "write".to_owned(),
+                    arguments: serde_json::json!({"path": "first.txt", "content": "one"}),
+                },
+            },
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_w2".to_owned(),
+                    name: "write".to_owned(),
+                    arguments: serde_json::json!({"path": "second.txt", "content": "two"}),
+                },
+            },
+            SessionEvent::StreamDelta {
+                delta: "Wrote files.".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "Wrote files."),
+            },
+        ];
+        let mut replay = ReplayProvider::from_events(&events);
+        let sandbox = WorkspaceSandbox::new(&dir);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteTool::new(sandbox.clone())));
+        registry.register(Box::new(EditTool::new(sandbox.clone())));
+
+        let profile =
+            Profile::personal().with_extra_tools(&["write".to_owned(), "edit".to_owned()]);
+        let policy = PolicyEngine::new(
+            profile.policy_rules.clone(),
+            sandbox,
+            AuditLog::new(dir.join("audit.jsonl")),
+        );
+        let repo_cmds = dir.join(".rein/commands.json");
+        let global_cmds = dir.join(".rein/global_commands.json");
+        let mut agent = AgentLoop::new(
+            EventLog::new(dir.join("session.jsonl")),
+            policy,
+            registry,
+            JsonlMemoryStore::new(dir.join("memory.jsonl")),
+            profile,
+        )
+        .with_extra_tools(vec!["write".to_owned(), "edit".to_owned()])
+        .with_command_allowlist_paths(&repo_cmds, &global_cmds);
+
+        let mut prompter = RecordingPrompter::with_decisions(vec![ApprovalDecision {
+            action: ApprovalAction::AllowCwd("tool:write".to_owned()),
+            feedback: Some("keep files minimal".to_owned()),
+        }]);
+        let _ = agent.run_user_prompt("write two files", &mut replay, &mut prompter)?;
+        assert_eq!(prompter.confirms.len(), 1);
+        assert_eq!(prompter.confirms[0].pattern, "tool:write");
+        let persisted: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&repo_cmds)?)?;
+        assert_eq!(persisted, vec!["tool:write"]);
+        assert!(
+            agent.history().iter().any(|m| m.role == Role::Tool
+                && m.content.contains("[User feedback: keep files minimal]"))
+        );
+
+        let deny_events = vec![
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_e1".to_owned(),
+                    name: "edit".to_owned(),
+                    arguments: serde_json::json!({"path": "target.txt", "old": "hello", "new": "hi"}),
+                },
+            },
+            SessionEvent::StreamDelta {
+                delta: "Understood.".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "Understood."),
+            },
+        ];
+        let mut deny_replay = ReplayProvider::from_events(&deny_events);
+        let mut deny_prompter = RecordingPrompter::with_decisions(vec![ApprovalDecision {
+            action: ApprovalAction::Deny,
+            feedback: Some("use cargo check instead".to_owned()),
+        }]);
+        let _ = agent.run_user_prompt("edit target", &mut deny_replay, &mut deny_prompter)?;
+        assert_eq!(deny_prompter.confirms.len(), 1);
+        assert!(
+            agent
+                .history()
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Tool)
+                .is_some_and(|m| m.content.contains("use cargo check instead"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

@@ -6,5 +6,6 @@
 pub mod loader;
 
 pub use loader::{
-    LoadedReinState, ReinConfig, ReinPaths, ensure_dirs_and_load, ensure_dirs_and_load_in,
+    LoadedReinState, ReinConfig, ReinPaths, append_allowed_command, ensure_dirs_and_load,
+    ensure_dirs_and_load_in,
 };

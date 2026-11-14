@@ -6,7 +6,10 @@ use rein_core::{MemoryScope, ModeId};
 
 use crate::audit::{AuditEntry, AuditLog};
 use crate::capability::{AccessMode, Capability, PersonalResource};
-use crate::classifier::{EffectLevel, ShellClassifier, TargetScope};
+use crate::classifier::{
+    EffectLevel, ParsedCommand, ShellClassification, ShellClassifier, ShellPipeline, TargetScope,
+    classify_parsed_command, classify_path_token,
+};
 use crate::engine::{PolicyDecision, PolicyError, PolicyRuleSet};
 use crate::sandbox::{SandboxStatus, WorkspaceSandbox, probe_kernel_sandbox};
 
@@ -47,6 +50,14 @@ impl PolicyEngine {
         self.rules = rules;
     }
 
+    /// Adds a newly persisted command pattern (`cargo *`, exact command, etc.) to active rules.
+    pub fn allow_command_pattern(&mut self, pattern: impl Into<String>) {
+        let pat = pattern.into();
+        if !self.rules.allowed_commands.iter().any(|p| p == &pat) {
+            self.rules.allowed_commands.push(pat);
+        }
+    }
+
     /// Returns a reference to the active [`PolicyRuleSet`].
     #[must_use]
     pub fn rules(&self) -> &PolicyRuleSet {
@@ -71,7 +82,7 @@ impl PolicyEngine {
         tool_name: &str,
         capability: &Capability,
     ) -> Result<PolicyDecision, PolicyError> {
-        let decision = self.decide(capability);
+        let decision = self.decide(tool_name, capability);
         self.audit.record(&AuditEntry {
             mode: self.rules.mode,
             tool_name: tool_name.to_owned(),
@@ -81,15 +92,25 @@ impl PolicyEngine {
         Ok(decision)
     }
 
-    fn decide(&self, capability: &Capability) -> PolicyDecision {
+    fn decide(&self, tool_name: &str, capability: &Capability) -> PolicyDecision {
         match capability {
-            Capability::Memory { scope, mode } => self.decide_memory(*scope, *mode),
-            Capability::FileSystem { path, mode } => self.decide_fs(path, *mode),
-            Capability::Personal { resource, mode } => self.decide_personal(*resource, *mode),
+            Capability::Memory { scope, mode } => self.decide_memory(tool_name, *scope, *mode),
+            Capability::FileSystem { path, mode } => self.decide_fs(tool_name, path, *mode),
+            Capability::Personal { resource, mode } => {
+                self.decide_personal(tool_name, *resource, *mode)
+            }
             Capability::Shell { program, args } => self.decide_shell(program, args),
-            Capability::Mcp { server, tool } => PolicyDecision::Ask {
-                prompt: format!("Allow MCP call '{server}::{tool}'?"),
-            },
+            Capability::Mcp { server, tool } => {
+                if self.is_tool_allowlisted(tool_name) {
+                    PolicyDecision::Allow {
+                        reason: format!("tool '{tool_name}' matched configured allowlist"),
+                    }
+                } else {
+                    PolicyDecision::Ask {
+                        prompt: format!("Allow MCP call '{server}::{tool}'?"),
+                    }
+                }
+            }
         }
     }
 
@@ -114,7 +135,6 @@ impl PolicyEngine {
             };
         }
         if classification.effect < EffectLevel::Unknown
-            && classification.target == TargetScope::Workspace
             && self.is_command_allowlisted(program, args)
         {
             return PolicyDecision::Allow {
@@ -148,24 +168,32 @@ impl PolicyEngine {
     }
 
     fn is_command_allowlisted(&self, program: &str, args: &[String]) -> bool {
-        let full = if args.is_empty() {
-            program.to_owned()
-        } else if matches!(program.rsplit('/').next(), Some("sh" | "bash" | "zsh"))
-            && args.len() >= 2
-            && args[0] == "-c"
-        {
-            args[1].trim().to_owned()
-        } else {
-            format!("{program} {}", args.join(" "))
+        let Some(stages) = extract_stages(program, args, &self.sandbox) else {
+            return false;
         };
-        self.rules.allowed_commands.iter().any(|pattern| {
-            let pat = pattern.trim();
-            !pat.is_empty()
-                && (full == pat || full.starts_with(&format!("{pat} ")) || program == pat)
+        if stages.is_empty() {
+            return false;
+        }
+        stages.iter().all(|stage| {
+            let class = classify_parsed_command(stage, Some(&self.sandbox));
+            self.rules
+                .allowed_commands
+                .iter()
+                .any(|pat| stage_matches_pattern(stage, &class, pat))
         })
     }
 
-    fn decide_memory(&self, scope: MemoryScope, mode: AccessMode) -> PolicyDecision {
+    fn is_tool_allowlisted(&self, tool_name: &str) -> bool {
+        let key = format!("tool:{tool_name}");
+        self.rules.allowed_commands.iter().any(|pat| pat == &key)
+    }
+
+    fn decide_memory(
+        &self,
+        tool_name: &str,
+        scope: MemoryScope,
+        mode: AccessMode,
+    ) -> PolicyDecision {
         match (scope, mode) {
             (MemoryScope::Project, _) => PolicyDecision::Allow {
                 reason: "project memory access permitted".to_owned(),
@@ -183,6 +211,11 @@ impl PolicyEngine {
                     reason: "personal memory write permitted in personal profile".to_owned(),
                 }
             }
+            (MemoryScope::Personal, AccessMode::Write) if self.is_tool_allowlisted(tool_name) => {
+                PolicyDecision::Allow {
+                    reason: format!("tool '{tool_name}' matched configured allowlist"),
+                }
+            }
             (MemoryScope::Personal, AccessMode::Write) => PolicyDecision::Ask {
                 prompt: "Allow writing to personal memory from current profile?".to_owned(),
             },
@@ -192,7 +225,12 @@ impl PolicyEngine {
         }
     }
 
-    fn decide_fs(&self, path: &std::path::Path, mode: AccessMode) -> PolicyDecision {
+    fn decide_fs(
+        &self,
+        tool_name: &str,
+        path: &std::path::Path,
+        mode: AccessMode,
+    ) -> PolicyDecision {
         if self.sandbox.resolve_within(path).is_err() {
             return PolicyDecision::Deny {
                 reason: format!("path '{}' is outside workspace sandbox", path.display()),
@@ -205,13 +243,21 @@ impl PolicyEngine {
             AccessMode::Write if self.rules.allow_workspace_write => PolicyDecision::Allow {
                 reason: "workspace write within sandbox".to_owned(),
             },
+            AccessMode::Write if self.is_tool_allowlisted(tool_name) => PolicyDecision::Allow {
+                reason: format!("sandboxed tool '{tool_name}' matched configured allowlist"),
+            },
             AccessMode::Write => PolicyDecision::Ask {
                 prompt: format!("Allow writing file '{}'?", path.display()),
             },
         }
     }
 
-    fn decide_personal(&self, resource: PersonalResource, mode: AccessMode) -> PolicyDecision {
+    fn decide_personal(
+        &self,
+        tool_name: &str,
+        resource: PersonalResource,
+        mode: AccessMode,
+    ) -> PolicyDecision {
         if self.rules.mode != ModeId::Personal {
             return PolicyDecision::Deny {
                 reason: format!("personal resource '{resource:?}' requires personal mode profile"),
@@ -223,6 +269,13 @@ impl PolicyEngine {
                     reason: format!("personal '{resource:?}' '{mode:?}' allowed in personal mode"),
                 }
             }
+            (PersonalResource::Calendar | PersonalResource::Email, AccessMode::Write)
+                if self.is_tool_allowlisted(tool_name) =>
+            {
+                PolicyDecision::Allow {
+                    reason: format!("tool '{tool_name}' matched configured allowlist"),
+                }
+            }
             (PersonalResource::Calendar | PersonalResource::Email, AccessMode::Write) => {
                 PolicyDecision::Ask {
                     prompt: format!("Confirm mutating personal {resource:?} action?"),
@@ -230,6 +283,188 @@ impl PolicyEngine {
             }
         }
     }
+}
+
+const MULTI_SUBCOMMAND_TOOLS: &[&str] = &[
+    "cargo", "git", "npm", "pnpm", "yarn", "bun", "go", "make", "just", "pytest", "uv", "pip",
+    "ruff", "rustup", "rustc",
+];
+
+/// Suggests a concise excerpt and a least-privilege allowlist pattern for a shell invocation.
+///
+/// Workspace-safe subcommands of recognized toolchain binaries (for example `cargo test`) suggest
+/// a scoped wildcard like `"cargo *"` (which excludes `cargo install`, `cargo publish`, and
+/// outside-workspace flags), whereas `OutsideWrite` / `Network` / unknown invocations suggest the
+/// exact command string so allowing `cargo install ripgrep` never broadens to `cargo *`.
+#[must_use]
+pub fn suggest_command_allow_pattern(
+    program: &str,
+    args: &[String],
+    sandbox: &WorkspaceSandbox,
+) -> (String, String) {
+    let Some(stages) = extract_stages(program, args, sandbox) else {
+        let fallback = format_command_tokens(program, args);
+        return (truncate_excerpt(&fallback), fallback);
+    };
+    if stages.is_empty() {
+        let fallback = format_command_tokens(program, args);
+        return (truncate_excerpt(&fallback), fallback);
+    }
+    let joined = stages
+        .iter()
+        .map(stage_text)
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let excerpt = truncate_excerpt(&joined);
+    if stages.len() == 1
+        && let Some(stage) = stages.first()
+    {
+        let class = classify_parsed_command(stage, Some(sandbox));
+        let base = basename(&stage.program);
+        if is_workspace_safe_stage(stage, &class) && MULTI_SUBCOMMAND_TOOLS.contains(&base) {
+            return (excerpt, format!("{base} *"));
+        }
+        return (excerpt, stage_text(stage));
+    }
+    (excerpt, joined)
+}
+
+fn is_workspace_safe_stage(stage: &ParsedCommand, class: &ShellClassification) -> bool {
+    if class.target != TargetScope::Workspace {
+        return false;
+    }
+    if matches!(
+        class.effect,
+        EffectLevel::OutsideWrite | EffectLevel::Network | EffectLevel::Unknown
+    ) {
+        return false;
+    }
+    let base = basename(&stage.program);
+    if base == "git" && class.effect == EffectLevel::Exec {
+        return false;
+    }
+    if base == "go"
+        && stage
+            .raw_args
+            .iter()
+            .any(|a| a.starts_with("-vettool") || a == "-exec" || a.starts_with("-exec="))
+    {
+        return false;
+    }
+    true
+}
+
+fn format_command_tokens(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_owned()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn truncate_excerpt(raw: &str) -> String {
+    let single_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_LEN: usize = 72;
+    if single_line.chars().count() <= MAX_LEN {
+        single_line
+    } else {
+        let head: String = single_line.chars().take(MAX_LEN - 3).collect();
+        format!("{head}...")
+    }
+}
+
+fn extract_stages(
+    program: &str,
+    args: &[String],
+    sandbox: &WorkspaceSandbox,
+) -> Option<Vec<ParsedCommand>> {
+    let base = basename(program);
+    if matches!(base, "sh" | "bash" | "zsh") {
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "-c" {
+                let script = iter.next()?;
+                let pipeline = ShellPipeline::parse(script).ok()?;
+                if pipeline.dynamic_command || !pipeline.substitutions.is_empty() {
+                    return None;
+                }
+                let bad_redirect = pipeline.redirections.iter().any(|r| {
+                    classify_path_token(&r.target, Some(sandbox)) != TargetScope::Workspace
+                });
+                if bad_redirect {
+                    return None;
+                }
+                return Some(pipeline.stages);
+            }
+        }
+    }
+    Some(vec![ParsedCommand::from_words(
+        program.to_owned(),
+        args.to_vec(),
+        Vec::new(),
+    )])
+}
+
+fn stage_text(stage: &ParsedCommand) -> String {
+    std::iter::once(stage.program.as_str())
+        .chain(stage.raw_args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn basename(program: &str) -> &str {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+}
+
+fn stage_matches_pattern(
+    stage: &ParsedCommand,
+    class: &ShellClassification,
+    pattern: &str,
+) -> bool {
+    if class.effect >= EffectLevel::Unknown || class.target == TargetScope::Protected {
+        return false;
+    }
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let stage_tokens: Vec<&str> = std::iter::once(stage.program.as_str())
+        .chain(stage.raw_args.iter().map(String::as_str))
+        .collect();
+    let workspace_safe = is_workspace_safe_stage(stage, class);
+
+    if let Some(prefix) = pattern.strip_suffix(" *") {
+        if !workspace_safe {
+            return false;
+        }
+        let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+        return tokens_start_with(&stage_tokens, &prefix_tokens);
+    }
+
+    let pat_tokens: Vec<&str> = pattern.split_whitespace().collect();
+    if pat_tokens.len() == 1 {
+        if !workspace_safe {
+            return stage_tokens.len() == 1 && basename(stage_tokens[0]) == pat_tokens[0];
+        }
+        return !stage_tokens.is_empty() && basename(stage_tokens[0]) == pat_tokens[0];
+    }
+
+    if stage_tokens.len() == pat_tokens.len() {
+        return tokens_start_with(&stage_tokens, &pat_tokens);
+    }
+
+    workspace_safe && tokens_start_with(&stage_tokens, &pat_tokens)
+}
+
+fn tokens_start_with(stage_tokens: &[&str], pattern_tokens: &[&str]) -> bool {
+    if pattern_tokens.is_empty() || stage_tokens.len() < pattern_tokens.len() {
+        return false;
+    }
+    basename(stage_tokens[0]) == basename(pattern_tokens[0])
+        && stage_tokens[1..pattern_tokens.len()] == pattern_tokens[1..]
 }
 
 #[cfg(test)]
@@ -311,6 +546,165 @@ mod tests {
         )?;
         assert!(matches!(decision, PolicyDecision::Allow { .. }));
         let _ = std::fs::remove_file(&audit_path);
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_cargo_allowlist_does_not_allow_install_or_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir();
+        let audit_path = temp_dir.join("rein_policy_cargo_scope_audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let mut rules = PolicyRuleSet::coding_default();
+        rules.allowed_commands = vec!["cargo *".to_owned()];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            WorkspaceSandbox::new(&temp_dir),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+
+        let check = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo check --all-targets".to_owned()],
+            },
+        )?;
+        assert!(matches!(check, PolicyDecision::Allow { .. }));
+
+        let install = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo install ripgrep".to_owned()],
+            },
+        )?;
+        assert!(matches!(install, PolicyDecision::Ask { .. }));
+
+        let publish = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo publish".to_owned()],
+            },
+        )?;
+        assert!(matches!(publish, PolicyDecision::Ask { .. }));
+
+        let chained = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "cargo check && rm -rf /tmp/rein_nonexistent".to_owned(),
+                ],
+            },
+        )?;
+        assert!(matches!(chained, PolicyDecision::Ask { .. }));
+
+        let _ = std::fs::remove_file(&audit_path);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_cargo_install_allowlist_does_not_broaden_to_other_cargo_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir();
+        let audit_path = temp_dir.join("rein_policy_exact_install_audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let sandbox = WorkspaceSandbox::new(&temp_dir);
+        let (_, install_pat) = suggest_command_allow_pattern(
+            "bash",
+            &["-c".to_owned(), "cargo install ripgrep".to_owned()],
+            &sandbox,
+        );
+        assert_eq!(install_pat, "cargo install ripgrep");
+
+        let (_, test_pat) = suggest_command_allow_pattern(
+            "bash",
+            &["-c".to_owned(), "cargo test --lib".to_owned()],
+            &sandbox,
+        );
+        assert_eq!(test_pat, "cargo *");
+
+        let mut rules = PolicyRuleSet::coding_default();
+        rules.allowed_commands = vec![install_pat];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            sandbox,
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+
+        let allowed = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo install ripgrep".to_owned()],
+            },
+        )?;
+        assert!(matches!(allowed, PolicyDecision::Allow { .. }));
+
+        let other_install = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo install cargo-edit".to_owned()],
+            },
+        )?;
+        assert!(matches!(other_install, PolicyDecision::Ask { .. }));
+
+        let other_cargo = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo test".to_owned()],
+            },
+        )?;
+        assert!(matches!(other_cargo, PolicyDecision::Ask { .. }));
+
+        let _ = std::fs::remove_file(&audit_path);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_allowlist_applies_only_within_sandbox_path() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join("rein_policy_tool_sandbox_scope");
+        std::fs::create_dir_all(&temp_dir)?;
+        let audit_path = temp_dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let mut rules = PolicyRuleSet::personal_default();
+        rules.allowed_commands = vec!["tool:write".to_owned()];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            WorkspaceSandbox::new(&temp_dir),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+
+        let inside = engine.evaluate(
+            "write",
+            &Capability::FileSystem {
+                path: temp_dir.join("note.txt"),
+                mode: AccessMode::Write,
+            },
+        )?;
+        assert!(matches!(inside, PolicyDecision::Allow { .. }));
+
+        let outside = engine.evaluate(
+            "write",
+            &Capability::FileSystem {
+                path: std::path::PathBuf::from("/etc/passwd"),
+                mode: AccessMode::Write,
+            },
+        )?;
+        assert!(matches!(outside, PolicyDecision::Deny { .. }));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 }

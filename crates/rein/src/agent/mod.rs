@@ -5,4 +5,6 @@
 /// In-process agent loop orchestrating Core, Policy, Tools, and Modes.
 pub mod runner;
 
-pub use runner::{AgentLoop, ApprovalPrompter, MAX_TOOL_ROUNDS};
+pub use runner::{
+    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, MAX_TOOL_ROUNDS,
+};

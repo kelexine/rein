@@ -4,8 +4,22 @@
 
 use rein_tools::McpServerConfig;
 
+use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest};
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::modes::Profile;
+
+/// Active interactive 4-option permission prompt with inline `Tab` feedback editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// Policy prompt, concise command/action excerpt, and suggested CWD/Global pattern.
+    pub request: ApprovalRequest,
+    /// Highlighted option (`0`: Allow once, `1`: Allow CWD, `2`: Allow Global, `3`: Deny).
+    pub selected: usize,
+    /// Whether `Tab` opened inline feedback typing for the highlighted option.
+    pub editing_feedback: bool,
+    /// Optional user feedback sent back with the tool result.
+    pub feedback: String,
+}
 
 /// State owned by the in-process minimalist Ratatui frontend.
 #[derive(Debug)]
@@ -21,7 +35,7 @@ pub struct AppState {
     mcp_servers: Vec<McpServerConfig>,
     transcript: Vec<String>,
     input: String,
-    pending_prompt: Option<String>,
+    pending_approval: Option<PendingApproval>,
     scroll_offset: u16,
     auto_scroll: bool,
     busy: bool,
@@ -48,7 +62,7 @@ impl AppState {
             mcp_servers: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
-            pending_prompt: None,
+            pending_approval: None,
             scroll_offset: 0,
             auto_scroll: true,
             busy: false,
@@ -147,7 +161,7 @@ impl AppState {
     /// Returns matching slash entries while typing a `/command` token (hidden while busy/asking).
     #[must_use]
     pub fn slash_matches(&self) -> Vec<&SlashCommand> {
-        if self.busy || self.pending_prompt.is_some() {
+        if self.busy || self.pending_approval.is_some() {
             return Vec::new();
         }
         self.slash_registry.matching(&self.input)
@@ -228,15 +242,85 @@ impl AppState {
         std::mem::take(&mut self.input)
     }
 
-    /// Sets or clears an interactive confirmation prompt from the policy layer.
-    pub fn set_pending_prompt(&mut self, prompt: Option<String>) {
-        self.pending_prompt = prompt;
+    /// Sets or clears an interactive 4-option approval prompt from the policy layer.
+    pub fn set_pending_approval(&mut self, request: Option<ApprovalRequest>) {
+        self.pending_approval = request.map(|req| PendingApproval {
+            request: req,
+            selected: 0,
+            editing_feedback: false,
+            feedback: String::new(),
+        });
     }
 
-    /// Returns any active interactive permission prompt from the policy layer.
+    /// Returns any active interactive permission dialog state.
     #[must_use]
-    pub fn pending_prompt(&self) -> Option<&str> {
-        self.pending_prompt.as_deref()
+    pub fn pending_approval(&self) -> Option<&PendingApproval> {
+        self.pending_approval.as_ref()
+    }
+
+    /// Moves the highlighted option inside the active approval dialog with wrap-around (`0..4`).
+    pub fn move_approval_selection(&mut self, delta: isize) {
+        let Some(pending) = &mut self.pending_approval else {
+            return;
+        };
+        let count = 4isize;
+        let current = isize::try_from(pending.selected).unwrap_or(0);
+        let next = (current + delta).rem_euclid(count);
+        pending.selected = usize::try_from(next).unwrap_or(0);
+    }
+
+    /// Toggles inline feedback editing (`Tab`) for whichever approval option is highlighted.
+    pub fn toggle_approval_feedback(&mut self) {
+        if let Some(pending) = &mut self.pending_approval {
+            pending.editing_feedback = !pending.editing_feedback;
+        }
+    }
+
+    /// Appends a character to the approval feedback buffer when editing via `Tab`.
+    pub fn push_approval_feedback_char(&mut self, ch: char) {
+        if let Some(pending) = &mut self.pending_approval {
+            pending.feedback.push(ch);
+        }
+    }
+
+    /// Pops the trailing character from the approval feedback buffer.
+    pub fn pop_approval_feedback_char(&mut self) {
+        if let Some(pending) = &mut self.pending_approval {
+            let _ = pending.feedback.pop();
+        }
+    }
+
+    /// Resolves and clears the active approval prompt, updating session status on CWD/Global persistence.
+    pub fn take_approval_decision(
+        &mut self,
+        explicit_idx: Option<usize>,
+    ) -> Option<ApprovalDecision> {
+        let pending = self.pending_approval.take()?;
+        let choice = explicit_idx.unwrap_or(pending.selected);
+        let action = match choice {
+            0 => ApprovalAction::AllowOnce,
+            1 => {
+                let pat = pending.request.pattern.clone();
+                if !self.configured_commands.contains(&pat) {
+                    self.configured_commands.push(pat.clone());
+                }
+                ApprovalAction::AllowCwd(pat)
+            }
+            2 => {
+                let pat = pending.request.pattern.clone();
+                if !self.configured_commands.contains(&pat) {
+                    self.configured_commands.push(pat.clone());
+                }
+                ApprovalAction::AllowGlobal(pat)
+            }
+            _ => ApprovalAction::Deny,
+        };
+        let feedback = if pending.feedback.trim().is_empty() {
+            None
+        } else {
+            Some(pending.feedback.trim().to_owned())
+        };
+        Some(ApprovalDecision { action, feedback })
     }
 
     /// Marks whether a background model turn is currently running.

@@ -16,7 +16,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use rein_core::{MemoryScope, ModeId, Provider};
 
-use crate::agent::{AgentLoop, ApprovalPrompter};
+use crate::agent::{
+    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
+};
 use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
 use crate::ui::view::{compute_max_scroll, header_height};
 use crate::ui::{AppState, render_frame};
@@ -49,20 +51,23 @@ impl Drop for TerminalGuard {
 enum WorkerEvent {
     Delta(String),
     ToolStatus(String),
-    AskConfirm(String),
+    AskConfirm(ApprovalRequest),
     Note(String),
     Finished(Result<()>),
 }
 
 struct ChannelPrompter {
     tx: Sender<WorkerEvent>,
-    confirm_rx: Receiver<bool>,
+    confirm_rx: Receiver<ApprovalDecision>,
 }
 
 impl ApprovalPrompter for ChannelPrompter {
-    fn confirm(&mut self, prompt: &str) -> Result<bool> {
-        let _ = self.tx.send(WorkerEvent::AskConfirm(prompt.to_owned()));
-        Ok(self.confirm_rx.recv().unwrap_or(false))
+    fn confirm(&mut self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        let _ = self.tx.send(WorkerEvent::AskConfirm(request.clone()));
+        Ok(self.confirm_rx.recv().unwrap_or(ApprovalDecision {
+            action: ApprovalAction::Deny,
+            feedback: None,
+        }))
     }
 
     fn on_delta(&mut self, delta: &str) {
@@ -323,7 +328,6 @@ fn compact_background(
     guard.terminal.draw(|f| render_frame(app, f))?;
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
-    let (_ans_tx, ans_rx) = mpsc::channel::<bool>();
     let mut should_quit = false;
 
     std::thread::scope(|scope| {
@@ -352,7 +356,6 @@ fn compact_background(
                 break;
             }
         }
-        drop(ans_rx);
     });
 
     app.set_busy(false);
@@ -372,7 +375,7 @@ fn stream_prompt_background(
     guard.terminal.draw(|f| render_frame(app, f))?;
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
-    let (ans_tx, ans_rx) = mpsc::channel::<bool>();
+    let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
     let mut should_quit = false;
 
     std::thread::scope(|scope| {
@@ -398,13 +401,16 @@ fn stream_prompt_background(
                 && handle_streaming_key(key, app, guard, &ans_tx)
             {
                 should_quit = true;
-                let _ = ans_tx.send(false);
+                let _ = ans_tx.send(ApprovalDecision {
+                    action: ApprovalAction::Deny,
+                    feedback: None,
+                });
                 break;
             }
         }
     });
 
-    app.set_pending_prompt(None);
+    app.set_pending_approval(None);
     app.set_busy(false);
     Ok(should_quit)
 }
@@ -414,7 +420,7 @@ fn drain_worker_events(ev_rx: &Receiver<WorkerEvent>, app: &mut AppState) {
         match ev {
             WorkerEvent::Delta(delta) => app.append_stream_delta(&delta),
             WorkerEvent::ToolStatus(status) => app.push_line(status),
-            WorkerEvent::AskConfirm(prompt) => app.set_pending_prompt(Some(prompt)),
+            WorkerEvent::AskConfirm(req) => app.set_pending_approval(Some(req)),
             WorkerEvent::Note(note) => app.push_line(note),
             WorkerEvent::Finished(res) => {
                 if let Err(err) = res {
@@ -430,24 +436,69 @@ fn handle_streaming_key(
     key: KeyEvent,
     app: &mut AppState,
     guard: &mut TerminalGuard,
-    ans_tx: &Sender<bool>,
+    ans_tx: &Sender<ApprovalDecision>,
 ) -> bool {
-    if is_quit_key(key) {
+    let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl_c {
         return true;
     }
-    if app.pending_prompt().is_some() {
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                app.set_pending_prompt(None);
-                let _ = ans_tx.send(true);
+
+    if let Some(pending) = app.pending_approval() {
+        let editing = pending.editing_feedback;
+        if editing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Tab => app.toggle_approval_feedback(),
+                KeyCode::Up => app.move_approval_selection(-1),
+                KeyCode::Down => app.move_approval_selection(1),
+                KeyCode::Backspace => app.pop_approval_feedback_char(),
+                KeyCode::Enter => {
+                    if let Some(decision) = app.take_approval_decision(None) {
+                        let _ = ans_tx.send(decision);
+                    }
+                }
+                KeyCode::Char(c) => app.push_approval_feedback_char(c),
+                _ => {}
             }
-            KeyCode::Char('n' | 'N') => {
-                app.set_pending_prompt(None);
-                let _ = ans_tx.send(false);
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Up => app.move_approval_selection(-1),
+            KeyCode::Down => app.move_approval_selection(1),
+            KeyCode::Tab => app.toggle_approval_feedback(),
+            KeyCode::Enter => {
+                if let Some(decision) = app.take_approval_decision(None) {
+                    let _ = ans_tx.send(decision);
+                }
+            }
+            KeyCode::Char('1' | 'y' | 'Y') => {
+                if let Some(decision) = app.take_approval_decision(Some(0)) {
+                    let _ = ans_tx.send(decision);
+                }
+            }
+            KeyCode::Char('2') => {
+                if let Some(decision) = app.take_approval_decision(Some(1)) {
+                    let _ = ans_tx.send(decision);
+                }
+            }
+            KeyCode::Char('3') => {
+                if let Some(decision) = app.take_approval_decision(Some(2)) {
+                    let _ = ans_tx.send(decision);
+                }
+            }
+            KeyCode::Char('4' | 'n' | 'N') => {
+                if let Some(decision) = app.take_approval_decision(Some(3)) {
+                    let _ = ans_tx.send(decision);
+                }
             }
             _ => {}
         }
         return false;
+    }
+
+    if is_quit_key(key) {
+        return true;
     }
     match key.code {
         KeyCode::Up => {

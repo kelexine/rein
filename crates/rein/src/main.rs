@@ -26,19 +26,24 @@ use rein_policy::{
     execute_sandbox_child,
 };
 use rein_tools::{
-    CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
-    McpToolAdapter, MemoryTool, NotesTool, ReadTool, ShellTool, ToolRegistry, WriteTool,
+    BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
+    McpToolAdapter, MemoryTool, NotesTool, ReadTool, ToolRegistry, WriteTool,
 };
 
-use crate::agent::{AgentLoop, ApprovalPrompter};
+use crate::agent::{
+    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
+};
 use crate::config::{LoadedReinState, ensure_dirs_and_load};
 use crate::modes::Profile;
 use crate::ui::{AppState, run_tui};
 
 struct HeadlessDenier;
 impl ApprovalPrompter for HeadlessDenier {
-    fn confirm(&mut self, _prompt: &str) -> Result<bool> {
-        Ok(false)
+    fn confirm(&mut self, _request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        Ok(ApprovalDecision {
+            action: ApprovalAction::Deny,
+            feedback: None,
+        })
     }
 }
 
@@ -121,6 +126,7 @@ fn run_interactive(
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)
         .with_full_transcript_path(&loaded.paths.full_transcript)
+        .with_command_allowlist_paths(&loaded.paths.repo_commands, &loaded.paths.global_commands)
         .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(mcp_tools);
     let mut provider = AnthropicProvider::new(anthropic_cfg);
@@ -187,7 +193,9 @@ fn build_registry(
     registry.register(Box::new(EditTool::new(sandbox.clone())));
     registry.register(Box::new(GlobTool::new(sandbox.clone())));
     registry.register(Box::new(GrepTool::new(sandbox.clone())));
-    registry.register(Box::new(ShellTool::new(sandbox.clone())));
+    registry.register(Box::new(
+        BashTool::new(sandbox.clone()).with_output_dir(loaded.paths.repo_dir.join("bash-outputs")),
+    ));
     registry.register(Box::new(MemoryTool::new(memory)));
     registry.register(Box::new(NotesTool::new(&loaded.paths.notes)));
 

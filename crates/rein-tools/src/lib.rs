@@ -5,7 +5,7 @@
 //! Policy-enforced tool registry, coding tools, JSONL memory, native personal tools, and MCP client for Rein.
 #![forbid(unsafe_code)]
 
-/// Sandboxed coding tools (read, write, edit, glob, grep, shell).
+/// Sandboxed coding tools (read, write, edit, glob, grep, bash).
 pub mod coding;
 /// Model Context Protocol (MCP) client and policy-gated tool adapter.
 pub mod mcp;
@@ -16,7 +16,7 @@ pub mod personal;
 /// Tool trait, schema, and policy-gated registry.
 pub mod registry;
 
-pub use coding::{EditTool, GlobTool, GrepTool, ReadTool, ShellTool, WriteTool};
+pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use mcp::{JsonRpcRequest, JsonRpcResponse, McpClient, McpServerConfig, McpToolAdapter};
 pub use memory::{JsonlMemoryStore, MemoryRecord, MemoryTool};
 pub use personal::{

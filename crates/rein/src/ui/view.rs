@@ -11,6 +11,7 @@ use rein_core::ModeId;
 
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
+use crate::ui::app::PendingApproval;
 
 const MAX_MENU_ROWS: usize = 6;
 const MIN_HEIGHT_FOR_HEADER: u16 = 14;
@@ -26,19 +27,27 @@ pub fn header_height(state: &AppState, total_height: u16) -> u16 {
     if notice_rows == 0 { 4 } else { 5 + notice_rows }
 }
 
-/// Renders the Citadel Owl header, transcript, optional slash popup, hairline prompt, and status bar.
+/// Renders the Citadel Owl header, transcript, optional popup/approval menu, hairline prompt, and status bar.
 pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
     let area = frame.area();
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
-    let menu_rows = u16::try_from(matches.len().min(MAX_MENU_ROWS)).unwrap_or(0);
+    let popup_rows = if let Some(pending) = state.pending_approval() {
+        if pending.editing_feedback || !pending.feedback.is_empty() {
+            6
+        } else {
+            5
+        }
+    } else {
+        u16::try_from(matches.len().min(MAX_MENU_ROWS)).unwrap_or(0)
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(hdr_rows),
             Constraint::Min(3),
-            Constraint::Length(menu_rows),
+            Constraint::Length(popup_rows),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -58,7 +67,9 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         .scroll((scroll, 0));
     frame.render_widget(transcript, chunks[1]);
 
-    if menu_rows > 0 {
+    if let Some(pending) = state.pending_approval() {
+        render_approval_menu(pending, frame, chunks[2]);
+    } else if popup_rows > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[2]);
     }
 
@@ -245,16 +256,89 @@ fn style_line(line: &str) -> Line<'_> {
     }
 }
 
-fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
-    if let Some(prompt) = state.pending_prompt() {
-        let line = Line::from(vec![
+fn render_approval_menu(pending: &PendingApproval, frame: &mut Frame<'_>, area: Rect) {
+    let options = [
+        format!("1. Allow: {}", pending.request.excerpt),
+        format!("2. Allow in CWD: {}", pending.request.pattern),
+        format!("3. Allow Global: {}", pending.request.pattern),
+        "4. Deny".to_owned(),
+    ];
+    let mut rows = Vec::with_capacity(6);
+    rows.push(Line::from(Span::styled(
+        format!("? {}", pending.request.title),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let hint = if pending.editing_feedback {
+        "  [Tab: close]"
+    } else {
+        "  [Tab: feedback]"
+    };
+    for (idx, label) in options.iter().enumerate() {
+        let is_selected = idx == pending.selected;
+        let marker = if is_selected { "› " } else { "  " };
+        let label_style = if is_selected {
+            let color = if idx == 3 {
+                Color::LightRed
+            } else {
+                Color::LightBlue
+            };
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let mut spans = vec![Span::styled(format!("{marker}{label}"), label_style)];
+        if is_selected {
+            spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+        }
+        rows.push(Line::from(spans));
+    }
+
+    let show_feedback = pending.editing_feedback || !pending.feedback.is_empty();
+    if show_feedback {
+        let label = "  feedback › ";
+        rows.push(Line::from(vec![
             Span::styled(
-                "allow [y/n]: ",
+                label,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(prompt),
+            Span::raw(&pending.feedback),
+        ]));
+        if pending.editing_feedback && area.height >= 6 {
+            let prefix_len = u16::try_from(label.chars().count()).unwrap_or(13);
+            let input_len = u16::try_from(pending.feedback.chars().count()).unwrap_or(u16::MAX);
+            let cx = area
+                .x
+                .saturating_add(prefix_len)
+                .saturating_add(input_len)
+                .min(area.right().saturating_sub(1));
+            frame.set_cursor_position(Position::new(cx, area.y.saturating_add(5)));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
+    if let Some(pending) = state.pending_approval() {
+        let (label, color) = if pending.editing_feedback {
+            ("feedback [Enter: submit · Tab/Esc: back]: ", Color::Cyan)
+        } else {
+            ("choose [1-4 · ↑/↓ · Tab feedback · Enter]: ", Color::Yellow)
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                &pending.request.excerpt,
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -343,6 +427,39 @@ mod tests {
         assert!(all_text.contains("~/dev/rein"));
         assert!(all_text.contains("⚠ ANTHROPIC_API_KEY not set"));
         assert!(all_text.contains("› /mode"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_four_option_approval_menu_with_tab_feedback() -> std::io::Result<()> {
+        use crate::agent::ApprovalRequest;
+
+        let backend = TestBackend::new(90, 22);
+        let mut terminal = Terminal::new(backend)?;
+        let mut state = AppState::new(Profile::coding(), "landlock v11", "claude-sonnet-4");
+        state.set_pending_approval(Some(ApprovalRequest {
+            title: "[Exec | Workspace] Allow 'cargo test --lib'?".to_owned(),
+            excerpt: "cargo test --lib".to_owned(),
+            pattern: "cargo *".to_owned(),
+        }));
+        state.move_approval_selection(3);
+        state.toggle_approval_feedback();
+        for ch in "use cargo check".chars() {
+            state.push_approval_feedback_char(ch);
+        }
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let all_text: String = (0..22)
+            .map(|y| (0..90).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(all_text.contains("1. Allow: cargo test --lib"));
+        assert!(all_text.contains("2. Allow in CWD: cargo *"));
+        assert!(all_text.contains("3. Allow Global: cargo *"));
+        assert!(all_text.contains("› 4. Deny"));
+        assert!(all_text.contains("feedback › use cargo check"));
         Ok(())
     }
 }
