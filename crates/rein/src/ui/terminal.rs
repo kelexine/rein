@@ -18,7 +18,7 @@ use rein_core::{MemoryScope, ModeId, Provider};
 
 use crate::agent::{AgentLoop, ApprovalPrompter};
 use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
-use crate::ui::view::compute_max_scroll;
+use crate::ui::view::{compute_max_scroll, header_height};
 use crate::ui::{AppState, render_frame};
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -465,7 +465,8 @@ fn handle_streaming_key(
 
 fn scroll_app(app: &mut AppState, guard: &TerminalGuard, delta: i16) -> Result<()> {
     let size = guard.terminal.size()?;
-    let transcript_height = size.height.saturating_sub(4);
+    let hdr_rows = header_height(app, size.height);
+    let transcript_height = size.height.saturating_sub(hdr_rows + 4);
     let max_scroll = compute_max_scroll(app.transcript(), size.width, transcript_height);
     app.scroll_by(delta, max_scroll);
     Ok(())

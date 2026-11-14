@@ -80,6 +80,7 @@ fn main() -> Result<()> {
 
     let resume = args.iter().any(|arg| arg == "--resume");
     run_interactive(
+        &workspace_root,
         loaded,
         policy,
         registry,
@@ -93,6 +94,7 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
+    workspace_root: &Path,
     loaded: LoadedReinState,
     policy: PolicyEngine,
     registry: ToolRegistry,
@@ -105,6 +107,15 @@ fn run_interactive(
     let sandbox_label = format_sandbox_label(policy.sandbox_status());
     let anthropic_cfg = loaded.config.to_anthropic_config();
     let model_label = anthropic_cfg.model.clone();
+    let mut notices = Vec::new();
+    if std::env::var_os(&anthropic_cfg.api_key_env).is_none() {
+        notices.push(format!(
+            "{} not set · export it before sending prompts",
+            anthropic_cfg.api_key_env
+        ));
+    }
+    notices.extend(mcp_warnings);
+
     let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
     let event_log = EventLog::new(&loaded.paths.session_log);
 
@@ -114,6 +125,8 @@ fn run_interactive(
         .with_extra_tools(mcp_tools);
     let mut provider = AnthropicProvider::new(anthropic_cfg);
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
+        .with_workspace_label(collapse_home_path(workspace_root))
+        .with_startup_notices(notices)
         .with_slash_registry(slash_registry)
         .with_configured_commands(loaded.allowed_commands)
         .with_mcp_servers(loaded.config.mcp_servers);
@@ -121,9 +134,6 @@ fn run_interactive(
     if resume {
         app.extend_transcript(agent.hydrate_from_log()?);
         app.set_active_profile(agent.active_profile().clone());
-    }
-    for warn in mcp_warnings {
-        app.push_line(format!("! {warn}"));
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -215,4 +225,17 @@ fn format_sandbox_label(status: &SandboxStatus) -> String {
         SandboxStatus::Enforced { abi_version } => format!("landlock v{abi_version}"),
         SandboxStatus::Unavailable { .. } => "sandbox off".to_owned(),
     }
+}
+
+fn collapse_home_path(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(rel) = path.strip_prefix(Path::new(&home))
+    {
+        return if rel.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    path.display().to_string()
 }

@@ -13,6 +13,8 @@ pub struct AppState {
     active_profile: Profile,
     sandbox_summary: String,
     model_name: String,
+    workspace_label: String,
+    startup_notices: Vec<String>,
     slash_registry: SlashRegistry,
     slash_selected: usize,
     configured_commands: Vec<String>,
@@ -38,6 +40,8 @@ impl AppState {
             active_profile: initial,
             sandbox_summary: sandbox_summary.into(),
             model_name: model_name.into(),
+            workspace_label: ".".to_owned(),
+            startup_notices: Vec::new(),
             slash_registry: SlashRegistry::with_builtins(),
             slash_selected: 0,
             configured_commands: Vec::new(),
@@ -50,6 +54,20 @@ impl AppState {
             busy: false,
             streaming_active: false,
         }
+    }
+
+    /// Sets the workspace display path shown in the Citadel Owl header (`~/dev/rein`).
+    #[must_use]
+    pub fn with_workspace_label(mut self, label: impl Into<String>) -> Self {
+        self.workspace_label = label.into();
+        self
+    }
+
+    /// Attaches non-fatal startup notices rendered in amber beneath the header.
+    #[must_use]
+    pub fn with_startup_notices(mut self, notices: Vec<String>) -> Self {
+        self.startup_notices = notices;
+        self
     }
 
     /// Attaches the loaded [`SlashRegistry`] (built-ins plus `~/.rein/skills` and `.rein/skills`).
@@ -94,6 +112,18 @@ impl AppState {
     #[must_use]
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// Returns the collapsed workspace path shown in the header.
+    #[must_use]
+    pub fn workspace_label(&self) -> &str {
+        &self.workspace_label
+    }
+
+    /// Returns concise startup notices displayed beneath the header.
+    #[must_use]
+    pub fn startup_notices(&self) -> &[String] {
+        &self.startup_notices
     }
 
     /// Returns the loaded [`SlashRegistry`].
