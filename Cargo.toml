@@ -1,0 +1,40 @@
+# Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
+# Date: 2026-11-14
+# Purpose: Workspace root manifest for Rein (4-crate architecture)
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/rein-core",
+    "crates/rein-policy",
+    "crates/rein-tools",
+    "crates/rein",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>"]
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+rein-core = { path = "crates/rein-core" }
+rein-policy = { path = "crates/rein-policy" }
+rein-tools = { path = "crates/rein-tools" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+ratatui = "0.29"
+crossterm = "0.28"
+libc = "0.2"
+toml = "0.8"
+ureq = "2.12"

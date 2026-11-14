@@ -1,0 +1,19 @@
+# Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
+# Date: 2026-11-14
+# Purpose: Manifest for rein-core (event log, message types, typestate loop, provider trait)
+
+[package]
+name = "rein-core"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true

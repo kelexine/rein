@@ -1,0 +1,23 @@
+# Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
+# Date: 2026-11-14
+# Purpose: Manifest for rein-policy (permission engine, sandbox boundary, JSONL audit log)
+
+[package]
+name = "rein-policy"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true
+rein-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
