@@ -35,6 +35,16 @@ impl<'a> Turn<'a, Idle> {
             },
         })
     }
+
+    /// Transitions directly from [`Idle`] to [`AwaitingPolicy`] for follow-up calls in a multi-tool batch.
+    pub fn request_tool(self, call: ToolCall) -> Result<Turn<'a, AwaitingPolicy>, CoreError> {
+        self.log
+            .append(&SessionEvent::ToolRequested { call: call.clone() })?;
+        Ok(Turn {
+            log: self.log,
+            state: AwaitingPolicy { pending_call: call },
+        })
+    }
 }
 
 impl<'a> Turn<'a, Streaming> {

@@ -40,8 +40,10 @@ pub struct AnthropicConfig {
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
-            endpoint: DEFAULT_ANTHROPIC_ENDPOINT.to_owned(),
-            model: DEFAULT_ANTHROPIC_MODEL.to_owned(),
+            endpoint: std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_ENDPOINT.to_owned()),
+            model: std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_owned()),
             max_tokens: DEFAULT_MAX_TOKENS,
             api_key_env: "ANTHROPIC_API_KEY".to_owned(),
         }
@@ -71,7 +73,7 @@ impl AnthropicProvider {
         &self.config
     }
 
-    /// Builds the Anthropic Messages API JSON request body.
+    /// Builds the Anthropic Messages API JSON request body, batching consecutive tool results.
     #[must_use]
     pub fn build_request_body(
         &self,
@@ -79,7 +81,7 @@ impl AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Value {
-        let api_messages: Vec<Value> = messages.iter().filter_map(to_anthropic_message).collect();
+        let api_messages = encode_anthropic_messages(messages);
         let api_tools: Vec<Value> = tools
             .iter()
             .map(|t| {
@@ -94,14 +96,16 @@ impl AnthropicProvider {
         let mut body = json!({
             "model": self.config.model,
             "max_tokens": self.config.max_tokens,
-            "system": system_prompt,
             "messages": api_messages,
             "stream": true,
         });
-        if !api_tools.is_empty()
-            && let Some(obj) = body.as_object_mut()
-        {
-            obj.insert("tools".to_owned(), Value::Array(api_tools));
+        if let Some(obj) = body.as_object_mut() {
+            if !system_prompt.trim().is_empty() {
+                obj.insert("system".to_owned(), Value::String(system_prompt.to_owned()));
+            }
+            if !api_tools.is_empty() {
+                obj.insert("tools".to_owned(), Value::Array(api_tools));
+            }
         }
         body
     }
@@ -134,7 +138,7 @@ impl Provider for AnthropicProvider {
             .set("anthropic-version", ANTHROPIC_API_VERSION)
             .set("content-type", "application/json")
             .send_string(&payload)
-            .map_err(|err| CoreError::Provider(format!("Anthropic HTTP request failed: {err}")))?;
+            .map_err(format_ureq_error)?;
 
         let reader = BufReader::new(response.into_reader());
         let mut acc = SseEventAccumulator::new();
@@ -142,39 +146,79 @@ impl Provider for AnthropicProvider {
     }
 }
 
-fn to_anthropic_message(msg: &Message) -> Option<Value> {
-    match msg.role {
-        Role::System => None,
-        Role::User => Some(json!({
-            "role": "user",
-            "content": msg.content,
-        })),
-        Role::Assistant => {
-            let mut blocks = Vec::new();
-            if !msg.content.is_empty() {
-                blocks.push(json!({ "type": "text", "text": msg.content }));
+fn format_ureq_error(err: ureq::Error) -> CoreError {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| body.trim().to_owned());
+            if detail.is_empty() {
+                CoreError::Provider(format!("Anthropic HTTP {code}"))
+            } else {
+                CoreError::Provider(format!("Anthropic HTTP {code}: {detail}"))
             }
-            for call in &msg.tool_calls {
-                blocks.push(json!({
-                    "type": "tool_use",
-                    "id": call.id,
-                    "name": call.name,
-                    "input": call.arguments,
-                }));
-            }
-            Some(json!({ "role": "assistant", "content": blocks }))
         }
-        Role::Tool => {
+        other => CoreError::Provider(format!("Anthropic transport error: {other}")),
+    }
+}
+
+fn encode_anthropic_messages(messages: &[Message]) -> Vec<Value> {
+    let mut encoded = Vec::new();
+    let mut pending_tool_results: Vec<Value> = Vec::new();
+
+    for msg in messages {
+        if msg.role == Role::Tool {
             let tool_use_id = msg.tool_calls.first().map_or("unknown", |c| c.id.as_str());
-            Some(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": msg.content,
-                }]
-            }))
+            pending_tool_results.push(json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": msg.content,
+            }));
+            continue;
         }
+        flush_tool_results(&mut pending_tool_results, &mut encoded);
+
+        match msg.role {
+            Role::System | Role::Tool => {}
+            Role::User => encoded.push(json!({
+                "role": "user",
+                "content": msg.content,
+            })),
+            Role::Assistant => {
+                let mut blocks = Vec::new();
+                if !msg.content.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": msg.content }));
+                }
+                for call in &msg.tool_calls {
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }));
+                }
+                if !blocks.is_empty() {
+                    encoded.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+        }
+    }
+    flush_tool_results(&mut pending_tool_results, &mut encoded);
+    encoded
+}
+
+fn flush_tool_results(pending: &mut Vec<Value>, encoded: &mut Vec<Value>) {
+    if !pending.is_empty() {
+        encoded.push(json!({
+            "role": "user",
+            "content": std::mem::take(pending),
+        }));
     }
 }
 
@@ -184,15 +228,25 @@ mod tests {
     use crate::message::ToolCall;
 
     #[test]
-    fn builds_valid_anthropic_payload_with_tool_calls() {
+    fn builds_valid_anthropic_payload_with_batched_tool_results() {
         let provider = AnthropicProvider::new(AnthropicConfig::default());
-        let mut assistant = Message::new(Role::Assistant, "Reading Cargo.toml");
+        let mut assistant = Message::new(Role::Assistant, "Reading files");
         assistant.tool_calls.push(ToolCall {
             id: "call_1".to_owned(),
             name: "read".to_owned(),
             arguments: json!({"path": "Cargo.toml"}),
         });
-        let history = vec![Message::new(Role::User, "check Cargo.toml"), assistant];
+        assistant.tool_calls.push(ToolCall {
+            id: "call_2".to_owned(),
+            name: "glob".to_owned(),
+            arguments: json!({"pattern": "*.rs"}),
+        });
+        let mut r1 = Message::new(Role::Tool, "toml");
+        r1.tool_calls.push(assistant.tool_calls[0].clone());
+        let mut r2 = Message::new(Role::Tool, "main.rs");
+        r2.tool_calls.push(assistant.tool_calls[1].clone());
+
+        let history = vec![Message::new(Role::User, "check repo"), assistant, r1, r2];
         let tools = vec![ToolSpec {
             name: "read".to_owned(),
             description: "Read file".to_owned(),
@@ -203,5 +257,10 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(
+            body["messages"][2]["content"].as_array().map(Vec::len),
+            Some(2)
+        );
     }
 }

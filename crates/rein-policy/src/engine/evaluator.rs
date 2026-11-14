@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: PolicyEngine evaluating capabilities against kernel sandbox status, shell classifier, and audit log
+// Purpose: PolicyEngine evaluating capabilities against kernel sandbox status, classifier, allowlists, and audit log
 
 use rein_core::{MemoryScope, ModeId};
 
@@ -113,6 +113,14 @@ impl PolicyEngine {
                 ),
             };
         }
+        if classification.effect < EffectLevel::Unknown
+            && classification.target == TargetScope::Workspace
+            && self.is_command_allowlisted(program, args)
+        {
+            return PolicyDecision::Allow {
+                reason: "matched configured global/repo allowed_commands list".to_owned(),
+            };
+        }
         match classification.effect {
             EffectLevel::ReadOnly if classification.target == TargetScope::Workspace => {
                 PolicyDecision::Allow {
@@ -137,6 +145,24 @@ impl PolicyEngine {
                 reason: classification.reason,
             },
         }
+    }
+
+    fn is_command_allowlisted(&self, program: &str, args: &[String]) -> bool {
+        let full = if args.is_empty() {
+            program.to_owned()
+        } else if matches!(program.rsplit('/').next(), Some("sh" | "bash" | "zsh"))
+            && args.len() >= 2
+            && args[0] == "-c"
+        {
+            args[1].trim().to_owned()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        self.rules.allowed_commands.iter().any(|pattern| {
+            let pat = pattern.trim();
+            !pat.is_empty()
+                && (full == pat || full.starts_with(&format!("{pat} ")) || program == pat)
+        })
     }
 
     fn decide_memory(&self, scope: MemoryScope, mode: AccessMode) -> PolicyDecision {
@@ -254,6 +280,33 @@ mod tests {
             &Capability::Shell {
                 program: "tail".to_owned(),
                 args: vec!["-n".to_owned(), "10".to_owned(), "Cargo.toml".to_owned()],
+            },
+        )?;
+        assert!(matches!(decision, PolicyDecision::Allow { .. }));
+        let _ = std::fs::remove_file(&audit_path);
+        Ok(())
+    }
+
+    #[test]
+    fn allows_configured_global_and_repo_commands_inside_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir();
+        let audit_path = temp_dir.join("rein_policy_allowlist_audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let mut rules = PolicyRuleSet::coding_default();
+        rules.allowed_commands = vec!["cargo test".to_owned()];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            WorkspaceSandbox::new(&temp_dir),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+        let decision = engine.evaluate(
+            "shell",
+            &Capability::Shell {
+                program: "cargo".to_owned(),
+                args: vec!["test".to_owned(), "--lib".to_owned()],
             },
         )?;
         assert!(matches!(decision, PolicyDecision::Allow { .. }));

@@ -80,6 +80,24 @@ impl Profile {
     pub fn allows_tool(&self, tool_name: &str) -> bool {
         self.allowed_tools.iter().any(|t| t == tool_name)
     }
+
+    /// Attaches global + repository `commands.json` allowlisted shell commands to this profile.
+    #[must_use]
+    pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
+        self.policy_rules.allowed_commands = commands;
+        self
+    }
+
+    /// Appends additional tool names (such as discovered MCP tools) to `allowed_tools`.
+    #[must_use]
+    pub fn with_extra_tools(mut self, extra: &[String]) -> Self {
+        for name in extra {
+            if !self.allowed_tools.iter().any(|t| t == name) {
+                self.allowed_tools.push(name.clone());
+            }
+        }
+        self
+    }
 }
 
 fn to_owned_list(items: &[&str]) -> Vec<String> {

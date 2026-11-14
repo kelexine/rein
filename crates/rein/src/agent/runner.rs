@@ -4,7 +4,8 @@
 
 use anyhow::{Context, Result};
 use rein_core::{
-    EventLog, Message, ModeId, Provider, ProviderStreamEvent, Role, ToolCall, ToolSpec, Turn,
+    EventLog, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent, ToolCall,
+    ToolSpec, Turn,
 };
 use rein_policy::{PolicyDecision, PolicyEngine};
 use rein_tools::{JsonlMemoryStore, ToolRegistry, ToolSchema};
@@ -14,13 +15,16 @@ use crate::modes::{ContextBuilder, ModeManager, Profile};
 /// Maximum consecutive tool-execution rounds permitted in a single user turn.
 pub const MAX_TOOL_ROUNDS: usize = 16;
 
-/// Interactive callbacks used by [`AgentLoop`] for policy `[y/n]` confirmation and live streaming.
+/// Interactive callbacks used by [`AgentLoop`] for policy `[y/n]` confirmation, streaming deltas, and tool status.
 pub trait ApprovalPrompter {
     /// Displays `prompt` to the user and returns `true` if approved.
     fn confirm(&mut self, prompt: &str) -> Result<bool>;
 
     /// Receives incremental streamed text chunks during a model turn.
     fn on_delta(&mut self, _delta: &str) {}
+
+    /// Receives compact 1-line tool activity summaries (`· read Cargo.toml`).
+    fn on_tool_status(&mut self, _status: &str) {}
 }
 
 /// Coordinates the single-process agent turn loop across Core, Policy, Tools, and Modes.
@@ -31,6 +35,8 @@ pub struct AgentLoop {
     memory: JsonlMemoryStore,
     modes: ModeManager,
     history: Vec<Message>,
+    allowed_commands: Vec<String>,
+    extra_tools: Vec<String>,
 }
 
 impl AgentLoop {
@@ -43,6 +49,7 @@ impl AgentLoop {
         memory: JsonlMemoryStore,
         initial_profile: Profile,
     ) -> Self {
+        let allowed_commands = initial_profile.policy_rules.allowed_commands.clone();
         Self {
             event_log,
             policy,
@@ -50,7 +57,23 @@ impl AgentLoop {
             memory,
             modes: ModeManager::new(initial_profile),
             history: Vec::new(),
+            allowed_commands,
+            extra_tools: Vec::new(),
         }
+    }
+
+    /// Configures persistent allowlisted shell commands merged from global + repo `commands.json`.
+    #[must_use]
+    pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
+        self.allowed_commands = commands;
+        self
+    }
+
+    /// Configures extra registered tool names (e.g., MCP tools) enabled across profile switches.
+    #[must_use]
+    pub fn with_extra_tools(mut self, extra_tools: Vec<String>) -> Self {
+        self.extra_tools = extra_tools;
+        self
     }
 
     /// Returns the active [`Profile`].
@@ -65,17 +88,69 @@ impl AgentLoop {
         &self.policy
     }
 
+    /// Returns the current conversation history slice.
+    #[must_use]
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
     /// Toggles between `Coding` and `Personal` profiles via [`ModeManager`].
     pub fn toggle_mode(&mut self) -> Result<ModeId> {
-        let next = match self.modes.active().mode {
-            ModeId::Coding => Profile::personal(),
-            ModeId::Personal => Profile::coding(),
+        let next_mode = match self.modes.active().mode {
+            ModeId::Coding => ModeId::Personal,
+            ModeId::Personal => ModeId::Coding,
         };
+        let next = self.build_profile(next_mode);
         let switched = self
             .modes
             .switch_to(next, &mut self.policy, &self.event_log)
             .context("failed to switch mode profile")?;
         Ok(switched)
+    }
+
+    /// Hydrates conversation history, active mode, and clean display transcript lines from `session.jsonl`.
+    pub fn hydrate_from_log(&mut self) -> Result<Vec<String>> {
+        let events = self.event_log.read_all()?;
+        let mut display_lines = Vec::new();
+        let mut pending_calls: Vec<ToolCall> = Vec::new();
+        self.history.clear();
+
+        for ev in events {
+            match ev {
+                SessionEvent::ModeSwitched { mode } => {
+                    let profile = self.build_profile(mode);
+                    self.policy.set_rules(profile.policy_rules.clone());
+                    self.modes = ModeManager::new(profile);
+                }
+                SessionEvent::ToolRequested { call } => {
+                    display_lines.push(format_tool_status(&call));
+                    pending_calls.push(call);
+                }
+                SessionEvent::ToolCompleted { output } => {
+                    let mut tool_msg = Message::new(Role::Tool, output.content);
+                    if let Some(matched) = pending_calls
+                        .iter()
+                        .find(|c| c.id == output.call_id)
+                        .cloned()
+                    {
+                        tool_msg.tool_calls.push(matched);
+                    }
+                    self.history.push(tool_msg);
+                }
+                SessionEvent::MessageRecorded { message } => {
+                    Self::hydrate_message(
+                        &mut self.history,
+                        &mut display_lines,
+                        &mut pending_calls,
+                        message,
+                    );
+                }
+                SessionEvent::StreamDelta { .. }
+                | SessionEvent::PolicyEvaluated { .. }
+                | SessionEvent::MemoryAccessed { .. } => {}
+            }
+        }
+        Ok(display_lines)
     }
 
     /// Executes a user prompt through the typestate loop until the model finishes or reaches max rounds.
@@ -93,15 +168,15 @@ impl AgentLoop {
                 .build(&self.history, &self.registry)
                 .context("failed to assemble turn context")?;
             let specs: Vec<ToolSpec> = assembled.tools.iter().map(schema_to_spec).collect();
-
-            let mut streaming = if round == 0 {
-                Turn::new(&self.event_log).begin_user_turn(prompt)?
+            let turn_prompt = if round == 0 {
+                prompt
             } else {
-                Turn::new(&self.event_log).begin_user_turn("[tool_result_continuation]")?
+                "[tool_result_continuation]"
             };
+            let mut streaming = Turn::new(&self.event_log).begin_user_turn(turn_prompt)?;
 
             let mut streamed_text = String::new();
-            let mut requested_call: Option<ToolCall> = None;
+            let mut requested_calls: Vec<ToolCall> = Vec::new();
             let events = provider.stream_turn_with(
                 &assembled.system_prompt,
                 &assembled.messages,
@@ -119,51 +194,205 @@ impl AgentLoop {
                         streamed_text.push_str(&delta);
                         streaming.push_delta(&delta)?;
                     }
-                    ProviderStreamEvent::ToolUse(call) => {
-                        requested_call = Some(call);
-                    }
+                    ProviderStreamEvent::ToolUse(call) => requested_calls.push(call),
                     ProviderStreamEvent::Done => {}
                 }
             }
 
-            if let Some(call) = requested_call {
-                let mut assistant_msg = Message::new(Role::Assistant, &streamed_text);
-                assistant_msg.tool_calls.push(call.clone());
-                self.history.push(assistant_msg);
-
-                let awaiting = streaming.request_tool(call.clone())?;
-                let decision = self.registry.evaluate_turn_for_profile(
-                    &awaiting,
-                    &self.policy,
-                    &self.modes.active().allowed_tools,
-                )?;
-                let (_idle, output) = match decision {
-                    PolicyDecision::Allow { reason } => {
-                        let executing = awaiting.approve(reason)?;
-                        self.registry.execute_approved(executing)?
-                    }
-                    PolicyDecision::Ask { prompt: ask_prompt } => {
-                        if prompter.confirm(&ask_prompt)? {
-                            let executing = awaiting.approve("user approved in TUI")?;
-                            self.registry.execute_approved(executing)?
-                        } else {
-                            awaiting.deny("user denied in TUI")?
-                        }
-                    }
-                    PolicyDecision::Deny { reason } => awaiting.deny(reason)?,
-                };
-
-                let mut tool_msg = Message::new(Role::Tool, output.content);
-                tool_msg.tool_calls.push(call);
-                self.history.push(tool_msg);
-            } else {
+            if requested_calls.is_empty() {
                 let (_idle, msg) = streaming.finish_response()?;
                 final_text = msg.content.clone();
                 self.history.push(msg);
                 return Ok(final_text);
             }
+            execute_tool_batch(
+                streaming,
+                &self.policy,
+                &self.registry,
+                &self.modes,
+                &mut self.history,
+                &streamed_text,
+                requested_calls,
+                prompter,
+            )?;
         }
         Ok(final_text)
+    }
+
+    fn build_profile(&self, mode: ModeId) -> Profile {
+        Profile::for_mode(mode)
+            .with_allowed_commands(self.allowed_commands.clone())
+            .with_extra_tools(&self.extra_tools)
+    }
+
+    fn hydrate_message(
+        history: &mut Vec<Message>,
+        display_lines: &mut Vec<String>,
+        pending_calls: &mut Vec<ToolCall>,
+        mut message: Message,
+    ) {
+        if message.role == Role::User && message.content == "[tool_result_continuation]" {
+            return;
+        }
+        match message.role {
+            Role::User => {
+                pending_calls.clear();
+                display_lines.push(format!("❯ {}", message.content));
+            }
+            Role::Assistant => {
+                if !pending_calls.is_empty() && message.tool_calls.is_empty() {
+                    message.tool_calls = std::mem::take(pending_calls);
+                }
+                if !message.content.trim().is_empty() {
+                    display_lines.push(message.content.clone());
+                }
+            }
+            Role::Tool | Role::System => {}
+        }
+        history.push(message);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_tool_batch(
+    streaming: Turn<'_, rein_core::Streaming>,
+    policy: &PolicyEngine,
+    registry: &ToolRegistry,
+    modes: &ModeManager,
+    history: &mut Vec<Message>,
+    streamed_text: &str,
+    calls: Vec<ToolCall>,
+    prompter: &mut dyn ApprovalPrompter,
+) -> Result<()> {
+    let mut assistant_msg = Message::new(Role::Assistant, streamed_text);
+    assistant_msg.tool_calls = calls.clone();
+    history.push(assistant_msg);
+
+    let mut iter = calls.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(());
+    };
+    let mut idle = execute_awaiting(
+        streaming.request_tool(first)?,
+        policy,
+        registry,
+        modes,
+        history,
+        prompter,
+    )?;
+    for call in iter {
+        idle = execute_awaiting(
+            idle.request_tool(call)?,
+            policy,
+            registry,
+            modes,
+            history,
+            prompter,
+        )?;
+    }
+    Ok(())
+}
+
+fn execute_awaiting<'a>(
+    awaiting: Turn<'a, rein_core::AwaitingPolicy>,
+    policy: &PolicyEngine,
+    registry: &ToolRegistry,
+    modes: &ModeManager,
+    history: &mut Vec<Message>,
+    prompter: &mut dyn ApprovalPrompter,
+) -> Result<Turn<'a, rein_core::Idle>> {
+    let call = awaiting.pending_call().clone();
+    prompter.on_tool_status(&format_tool_status(&call));
+
+    let decision =
+        registry.evaluate_turn_for_profile(&awaiting, policy, &modes.active().allowed_tools)?;
+    let (idle, output) = match decision {
+        PolicyDecision::Allow { reason } => {
+            let executing = awaiting.approve(reason)?;
+            registry.execute_approved(executing)?
+        }
+        PolicyDecision::Ask { prompt: ask_prompt } => {
+            let rich_prompt = format_confirmation_prompt(&call, &ask_prompt);
+            if prompter.confirm(&rich_prompt)? {
+                let executing = awaiting.approve("user approved in TUI")?;
+                registry.execute_approved(executing)?
+            } else {
+                awaiting.deny("user denied in TUI")?
+            }
+        }
+        PolicyDecision::Deny { reason } => awaiting.deny(reason)?,
+    };
+
+    let mut tool_msg = Message::new(Role::Tool, output.content);
+    tool_msg.tool_calls.push(call);
+    history.push(tool_msg);
+    Ok(idle)
+}
+
+/// Formats a compact 1-line tool indicator shown inline in the TUI transcript.
+#[must_use]
+pub fn format_tool_status(call: &ToolCall) -> String {
+    let target = call
+        .arguments
+        .get("path")
+        .or_else(|| call.arguments.get("pattern"))
+        .or_else(|| call.arguments.get("command"))
+        .or_else(|| call.arguments.get("program"))
+        .or_else(|| call.arguments.get("action"))
+        .or_else(|| call.arguments.get("key"))
+        .and_then(serde_json::Value::as_str);
+    match target {
+        Some(arg) => format!("· {} {}", call.name, truncate_inline(arg, 60)),
+        None => format!("· {}", call.name),
+    }
+}
+
+/// Enhances `PolicyDecision::Ask` prompts with concise inline diff/summary for `write` and `edit`.
+#[must_use]
+pub fn format_confirmation_prompt(call: &ToolCall, base_prompt: &str) -> String {
+    let args = &call.arguments;
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    match call.name.as_str() {
+        "edit" => {
+            let old = args
+                .get("old")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let new = args
+                .get("new")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            format!(
+                "edit {path} (-{} / +{})",
+                truncate_inline(old, 32),
+                truncate_inline(new, 32)
+            )
+        }
+        "write" => {
+            let content = args
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            format!(
+                "write {path} ({} lines, {} bytes)",
+                content.lines().count(),
+                content.len()
+            )
+        }
+        _ => base_prompt.to_owned(),
+    }
+}
+
+fn truncate_inline(raw: &str, max_chars: usize) -> String {
+    let single = raw.lines().next().unwrap_or_default().trim();
+    if single.chars().count() <= max_chars {
+        single.to_owned()
+    } else {
+        let prefix: String = single.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{prefix}…")
     }
 }
 
@@ -178,44 +407,72 @@ fn schema_to_spec(schema: &ToolSchema) -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rein_core::{ReplayProvider, SessionEvent};
+    use rein_core::ReplayProvider;
     use rein_policy::{AuditLog, WorkspaceSandbox};
     use rein_tools::ReadTool;
 
-    struct AlwaysApprove(String);
-    impl ApprovalPrompter for AlwaysApprove {
-        fn confirm(&mut self, _prompt: &str) -> Result<bool> {
+    struct RecordingPrompter {
+        deltas: String,
+        statuses: Vec<String>,
+        confirms: Vec<String>,
+    }
+
+    impl RecordingPrompter {
+        fn new() -> Self {
+            Self {
+                deltas: String::new(),
+                statuses: Vec::new(),
+                confirms: Vec::new(),
+            }
+        }
+    }
+
+    impl ApprovalPrompter for RecordingPrompter {
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.confirms.push(prompt.to_owned());
             Ok(true)
         }
 
         fn on_delta(&mut self, delta: &str) {
-            self.0.push_str(delta);
+            self.deltas.push_str(delta);
+        }
+
+        fn on_tool_status(&mut self, status: &str) {
+            self.statuses.push(status.to_owned());
         }
     }
 
     #[test]
-    fn executes_multi_round_replay_loop_through_policy_gate() -> Result<()> {
-        let dir = std::env::temp_dir().join("rein_agent_loop_replay_test");
+    fn executes_multi_tool_batch_and_hydrates_resume_log() -> Result<()> {
+        let dir = std::env::temp_dir().join("rein_agent_multi_tool_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("note.txt"), "hello rein")?;
+        std::fs::write(dir.join("a.txt"), "alpha")?;
+        std::fs::write(dir.join("b.txt"), "beta")?;
 
         let recorded = vec![
             SessionEvent::StreamDelta {
-                delta: "Let me read note.txt. ".to_owned(),
+                delta: "Reading both files. ".to_owned(),
             },
             SessionEvent::ToolRequested {
                 call: ToolCall {
                     id: "call_1".to_owned(),
                     name: "read".to_owned(),
-                    arguments: serde_json::json!({"path": "note.txt"}),
+                    arguments: serde_json::json!({"path": "a.txt"}),
+                },
+            },
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_2".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({"path": "b.txt"}),
                 },
             },
             SessionEvent::StreamDelta {
-                delta: "The file says hello rein.".to_owned(),
+                delta: "Read alpha and beta.".to_owned(),
             },
             SessionEvent::MessageRecorded {
-                message: Message::new(Role::Assistant, "The file says hello rein."),
+                message: Message::new(Role::Assistant, "Read alpha and beta."),
             },
         ];
 
@@ -227,21 +484,53 @@ mod tests {
         let profile = Profile::coding();
         let policy = PolicyEngine::new(
             profile.policy_rules.clone(),
-            sandbox,
+            sandbox.clone(),
             AuditLog::new(dir.join("audit.jsonl")),
         );
+        let log_path = dir.join("session.jsonl");
         let mut agent = AgentLoop::new(
-            EventLog::new(dir.join("session.jsonl")),
+            EventLog::new(&log_path),
             policy,
             registry,
             JsonlMemoryStore::new(dir.join("memory.jsonl")),
             profile,
         );
 
-        let mut prompter = AlwaysApprove(String::new());
-        let reply = agent.run_user_prompt("what is in note.txt?", &mut replay, &mut prompter)?;
-        assert_eq!(reply, "The file says hello rein.");
-        assert!(prompter.0.contains("Let me read note.txt."));
+        let mut prompter = RecordingPrompter::new();
+        let reply = agent.run_user_prompt("read both files", &mut replay, &mut prompter)?;
+        assert_eq!(reply, "Read alpha and beta.");
+        assert_eq!(prompter.statuses, vec!["· read a.txt", "· read b.txt"]);
+        assert!(prompter.deltas.contains("Reading both files."));
+
+        let mut resumed_registry = ToolRegistry::new();
+        resumed_registry.register(Box::new(ReadTool::new(sandbox.clone())));
+        let resumed_profile = Profile::coding();
+        let resumed_policy = PolicyEngine::new(
+            resumed_profile.policy_rules.clone(),
+            sandbox,
+            AuditLog::new(dir.join("audit.jsonl")),
+        );
+        let mut resumed = AgentLoop::new(
+            EventLog::new(&log_path),
+            resumed_policy,
+            resumed_registry,
+            JsonlMemoryStore::new(dir.join("memory.jsonl")),
+            resumed_profile,
+        );
+        let transcript = resumed.hydrate_from_log()?;
+        assert!(transcript.iter().any(|l| l == "❯ read both files"));
+        assert!(transcript.iter().any(|l| l == "· read a.txt"));
+        assert!(transcript.iter().any(|l| l == "Read alpha and beta."));
+
+        let confirm_msg = format_confirmation_prompt(
+            &ToolCall {
+                id: "c1".to_owned(),
+                name: "edit".to_owned(),
+                arguments: serde_json::json!({"path": "foo.rs", "old": "bar()", "new": "baz()"}),
+            },
+            "confirm?",
+        );
+        assert!(confirm_msg.contains("edit foo.rs (-bar() / +baz())"));
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

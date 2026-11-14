@@ -39,6 +39,9 @@ pub struct PolicyRuleSet {
     pub allow_workspace_write: bool,
     /// Fail-closed default: refuse shell execution if kernel sandboxing (Landlock) is unavailable.
     pub require_kernel_sandbox: bool,
+    /// Merged global (`~/.rein/commands.json`) and repo (`<workspace>/.rein/commands.json`) command allowlist.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
 }
 
 impl PolicyRuleSet {
@@ -51,6 +54,7 @@ impl PolicyRuleSet {
             allow_personal_memory_write: false,
             allow_workspace_write: true,
             require_kernel_sandbox: true,
+            allowed_commands: Vec::new(),
         }
     }
 
@@ -63,6 +67,7 @@ impl PolicyRuleSet {
             allow_personal_memory_write: true,
             allow_workspace_write: false,
             require_kernel_sandbox: true,
+            allowed_commands: Vec::new(),
         }
     }
 }

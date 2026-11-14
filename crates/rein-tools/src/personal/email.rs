@@ -41,6 +41,7 @@ pub struct EmailMessage {
 #[derive(Debug, Clone)]
 pub struct EmailTool {
     spool_path: PathBuf,
+    maildir: Option<PathBuf>,
 }
 
 impl EmailTool {
@@ -49,7 +50,46 @@ impl EmailTool {
     pub fn new(spool_path: impl Into<PathBuf>) -> Self {
         Self {
             spool_path: spool_path.into(),
+            maildir: None,
         }
+    }
+
+    /// Attaches a local Maildir root (`new/` and `cur/`) read alongside the JSONL spool.
+    #[must_use]
+    pub fn with_maildir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.maildir = Some(dir.into());
+        self
+    }
+
+    fn read_maildir(&self) -> Result<Vec<EmailMessage>, ToolError> {
+        let Some(root) = &self.maildir else {
+            return Ok(Vec::new());
+        };
+        let mut maildir_msgs = Vec::new();
+        for sub in ["new", "cur"] {
+            let dir = root.join(sub);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir).map_err(|source| ToolError::Io {
+                path: dir.clone(),
+                source,
+            })? {
+                let entry = entry.map_err(|source| ToolError::Io {
+                    path: dir.clone(),
+                    source,
+                })?;
+                let path = entry.path();
+                if path.is_file() {
+                    let raw = std::fs::read_to_string(&path).map_err(|source| ToolError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    maildir_msgs.push(parse_rfc2822_summary(&raw));
+                }
+            }
+        }
+        Ok(maildir_msgs)
     }
 
     fn read_messages(&self) -> Result<Vec<EmailMessage>, ToolError> {
@@ -134,7 +174,11 @@ impl Tool for EmailTool {
 
     fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
         match arguments.get("action").and_then(Value::as_str) {
-            Some("inbox") => Ok(serde_json::to_string(&self.read_messages()?)?),
+            Some("inbox") => {
+                let mut combined = self.read_messages()?;
+                combined.extend(self.read_maildir()?);
+                Ok(serde_json::to_string(&combined)?)
+            }
             Some(act @ ("draft" | "send")) => {
                 let status = if act == "draft" {
                     EmailStatus::Draft
@@ -167,6 +211,37 @@ impl Tool for EmailTool {
                 reason: "unsupported email action".to_owned(),
             }),
         }
+    }
+}
+
+fn parse_rfc2822_summary(raw: &str) -> EmailMessage {
+    let (mut to, mut from, mut subject) = (String::new(), String::new(), String::new());
+    let mut lines = raw.lines();
+    for line in lines.by_ref() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            match k.to_ascii_lowercase().as_str() {
+                "to" => to = v.trim().to_owned(),
+                "from" => from = v.trim().to_owned(),
+                "subject" => subject = v.trim().to_owned(),
+                _ => {}
+            }
+        }
+    }
+    let body_preview: String = lines.take(8).collect::<Vec<_>>().join("\n");
+    let body = if from.is_empty() {
+        body_preview
+    } else {
+        format!("From: {from}\n{body_preview}")
+    };
+    EmailMessage {
+        to,
+        subject,
+        body,
+        status: EmailStatus::Received,
     }
 }
 
@@ -204,6 +279,28 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_maildir_new_and_cur_messages_in_inbox() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_maildir_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maildir/new"))?;
+        std::fs::create_dir_all(dir.join("maildir/cur"))?;
+        std::fs::write(
+            dir.join("maildir/new/msg1.eml"),
+            "From: alice@example.invalid\nTo: kelexine@example.invalid\nSubject: Kernel Patch\n\nPlease review.",
+        )?;
+
+        let tool = EmailTool::new(dir.join("email.jsonl")).with_maildir(dir.join("maildir"));
+        let inbox: Vec<EmailMessage> =
+            serde_json::from_str(&tool.execute(&json!({"action": "inbox"}))?)?;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "Kernel Patch");
+        assert_eq!(inbox[0].status, EmailStatus::Received);
+        assert!(inbox[0].body.contains("alice@example.invalid"));
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

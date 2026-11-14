@@ -43,6 +43,39 @@ impl McpClient {
         &self.config
     }
 
+    /// Queries `tools/list` on the configured MCP server and adapts each schema.
+    pub fn list_tools(&self) -> Result<Vec<ToolSchema>, ToolError> {
+        let req = JsonRpcRequest::new(1, "tools/list", json!({}));
+        let resp = self.send_request(&req)?;
+        if let Some(err) = resp.error {
+            return Err(ToolError::InvalidArguments {
+                tool: self.config.name.clone(),
+                reason: format!("MCP tools/list failed: {err}"),
+            });
+        }
+        let raw_tools = resp
+            .result
+            .as_ref()
+            .and_then(|res| res.get("tools"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::InvalidArguments {
+                tool: self.config.name.clone(),
+                reason: "MCP tools/list response missing 'result.tools' array".to_owned(),
+            })?;
+        let mut schemas = Vec::with_capacity(raw_tools.len());
+        for entry in raw_tools {
+            let wire: McpWireTool = serde_json::from_value(entry.clone())?;
+            schemas.push(ToolSchema {
+                name: wire.name,
+                description: wire.description.unwrap_or_default(),
+                input_schema: wire
+                    .input_schema
+                    .unwrap_or_else(|| json!({"type": "object"})),
+            });
+        }
+        Ok(schemas)
+    }
+
     /// Sends a single JSON-RPC 2.0 request over stdio to the configured MCP server binary.
     pub fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, ToolError> {
         let mut child = Command::new(&self.config.command)
@@ -80,6 +113,15 @@ impl McpClient {
         let _ = child.wait();
         Ok(serde_json::from_str(&response_line)?)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct McpWireTool {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "inputSchema", alias = "input_schema", default)]
+    input_schema: Option<Value>,
 }
 
 /// Wraps an MCP server tool so it conforms to [`Tool`] and passes through [`Capability::Mcp`].
@@ -154,6 +196,23 @@ mod tests {
         let resp: JsonRpcResponse = serde_json::from_str(&out)?;
         assert_eq!(resp.id, 1);
         assert_eq!(resp.result, Some(json!({"content": "pong"})));
+        Ok(())
+    }
+
+    #[test]
+    fn lists_tools_from_fake_server() -> Result<(), Box<dyn std::error::Error>> {
+        let client = McpClient::new(McpServerConfig {
+            name: "fake-list".to_owned(),
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                r#"read -r _; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"echoes text","inputSchema":{"type":"object"}}]}}'"#.to_owned(),
+            ],
+        });
+        let schemas = client.list_tools()?;
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "echo");
+        assert_eq!(schemas[0].description, "echoes text");
         Ok(())
     }
 }

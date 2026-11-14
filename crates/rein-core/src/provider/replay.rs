@@ -21,22 +21,47 @@ impl ReplayProvider {
     pub fn from_events(events: &[SessionEvent]) -> Self {
         let mut queued_turns = VecDeque::new();
         let mut current = Vec::new();
+        let mut saw_tool = false;
+
         for event in events {
             match event {
                 SessionEvent::StreamDelta { delta } => {
+                    if saw_tool {
+                        current.push(ProviderStreamEvent::Done);
+                        queued_turns.push_back(std::mem::take(&mut current));
+                        saw_tool = false;
+                    }
                     current.push(ProviderStreamEvent::TextDelta(delta.clone()));
                 }
                 SessionEvent::ToolRequested { call } => {
+                    saw_tool = true;
                     current.push(ProviderStreamEvent::ToolUse(call.clone()));
-                    current.push(ProviderStreamEvent::Done);
-                    queued_turns.push_back(std::mem::take(&mut current));
+                }
+                SessionEvent::PolicyEvaluated { .. } | SessionEvent::ToolCompleted { .. } => {
+                    if saw_tool {
+                        current.push(ProviderStreamEvent::Done);
+                        queued_turns.push_back(std::mem::take(&mut current));
+                        saw_tool = false;
+                    }
                 }
                 SessionEvent::MessageRecorded { message } if message.role == Role::Assistant => {
-                    current.push(ProviderStreamEvent::Done);
-                    queued_turns.push_back(std::mem::take(&mut current));
+                    if saw_tool || !current.is_empty() {
+                        current.push(ProviderStreamEvent::Done);
+                        queued_turns.push_back(std::mem::take(&mut current));
+                        saw_tool = false;
+                    } else if !message.content.is_empty() {
+                        queued_turns.push_back(vec![
+                            ProviderStreamEvent::TextDelta(message.content.clone()),
+                            ProviderStreamEvent::Done,
+                        ]);
+                    }
                 }
                 _ => {}
             }
+        }
+        if !current.is_empty() {
+            current.push(ProviderStreamEvent::Done);
+            queued_turns.push_back(current);
         }
         Self {
             queued_turns,

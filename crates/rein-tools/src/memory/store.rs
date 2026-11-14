@@ -23,48 +23,82 @@ pub struct MemoryRecord {
 }
 
 /// JSONL-backed store holding [`MemoryRecord`] items without SQL dependencies.
+///
+/// Supports separating `Project` records (`<workspace>/.rein/memory.jsonl`) from
+/// `Personal` records (`~/.rein/memory.jsonl`) via [`JsonlMemoryStore::dual`].
 #[derive(Debug, Clone)]
 pub struct JsonlMemoryStore {
-    path: PathBuf,
+    project_path: PathBuf,
+    personal_path: PathBuf,
 }
 
 impl JsonlMemoryStore {
-    /// Binds a [`JsonlMemoryStore`] to the specified JSONL file path.
+    /// Binds both `Project` and `Personal` scopes to the same JSONL file path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let shared = path.into();
+        Self {
+            project_path: shared.clone(),
+            personal_path: shared,
+        }
     }
 
-    /// Appends a [`MemoryRecord`] to the JSONL store.
+    /// Binds `Project` and `Personal` memory scopes to separate JSONL files.
+    #[must_use]
+    pub fn dual(project_path: impl Into<PathBuf>, personal_path: impl Into<PathBuf>) -> Self {
+        Self {
+            project_path: project_path.into(),
+            personal_path: personal_path.into(),
+        }
+    }
+
+    fn path_for(&self, scope: MemoryScope) -> &PathBuf {
+        match scope {
+            MemoryScope::Project => &self.project_path,
+            MemoryScope::Personal => &self.personal_path,
+        }
+    }
+
+    /// Appends a [`MemoryRecord`] to the JSONL store for `record.scope`.
     pub fn append(&self, record: &MemoryRecord) -> Result<(), ToolError> {
+        let path = self.path_for(record.scope);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|source| ToolError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(path)
             .map_err(|source| ToolError::Io {
-                path: self.path.clone(),
+                path: path.clone(),
                 source,
             })?;
         let line = serde_json::to_string(record)?;
         writeln!(file, "{line}").map_err(|source| ToolError::Io {
-            path: self.path.clone(),
+            path: path.clone(),
             source,
         })
     }
 
     /// Queries records matching `scope` and optional substring `query`.
     pub fn query(&self, scope: MemoryScope, query: &str) -> Result<Vec<MemoryRecord>, ToolError> {
-        if !self.path.exists() {
+        let path = self.path_for(scope);
+        if !path.exists() {
             return Ok(Vec::new());
         }
-        let file = File::open(&self.path).map_err(|source| ToolError::Io {
-            path: self.path.clone(),
+        let file = File::open(path).map_err(|source| ToolError::Io {
+            path: path.clone(),
             source,
         })?;
         let mut matches = Vec::new();
         for line in BufReader::new(file).lines() {
             let raw = line.map_err(|source| ToolError::Io {
-                path: self.path.clone(),
+                path: path.clone(),
                 source,
             })?;
             if raw.trim().is_empty() {
@@ -78,5 +112,41 @@ impl JsonlMemoryStore {
             }
         }
         Ok(matches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dual_store_isolates_project_and_personal_files() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_dual_memory_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let project_file = dir.join("repo/memory.jsonl");
+        let personal_file = dir.join("global/memory.jsonl");
+
+        let store = JsonlMemoryStore::dual(&project_file, &personal_file);
+        store.append(&MemoryRecord {
+            scope: MemoryScope::Project,
+            key: "build".to_owned(),
+            value: "cargo test".to_owned(),
+        })?;
+        store.append(&MemoryRecord {
+            scope: MemoryScope::Personal,
+            key: "editor".to_owned(),
+            value: "nvim".to_owned(),
+        })?;
+
+        let proj = store.query(MemoryScope::Project, "")?;
+        let pers = store.query(MemoryScope::Personal, "")?;
+        assert_eq!(proj.len(), 1);
+        assert_eq!(proj[0].key, "build");
+        assert_eq!(pers.len(), 1);
+        assert_eq!(pers[0].key, "editor");
+        assert!(project_file.exists());
+        assert!(personal_file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

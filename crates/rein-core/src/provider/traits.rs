@@ -31,7 +31,7 @@ pub enum ProviderStreamEvent {
 }
 
 /// Clean model provider abstraction supporting cloud streaming now and local backends later.
-pub trait Provider {
+pub trait Provider: Send {
     /// Human-readable provider identifier.
     #[must_use]
     fn name(&self) -> &str;

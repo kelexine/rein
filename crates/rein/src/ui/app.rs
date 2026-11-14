@@ -1,31 +1,43 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: In-process TUI state driving Core, Policy, Tools, and Modes without IPC
+// Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, and Modes in-process
 
 use crate::modes::Profile;
 
-/// State owned by the in-process Ratatui frontend.
+/// State owned by the in-process minimalist Ratatui frontend.
 #[derive(Debug)]
 pub struct AppState {
     active_profile: Profile,
     sandbox_summary: String,
+    model_name: String,
     transcript: Vec<String>,
     input: String,
     pending_prompt: Option<String>,
     scroll_offset: u16,
+    auto_scroll: bool,
+    busy: bool,
+    streaming_active: bool,
 }
 
 impl AppState {
-    /// Creates a new [`AppState`] starting in the given [`Profile`].
+    /// Creates a new [`AppState`] starting in `initial` profile.
     #[must_use]
-    pub fn new(initial: Profile, sandbox_summary: impl Into<String>) -> Self {
+    pub fn new(
+        initial: Profile,
+        sandbox_summary: impl Into<String>,
+        model_name: impl Into<String>,
+    ) -> Self {
         Self {
             active_profile: initial,
             sandbox_summary: sandbox_summary.into(),
+            model_name: model_name.into(),
             transcript: Vec::new(),
             input: String::new(),
             pending_prompt: None,
             scroll_offset: 0,
+            auto_scroll: true,
+            busy: false,
+            streaming_active: false,
         }
     }
 
@@ -40,16 +52,28 @@ impl AppState {
         &self.active_profile
     }
 
-    /// Returns the sandbox status summary shown in the footer.
+    /// Returns the concise sandbox label shown in the status bar.
     #[must_use]
     pub fn sandbox_summary(&self) -> &str {
         &self.sandbox_summary
+    }
+
+    /// Returns the active model name shown in the status bar.
+    #[must_use]
+    pub fn model_name(&self) -> &str {
+        &self.model_name
     }
 
     /// Returns the rendered transcript lines.
     #[must_use]
     pub fn transcript(&self) -> &[String] {
         &self.transcript
+    }
+
+    /// Replaces the transcript with hydrated lines (used by `--resume`).
+    pub fn extend_transcript(&mut self, lines: impl IntoIterator<Item = String>) {
+        self.transcript.extend(lines);
+        self.auto_scroll = true;
     }
 
     /// Returns the current input buffer.
@@ -84,34 +108,80 @@ impl AppState {
         self.pending_prompt.as_deref()
     }
 
-    /// Appends a line to the TUI transcript view.
-    pub fn push_line(&mut self, line: impl Into<String>) {
-        self.transcript.push(line.into());
-    }
-
-    /// Appends streamed text into the latest assistant transcript line.
-    pub fn append_stream_delta(&mut self, delta: &str) {
-        if let Some(last) = self.transcript.last_mut()
-            && last.starts_with("Rein: ")
-        {
-            last.push_str(delta);
-        } else {
-            self.transcript.push(format!("Rein: {delta}"));
+    /// Marks whether a background model turn is currently streaming.
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        if !busy {
+            self.streaming_active = false;
         }
     }
 
-    /// Returns the vertical scroll offset.
+    /// Returns `true` while a turn is streaming on the background worker thread.
     #[must_use]
-    pub fn scroll_offset(&self) -> u16 {
-        self.scroll_offset
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 
-    /// Adjusts transcript scroll offset safely.
-    pub fn scroll_by(&mut self, delta: i16) {
-        if delta < 0 {
-            self.scroll_offset = self.scroll_offset.saturating_sub(delta.unsigned_abs());
+    /// Appends a standalone line to the transcript (user prompt, tool status, or error).
+    pub fn push_line(&mut self, line: impl Into<String>) {
+        self.streaming_active = false;
+        self.transcript.push(line.into());
+        self.auto_scroll = true;
+    }
+
+    /// Appends streamed assistant tokens cleanly, handling embedded newlines.
+    pub fn append_stream_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let mut parts = delta.split('\n');
+        if let Some(first) = parts.next() {
+            if self.streaming_active
+                && let Some(last) = self.transcript.last_mut()
+            {
+                last.push_str(first);
+            } else {
+                self.transcript.push(first.to_owned());
+                self.streaming_active = true;
+            }
+        }
+        for rest in parts {
+            self.transcript.push(rest.to_owned());
+        }
+        self.auto_scroll = true;
+    }
+
+    /// Returns whether auto-scroll to the newest line is active.
+    #[must_use]
+    pub fn auto_scroll(&self) -> bool {
+        self.auto_scroll
+    }
+
+    /// Returns the current manual scroll offset, or updates it relative to max scroll.
+    #[must_use]
+    pub fn effective_scroll(&self, max_scroll: u16) -> u16 {
+        if self.auto_scroll {
+            max_scroll
         } else {
-            self.scroll_offset = self.scroll_offset.saturating_add(delta.unsigned_abs());
+            self.scroll_offset.min(max_scroll)
+        }
+    }
+
+    /// Adjusts transcript scroll offset safely against the current viewport max scroll.
+    pub fn scroll_by(&mut self, delta: i16, max_scroll: u16) {
+        let base = if self.auto_scroll {
+            max_scroll
+        } else {
+            self.scroll_offset.min(max_scroll)
+        };
+        if delta < 0 {
+            self.scroll_offset = base.saturating_sub(delta.unsigned_abs());
+            self.auto_scroll = false;
+        } else {
+            self.scroll_offset = base.saturating_add(delta.unsigned_abs()).min(max_scroll);
+            if self.scroll_offset >= max_scroll {
+                self.auto_scroll = true;
+            }
         }
     }
 }
