@@ -12,12 +12,13 @@ use rein_core::ModeId;
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
 use crate::ui::app::{
-    PendingApproval, PendingModelPicker, PendingSessionPicker, model_vendor_group,
+    PendingApproval, PendingModelPicker, PendingSessionPicker, is_model_active, model_vendor_group,
 };
 use crate::ui::entries::render_transcript_lines;
 
 const MAX_MENU_ROWS: usize = 6;
 const MAX_MODEL_MENU_ROWS: usize = 10;
+const MAX_PROMPT_ROWS: usize = 6;
 const MIN_HEIGHT_FOR_HEADER: u16 = 14;
 const CITADEL_OWL: [&str; 3] = ["▜▙████▟▛", "▐▛▄██▄▜▌", " ▝▜▀▀▛▘ "];
 const SPINNER_FRAMES: [&str; 6] = ["✶", "✢", "✽", "✻", "✳", "·"];
@@ -32,11 +33,21 @@ pub fn header_height(state: &AppState, total_height: u16) -> u16 {
     if notice_rows == 0 { 4 } else { 5 + notice_rows }
 }
 
+fn prompt_rows(state: &AppState, total_width: u16, total_height: u16) -> u16 {
+    if state.pending_approval().is_some() {
+        return 1;
+    }
+    let (lines, _, _) = build_wrapped_prompt(state.input(), state.input_cursor_byte(), total_width);
+    let max_rows = MAX_PROMPT_ROWS.min(usize::from(total_height.saturating_sub(8).max(1)));
+    u16::try_from(lines.len().clamp(1, max_rows.max(1))).unwrap_or(1)
+}
+
 fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
     let popup_rows = compute_popup_rows(state, matches.len());
     let spinner_rows = u16::from(state.is_busy() && state.pending_approval().is_none());
+    let input_rows = prompt_rows(state, area.width, area.height);
 
     Layout::default()
         .direction(Direction::Vertical)
@@ -46,7 +57,7 @@ fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Length(spinner_rows),
             Constraint::Length(popup_rows),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(input_rows),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -284,7 +295,8 @@ fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         .collect();
     frame.render_widget(Paragraph::new(owl_lines), cols[1]);
 
-    let mode_label = mode_name(state.active_profile().mode);
+    let mode = state.active_profile().mode;
+    let mode_label = mode_name(mode);
     let info_lines = vec![
         Line::from(vec![
             Span::styled("Rein", Style::default().add_modifier(Modifier::BOLD)),
@@ -296,7 +308,7 @@ fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled(state.model_name(), Style::default().fg(Color::LightBlue)),
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(mode_label, Style::default().fg(Color::Cyan)),
+            Span::styled(mode_label, Style::default().fg(mode_color(mode))),
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 state.sandbox_summary(),
@@ -423,7 +435,7 @@ fn render_model_picker(
         if is_selected {
             selected_row = body_rows.len();
         }
-        let is_active = current_model.ends_with(&item.id);
+        let is_active = is_model_active(current_model, &item.id);
         let marker = if is_selected { "  › " } else { "    " };
         let padded_id = format!("{marker}{:<width$}", item.id, width = id_col);
 
@@ -714,29 +726,118 @@ fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let line = Line::from(vec![
-        Span::styled(glyph, glyph_style),
-        Span::raw(state.input()),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let (visual_lines, cursor_row, cursor_col) =
+        build_wrapped_prompt(state.input(), state.input_cursor_byte(), area.width);
+    let visible_rows = usize::from(area.height.max(1));
+    let scroll_top = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
+    let rendered: Vec<Line<'_>> = visual_lines
+        .iter()
+        .enumerate()
+        .skip(scroll_top)
+        .take(visible_rows)
+        .map(|(idx, text)| {
+            if idx == 0 {
+                Line::from(vec![
+                    Span::styled(glyph, glyph_style),
+                    Span::raw(text.as_str()),
+                ])
+            } else {
+                Line::from(vec![Span::raw("  "), Span::raw(text.as_str())])
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rendered), area);
 
-    let cursor_offset = u16::try_from(state.input().chars().count()).unwrap_or(u16::MAX);
+    let cursor_offset_x = u16::try_from(cursor_col).unwrap_or(u16::MAX);
+    let cursor_offset_y = u16::try_from(cursor_row.saturating_sub(scroll_top)).unwrap_or(0);
     let cursor_x = area
         .x
         .saturating_add(2)
-        .saturating_add(cursor_offset)
+        .saturating_add(cursor_offset_x)
         .min(area.right().saturating_sub(1));
-    frame.set_cursor_position(Position::new(cursor_x, area.y));
+    let cursor_y = area
+        .y
+        .saturating_add(cursor_offset_y)
+        .min(area.bottom().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn build_wrapped_prompt(
+    input: &str,
+    cursor_byte: usize,
+    total_width: u16,
+) -> (Vec<String>, usize, usize) {
+    let inner_cols = usize::from(total_width.saturating_sub(2).max(1));
+    let mut rows = Vec::new();
+    let mut cursor_pos: Option<(usize, usize)> = None;
+    let mut byte_pos = 0usize;
+
+    for raw_line in input.split('\n') {
+        if raw_line.is_empty() {
+            let row_idx = rows.len();
+            rows.push(String::new());
+            if cursor_pos.is_none() && cursor_byte <= byte_pos {
+                cursor_pos = Some((row_idx, 0));
+            }
+            byte_pos = byte_pos.saturating_add(1);
+            continue;
+        }
+        let mut remaining = raw_line;
+        let mut seg_offset = byte_pos;
+        while !remaining.is_empty() {
+            let chunk: String = remaining.chars().take(inner_cols).collect();
+            let chunk_bytes = chunk.len();
+            let chunk_end = seg_offset + chunk_bytes;
+            let row_idx = rows.len();
+            let is_line_end = chunk_bytes == remaining.len();
+            if cursor_pos.is_none()
+                && cursor_byte >= seg_offset
+                && (cursor_byte < chunk_end || (is_line_end && cursor_byte == chunk_end))
+            {
+                let col = remaining[..cursor_byte - seg_offset].chars().count();
+                cursor_pos = Some((row_idx, col));
+            }
+            rows.push(chunk);
+            remaining = &remaining[chunk_bytes..];
+            seg_offset = chunk_end;
+        }
+        byte_pos = seg_offset.saturating_add(1);
+    }
+
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let (c_row, c_col) =
+        cursor_pos.unwrap_or((rows.len() - 1, rows.last().map_or(0, |r| r.chars().count())));
+    (rows, c_row, c_col)
 }
 
 fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
-    let mode_label = mode_name(state.active_profile().mode);
+    let mode = state.active_profile().mode;
+    let mode_label = mode_name(mode);
     let toggle_label = if state.expand_outputs() {
         "ctrl+o: collapse"
     } else {
         "ctrl+o: expand"
     };
-    let right = format!("{toggle_label} · tab: mode · /: commands · esc: quit");
+    let (right, right_style) = if state.ctrl_c_exit_armed() {
+        (
+            "press ctrl+c again within 2s to exit".to_owned(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if state.is_busy() {
+        (
+            format!("{toggle_label} · esc: stop · ctrl+c x2: exit"),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            format!("{toggle_label} · tab: mode · /: commands · /exit"),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
     let right_width = u16::try_from(right.chars().count()).unwrap_or(52);
     let bar_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -748,7 +849,7 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         .split(area);
 
     let mut left_spans = vec![
-        Span::styled(mode_label, Style::default().fg(Color::Cyan)),
+        Span::styled(mode_label, Style::default().fg(mode_color(mode))),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             state.sandbox_summary(),
@@ -774,10 +875,7 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(left_spans)), bar_cols[0]);
-    frame.render_widget(
-        Paragraph::new(right).style(Style::default().fg(Color::DarkGray)),
-        bar_cols[2],
-    );
+    frame.render_widget(Paragraph::new(right).style(right_style), bar_cols[2]);
 }
 
 fn sandbox_color(summary: &str) -> Color {
@@ -810,7 +908,16 @@ fn format_tokens(total: u64) -> String {
 fn mode_name(mode: ModeId) -> &'static str {
     match mode {
         ModeId::Coding => "coding",
+        ModeId::Plan => "plan",
         ModeId::Personal => "personal",
+    }
+}
+
+fn mode_color(mode: ModeId) -> Color {
+    match mode {
+        ModeId::Coding => Color::Cyan,
+        ModeId::Plan => Color::LightMagenta,
+        ModeId::Personal => Color::Rgb(115, 210, 125),
     }
 }
 
@@ -998,6 +1105,29 @@ mod tests {
         assert!(all_text.contains("3 turns"));
         assert!(all_text.contains("(active)"));
         assert!(all_text.contains("deadbeef"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_plan_mode_and_multiline_prompt_box() -> std::io::Result<()> {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend)?;
+        let mut state = AppState::new(Profile::plan(), "landlock v11", "antigravity/gemini-4");
+        state.push_input_str("first line\nsecond line\nthird line");
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let all_text: String = (0..20)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(all_text.contains("plan"));
+        assert!(all_text.contains("first line"));
+        assert!(all_text.contains("second line"));
+        assert!(all_text.contains("third line"));
+        assert!(all_text.contains("/exit"));
+        assert!(!all_text.contains("esc: quit"));
         Ok(())
     }
 }

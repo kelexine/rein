@@ -14,6 +14,7 @@ const PROTECTED_COMPONENTS: &[&str] = &[".git", ".vscode", ".rein"];
 #[must_use]
 pub fn classify_path_token(raw_token: &str, sandbox: Option<&WorkspaceSandbox>) -> TargetScope {
     let token = raw_token.strip_prefix("file://").unwrap_or(raw_token);
+    let token = strip_pwd_prefix(token);
     if token.is_empty() || token == "/dev/null" || token == "/dev/zero" {
         return TargetScope::Workspace;
     }
@@ -46,6 +47,16 @@ pub fn is_protected_path(token: &str) -> bool {
         }
     }
     false
+}
+
+fn strip_pwd_prefix(token: &str) -> &str {
+    if token == "$PWD" || token == "${PWD}" {
+        return ".";
+    }
+    token
+        .strip_prefix("$PWD/")
+        .or_else(|| token.strip_prefix("${PWD}/"))
+        .unwrap_or(token)
 }
 
 fn is_explicit_outside_path(token: &str) -> bool {

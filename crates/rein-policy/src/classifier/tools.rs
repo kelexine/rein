@@ -26,6 +26,9 @@ pub fn classify_tool_specific(
         "rg" => classify_rg(cmd, sandbox),
         "git" => classify_git(cmd, sandbox),
         "cargo" => classify_cargo(cmd, sandbox),
+        "rustc" => classify_rustc(cmd, sandbox),
+        "rustfmt" => classify_rustfmt(cmd, sandbox),
+        "jq" => classify_jq(cmd, sandbox),
         "go" => classify_go(cmd, sandbox),
         "ruff" => classify_ruff(cmd, sandbox),
         "ssh" => classify_ssh(cmd),
@@ -279,11 +282,29 @@ fn classify_git(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shel
             TargetScope::Protected,
             "git config modifies protected repository/hook settings",
         ),
-        "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "blame" | "grep" => {
+        "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "blame" | "grep"
+        | "describe" | "shortlog" | "name-rev" | "merge-base" | "rev-list" | "ls-tree"
+        | "cat-file" => ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            tail_scope,
+            format!("git {sub} read-only"),
+        ),
+        "branch" if is_readonly_git_branch(cmd) => {
+            ShellClassification::with_target(EffectLevel::ReadOnly, tail_scope, "git branch list")
+        }
+        "tag" if is_readonly_git_tag(cmd) => {
+            ShellClassification::with_target(EffectLevel::ReadOnly, tail_scope, "git tag list")
+        }
+        "remote"
+            if cmd
+                .positionals
+                .get(1)
+                .is_none_or(|s| matches!(s.as_str(), "get-url") || s.starts_with('-')) =>
+        {
             ShellClassification::with_target(
                 EffectLevel::ReadOnly,
                 tail_scope,
-                format!("git {sub} read-only"),
+                "git remote read-only",
             )
         }
         "push" | "fetch" | "pull" | "clone" | "ls-remote" => ShellClassification::with_target(
@@ -320,11 +341,30 @@ fn classify_cargo(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Sh
         scope = scope.max(classify_args_scope(&cmd.positionals[1..], sandbox));
     }
     match sub {
+        Some("fmt") if cmd.has_long_prefix("check") => ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            scope,
+            "cargo fmt --check read-only",
+        ),
         Some("fmt") => ShellClassification::with_target(
             EffectLevel::WorkspaceWrite,
             scope,
             "cargo fmt formats workspace",
         ),
+        Some("locate-project" | "verify-project" | "read-manifest" | "pkgid") => {
+            ShellClassification::with_target(
+                EffectLevel::ReadOnly,
+                scope,
+                "cargo manifest inspection read-only",
+            )
+        }
+        Some("metadata") if cmd.has_long_prefix("no-deps") || cmd.has_long_prefix("offline") => {
+            ShellClassification::with_target(
+                EffectLevel::ReadOnly,
+                scope,
+                "cargo offline/no-deps metadata read-only",
+            )
+        }
         Some("fetch" | "publish" | "login" | "owner" | "yank") => ShellClassification::with_target(
             EffectLevel::Network,
             scope.max(TargetScope::OutsideWorkspace),
@@ -341,6 +381,104 @@ fn classify_cargo(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Sh
             "cargo executes build.rs and proc-macros",
         ),
     }
+}
+
+fn is_readonly_git_branch(cmd: &ParsedCommand) -> bool {
+    let mutating = cmd.has_short('d')
+        || cmd.has_short('D')
+        || cmd.has_short('m')
+        || cmd.has_short('M')
+        || cmd.has_short('c')
+        || cmd.has_short('C')
+        || cmd.has_long_prefix("delete")
+        || cmd.has_long_prefix("move")
+        || cmd.has_long_prefix("copy")
+        || cmd.has_long_prefix("set-upstream")
+        || cmd.has_long_prefix("unset-upstream")
+        || cmd.has_long_prefix("edit-description");
+    if mutating {
+        return false;
+    }
+    cmd.positionals.len() <= 1
+        || cmd.has_long_prefix("list")
+        || cmd.has_short('l')
+        || cmd.has_long_prefix("contains")
+        || cmd.has_long_prefix("merged")
+        || cmd.has_long_prefix("no-merged")
+        || cmd.has_long_prefix("show-current")
+}
+
+fn is_readonly_git_tag(cmd: &ParsedCommand) -> bool {
+    let mutating = cmd.has_short('d')
+        || cmd.has_short('f')
+        || cmd.has_short('a')
+        || cmd.has_short('s')
+        || cmd.has_short('m')
+        || cmd.has_long_prefix("delete")
+        || cmd.has_long_prefix("force")
+        || cmd.has_long_prefix("annotate")
+        || cmd.has_long_prefix("sign");
+    !mutating
+        && (cmd.positionals.len() <= 1
+            || cmd.has_short('l')
+            || cmd.has_long_prefix("list")
+            || cmd.has_short('v')
+            || cmd.has_long_prefix("verify"))
+}
+
+fn classify_rustc(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
+    let scope = classify_args_scope(&cmd.positionals, sandbox);
+    if cmd.has_long_prefix("version")
+        || cmd.has_short('V')
+        || cmd.has_long_prefix("help")
+        || cmd.has_short('h')
+        || cmd.has_long_prefix("print")
+    {
+        return ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            scope,
+            "rustc info query read-only",
+        );
+    }
+    ShellClassification::with_target(EffectLevel::Exec, scope, "rustc compilation")
+}
+
+fn classify_rustfmt(
+    cmd: &ParsedCommand,
+    sandbox: Option<&WorkspaceSandbox>,
+) -> ShellClassification {
+    let scope = classify_args_scope(&cmd.positionals, sandbox);
+    if cmd.has_long_prefix("check")
+        || cmd.has_long_prefix("version")
+        || cmd.has_short('V')
+        || cmd.has_long_prefix("help")
+    {
+        return ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            scope,
+            "rustfmt --check read-only",
+        );
+    }
+    let eff = if scope == TargetScope::OutsideWorkspace {
+        EffectLevel::OutsideWrite
+    } else {
+        EffectLevel::WorkspaceWrite
+    };
+    ShellClassification::with_target(eff, scope, "rustfmt formats file(s)")
+}
+
+fn classify_jq(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
+    if cmd.has_short('f') || cmd.has_long_prefix("from-file") {
+        let scope = classify_args_scope(&cmd.raw_args, sandbox);
+        return ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            scope,
+            "jq reads filter/input files",
+        );
+    }
+    let files: Vec<String> = cmd.positionals.iter().skip(1).cloned().collect();
+    let scope = classify_args_scope(&files, sandbox);
+    ShellClassification::with_target(EffectLevel::ReadOnly, scope, "jq filter read-only")
 }
 
 fn classify_go(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {

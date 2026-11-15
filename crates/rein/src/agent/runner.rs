@@ -3,14 +3,15 @@
 // Purpose: In-process typestate agent loop wiring ContextBuilder, Provider, PolicyEngine, and ToolRegistry
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use rein_core::{
-    EventLog, MemoryScope, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent,
-    ToolCall, ToolOutput, ToolSpec, Turn, UsageStats,
+    CoreError, EventLog, MemoryScope, Message, ModeId, Provider, ProviderStreamEvent, Role,
+    SessionEvent, ToolCall, ToolOutput, ToolSpec, Turn, UsageStats,
 };
 use rein_policy::{PolicyDecision, PolicyEngine, WorkspaceSandbox, suggest_command_allow_pattern};
-use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema};
+use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema, parse_mode_id};
 
 use crate::config::append_allowed_command;
 use crate::modes::{ContextBuilder, ModeManager, Profile};
@@ -91,6 +92,9 @@ pub trait ApprovalPrompter {
 
     /// Notified once per provider turn with reported token usage.
     fn on_usage(&mut self, _usage: UsageStats) {}
+
+    /// Notified immediately when `switch_mode` changes the active profile mid-turn.
+    fn on_mode_switched(&mut self, _profile: &Profile) {}
 }
 
 /// Coordinates the single-process agent turn loop across Core, Policy, Tools, and Modes.
@@ -191,10 +195,11 @@ impl AgentLoop {
         &self.history
     }
 
-    /// Toggles between `Coding` and `Personal` profiles via [`ModeManager`].
+    /// Cycles between `Coding`, `Plan`, and `Personal` profiles via [`ModeManager`].
     pub fn toggle_mode(&mut self) -> Result<ModeId> {
         let next_mode = match self.modes.active().mode {
-            ModeId::Coding => ModeId::Personal,
+            ModeId::Coding => ModeId::Plan,
+            ModeId::Plan => ModeId::Personal,
             ModeId::Personal => ModeId::Coding,
         };
         self.set_mode(next_mode)
@@ -405,12 +410,27 @@ impl AgentLoop {
         provider: &mut dyn Provider,
         prompter: &mut dyn ApprovalPrompter,
     ) -> Result<String> {
+        let never = AtomicBool::new(false);
+        self.run_user_prompt_cancellable(prompt, provider, prompter, &never)
+    }
+
+    /// Executes a user prompt through the typestate loop, aborting cleanly if `cancel` is set.
+    pub fn run_user_prompt_cancellable(
+        &mut self,
+        prompt: &str,
+        provider: &mut dyn Provider,
+        prompter: &mut dyn ApprovalPrompter,
+        cancel: &AtomicBool,
+    ) -> Result<String> {
         let user_msg = Message::new(Role::User, prompt);
         record_full_message(self.full_transcript_path.as_deref(), &user_msg)?;
         self.history.push(user_msg);
         let mut final_text = String::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CoreError::Cancelled.into());
+            }
             let assembled = ContextBuilder::new(self.modes.active(), &self.memory)
                 .build(&self.history, &self.registry)
                 .context("failed to assemble turn context")?;
@@ -425,16 +445,28 @@ impl AgentLoop {
             let mut streamed_text = String::new();
             let mut requested_calls: Vec<ToolCall> = Vec::new();
             let mut turn_usage: Option<UsageStats> = None;
-            let events = provider.stream_turn_with(
+            let events = match provider.stream_turn_cancellable(
                 &assembled.system_prompt,
                 &assembled.messages,
                 &specs,
+                cancel,
                 &mut |ev| match ev {
                     ProviderStreamEvent::ThinkingDelta(delta) => prompter.on_thinking_delta(delta),
                     ProviderStreamEvent::TextDelta(delta) => prompter.on_delta(delta),
                     _ => {}
                 },
-            )?;
+            ) {
+                Ok(evs) => evs,
+                Err(CoreError::Cancelled) => {
+                    finalize_cancelled_stream(
+                        streaming,
+                        self.full_transcript_path.as_deref(),
+                        &mut self.history,
+                    )?;
+                    return Err(CoreError::Cancelled.into());
+                }
+                Err(err) => return Err(err.into()),
+            };
 
             for ev in events {
                 match ev {
@@ -452,6 +484,15 @@ impl AgentLoop {
                 prompter.on_usage(usage);
             }
 
+            if cancel.load(Ordering::Relaxed) {
+                finalize_cancelled_stream(
+                    streaming,
+                    self.full_transcript_path.as_deref(),
+                    &mut self.history,
+                )?;
+                return Err(CoreError::Cancelled.into());
+            }
+
             if requested_calls.is_empty() {
                 let (_idle, msg) = streaming.finish_response()?;
                 final_text = msg.content.clone();
@@ -461,27 +502,55 @@ impl AgentLoop {
             }
             execute_tool_batch(
                 streaming,
+                &self.event_log,
                 self.full_transcript_path.as_deref(),
                 self.repo_commands_path.as_deref(),
                 self.global_commands_path.as_deref(),
                 &mut self.policy,
                 &mut self.allowed_commands,
+                &self.extra_tools,
                 &self.registry,
-                &self.modes,
+                &mut self.modes,
                 &mut self.history,
                 &streamed_text,
                 requested_calls,
                 prompter,
+                cancel,
             )?;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CoreError::Cancelled.into());
+            }
         }
         Ok(final_text)
     }
 
     fn build_profile(&self, mode: ModeId) -> Profile {
-        Profile::for_mode(mode)
-            .with_allowed_commands(self.allowed_commands.clone())
-            .with_extra_tools(&self.extra_tools)
+        build_mode_profile(mode, &self.allowed_commands, &self.extra_tools)
     }
+}
+
+fn build_mode_profile(
+    mode: ModeId,
+    allowed_commands: &[String],
+    extra_tools: &[String],
+) -> Profile {
+    Profile::for_mode(mode)
+        .with_allowed_commands(allowed_commands.to_vec())
+        .with_extra_tools(extra_tools)
+}
+
+fn finalize_cancelled_stream(
+    streaming: Turn<'_, rein_core::Streaming>,
+    full_transcript_path: Option<&Path>,
+    history: &mut Vec<Message>,
+) -> Result<()> {
+    let (_idle, mut msg) = streaming.finish_response()?;
+    if msg.content.trim().is_empty() {
+        msg.content = "[stopped by user]".to_owned();
+    }
+    record_full_message(full_transcript_path, &msg)?;
+    history.push(msg);
+    Ok(())
 }
 
 fn flush_tool_round(
@@ -520,17 +589,20 @@ fn flush_tool_round(
 #[allow(clippy::too_many_arguments)]
 fn execute_tool_batch(
     streaming: Turn<'_, rein_core::Streaming>,
+    event_log: &EventLog,
     full_transcript_path: Option<&Path>,
     repo_commands_path: Option<&Path>,
     global_commands_path: Option<&Path>,
     policy: &mut PolicyEngine,
     allowed_commands: &mut Vec<String>,
+    extra_tools: &[String],
     registry: &ToolRegistry,
-    modes: &ModeManager,
+    modes: &mut ModeManager,
     history: &mut Vec<Message>,
     streamed_text: &str,
     calls: Vec<ToolCall>,
     prompter: &mut dyn ApprovalPrompter,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut assistant_msg = Message::new(Role::Assistant, streamed_text);
     assistant_msg.tool_calls = calls.clone();
@@ -543,28 +615,34 @@ fn execute_tool_batch(
     };
     let mut idle = execute_awaiting(
         streaming.request_tool(first)?,
+        event_log,
         full_transcript_path,
         repo_commands_path,
         global_commands_path,
         policy,
         allowed_commands,
+        extra_tools,
         registry,
         modes,
         history,
         prompter,
+        cancel,
     )?;
     for call in iter {
         idle = execute_awaiting(
             idle.request_tool(call)?,
+            event_log,
             full_transcript_path,
             repo_commands_path,
             global_commands_path,
             policy,
             allowed_commands,
+            extra_tools,
             registry,
             modes,
             history,
             prompter,
+            cancel,
         )?;
     }
     Ok(())
@@ -573,19 +651,35 @@ fn execute_tool_batch(
 #[allow(clippy::too_many_arguments)]
 fn execute_awaiting<'a>(
     awaiting: Turn<'a, rein_core::AwaitingPolicy>,
+    event_log: &EventLog,
     full_transcript_path: Option<&Path>,
     repo_commands_path: Option<&Path>,
     global_commands_path: Option<&Path>,
     policy: &mut PolicyEngine,
     allowed_commands: &mut Vec<String>,
+    extra_tools: &[String],
     registry: &ToolRegistry,
-    modes: &ModeManager,
+    modes: &mut ModeManager,
     history: &mut Vec<Message>,
     prompter: &mut dyn ApprovalPrompter,
+    cancel: &AtomicBool,
 ) -> Result<Turn<'a, rein_core::Idle>> {
     let call = awaiting.pending_call().clone();
     prompter.on_tool_status(&format_tool_status(&call));
     prompter.on_tool_start(&call);
+
+    if cancel.load(Ordering::Relaxed) {
+        let (idle, mut output) = awaiting.deny("cancelled by user")?;
+        if output.content.is_empty() {
+            output.content = "cancelled by user".to_owned();
+        }
+        prompter.on_tool_finish(&call, &output);
+        let mut tool_msg = Message::new(Role::Tool, output.content);
+        tool_msg.tool_calls.push(call);
+        record_full_message(full_transcript_path, &tool_msg)?;
+        history.push(tool_msg);
+        return Ok(idle);
+    }
 
     let decision =
         registry.evaluate_turn_for_profile(&awaiting, policy, &modes.active().allowed_tools)?;
@@ -647,6 +741,20 @@ fn execute_awaiting<'a>(
         }
         PolicyDecision::Deny { reason } => awaiting.deny(reason)?,
     };
+
+    if call.name == "switch_mode"
+        && !output.is_error
+        && let Some(raw_mode) = call
+            .arguments
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+        && let Ok(target_mode) = parse_mode_id(raw_mode)
+        && modes.active().mode != target_mode
+    {
+        let next_profile = build_mode_profile(target_mode, allowed_commands, extra_tools);
+        let _ = modes.switch_to(next_profile, policy, event_log)?;
+        prompter.on_mode_switched(modes.active());
+    }
 
     if output.content.is_empty() {
         output.content = "(no output)".to_owned();
@@ -785,6 +893,7 @@ pub fn format_tool_status(call: &ToolCall) -> String {
         .or_else(|| call.arguments.get("command"))
         .or_else(|| call.arguments.get("program"))
         .or_else(|| call.arguments.get("action"))
+        .or_else(|| call.arguments.get("mode"))
         .or_else(|| call.arguments.get("key"))
         .and_then(serde_json::Value::as_str);
     match target {
@@ -1188,6 +1297,82 @@ mod tests {
                 .find(|m| m.role == Role::Tool)
                 .is_some_and(|m| m.content.contains("use cargo check instead"))
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn model_initiated_switch_mode_updates_active_profile_and_toolset() -> Result<()> {
+        let dir = std::env::temp_dir().join("rein_agent_switch_mode_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let events = vec![
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_sw_1".to_owned(),
+                    name: "switch_mode".to_owned(),
+                    arguments: serde_json::json!({ "mode": "plan", "reason": "design first" }),
+                },
+            },
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_notes_denied".to_owned(),
+                    name: "notes".to_owned(),
+                    arguments: serde_json::json!({ "action": "list" }),
+                },
+            },
+            SessionEvent::ToolRequested {
+                call: ToolCall {
+                    id: "call_sw_2".to_owned(),
+                    name: "switch_mode".to_owned(),
+                    arguments: serde_json::json!({ "mode": "personal", "reason": "check notes" }),
+                },
+            },
+            SessionEvent::StreamDelta {
+                delta: "Now in personal mode.".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "Now in personal mode."),
+            },
+        ];
+        let mut replay = ReplayProvider::from_events(&events);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadTool::new(WorkspaceSandbox::new(&dir))));
+        registry.register(Box::new(rein_tools::SwitchModeTool::new()));
+        registry.register(Box::new(rein_tools::NotesTool::new(
+            dir.join("notes.jsonl"),
+        )));
+        let profile = Profile::coding();
+        let policy = PolicyEngine::new(
+            profile.policy_rules.clone(),
+            WorkspaceSandbox::new(&dir),
+            AuditLog::new(dir.join("audit.jsonl")),
+        );
+        let mut agent = AgentLoop::new(
+            EventLog::new(dir.join("session.jsonl")),
+            policy,
+            registry,
+            JsonlMemoryStore::new(dir.join("memory.jsonl")),
+            profile,
+        );
+        let mut prompter = RecordingPrompter::new();
+        let out =
+            agent.run_user_prompt("switch to plan then personal", &mut replay, &mut prompter)?;
+        assert_eq!(out, "Now in personal mode.");
+        assert_eq!(agent.active_profile().mode, ModeId::Personal);
+        assert_eq!(agent.toggle_mode()?, ModeId::Coding);
+        assert_eq!(agent.toggle_mode()?, ModeId::Plan);
+        assert_eq!(agent.toggle_mode()?, ModeId::Personal);
+
+        let denied_notes = agent.history().iter().find(|m| {
+            m.role == Role::Tool
+                && m.tool_calls
+                    .first()
+                    .is_some_and(|c| c.id == "call_notes_denied")
+        });
+        assert!(denied_notes.is_some_and(|m| m.content.contains("not enabled")));
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

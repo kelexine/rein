@@ -38,8 +38,22 @@ impl SseEventAccumulator {
         reader: R,
         on_event: &mut dyn FnMut(&ProviderStreamEvent),
     ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        self.read_stream_cancellable(reader, &never, on_event)
+    }
+
+    /// Reads an SSE byte stream to completion or until `cancel` is set, emitting events live.
+    pub fn read_stream_cancellable<R: BufRead>(
+        &mut self,
+        reader: R,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_event: &mut dyn FnMut(&ProviderStreamEvent),
+    ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
         let mut emitted = Vec::new();
         for line in reader.lines() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CoreError::Cancelled);
+            }
             let line = line.map_err(|err| CoreError::Provider(format!("SSE read error: {err}")))?;
             let trimmed = line.trim();
             if let Some(payload) = trimmed.strip_prefix("data:") {

@@ -36,6 +36,12 @@ impl ContextStrategy {
         }
     }
 
+    /// Plan strategy: long history and large read-only inspection outputs matching Coding mode.
+    #[must_use]
+    pub fn plan() -> Self {
+        Self::coding()
+    }
+
     /// Personal strategy: shorter history, small tool outputs, richer memory recall.
     #[must_use]
     pub fn personal() -> Self {
@@ -119,7 +125,20 @@ fn scope_label(scope: MemoryScope) -> &'static str {
 }
 
 fn window_history(history: &[Message], strategy: &ContextStrategy) -> Vec<Message> {
-    let skip = history.len().saturating_sub(strategy.max_history_messages);
+    let mut skip = history.len().saturating_sub(strategy.max_history_messages);
+    if skip > 0 {
+        // Advancing past tool results and assistant function-call turns prevents slicing a tool_call/tool_result pair.
+        while history.get(skip).is_some_and(|m| {
+            m.role == Role::Tool || (m.role == Role::Assistant && !m.tool_calls.is_empty())
+        }) {
+            skip += 1;
+        }
+        if skip >= history.len()
+            && let Some(prev_user) = history.iter().rposition(|m| m.role == Role::User)
+        {
+            skip = prev_user;
+        }
+    }
     history
         .iter()
         .skip(skip)
@@ -188,5 +207,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn window_history_skips_orphaned_leading_tool_results_after_slice() {
+        let mut assistant = Message::new(Role::Assistant, "running bash");
+        assistant.tool_calls.push(rein_core::message::ToolCall {
+            id: "c1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        let mut tool = Message::new(Role::Tool, "ok");
+        tool.tool_calls = assistant.tool_calls.clone();
+
+        let mut history = vec![
+            Message::new(Role::User, "old"),
+            assistant,
+            tool, // index 2: raw cut point when max_history_messages = 3
+        ];
+        history.push(Message::new(Role::Assistant, "done"));
+        history.push(Message::new(Role::User, "next"));
+
+        let strategy = ContextStrategy {
+            max_history_messages: 3,
+            max_memory_records: 8,
+            max_tool_output_chars: 1000,
+            inject_scoped_memory: false,
+        };
+        let windowed = window_history(&history, &strategy);
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed[0].role, Role::Assistant);
+        assert_eq!(windowed[1].role, Role::User);
+    }
+
+    #[test]
+    fn window_history_skips_assistant_function_call_slice_and_scopes_plan_tools() {
+        let mut assistant = Message::new(Role::Assistant, "running bash");
+        assistant.tool_calls.push(rein_core::message::ToolCall {
+            id: "c1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        let mut tool = Message::new(Role::Tool, "ok");
+        tool.tool_calls = assistant.tool_calls.clone();
+
+        let history = vec![
+            Message::new(Role::User, "old"),
+            assistant, // index 1: cut point when max_history_messages = 3
+            tool,
+            Message::new(Role::User, "next"),
+        ];
+        let strategy = ContextStrategy {
+            max_history_messages: 3,
+            max_memory_records: 8,
+            max_tool_output_chars: 1000,
+            inject_scoped_memory: false,
+        };
+        let windowed = window_history(&history, &strategy);
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].role, Role::User);
+        assert_eq!(windowed[0].content, "next");
+
+        let plan = Profile::plan();
+        assert!(plan.allows_tool("read"));
+        assert!(plan.allows_tool("switch_mode"));
+        assert!(!plan.allows_tool("write"));
+        assert!(!plan.allows_tool("edit"));
+        assert!(!plan.allows_tool("notes"));
+        assert!(!plan.allows_tool("calendar"));
+        assert!(!plan.allows_tool("email"));
     }
 }

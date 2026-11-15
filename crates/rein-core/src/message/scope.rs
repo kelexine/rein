@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum ModeId {
     /// Software engineering and workspace manipulation mode.
     Coding,
+    /// Read-only architecture exploration and implementation planning mode.
+    Plan,
     /// Interactive personal assistant mode (memory, notes, calendar, email).
     Personal,
 }

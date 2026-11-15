@@ -152,27 +152,39 @@ impl From<&TranscriptEntry> for EntryKind {
 fn render_user_turn(text: &str, width: u16, out: &mut Vec<Line<'static>>) {
     let bar_bg = Color::Rgb(34, 38, 46);
     let cols = usize::from(width.max(10));
-    for (idx, part) in text.lines().enumerate() {
-        let prefix = if idx == 0 { "❯ " } else { "  " };
-        let used = prefix.chars().count() + part.chars().count();
-        let pad = cols.saturating_sub(used);
-        out.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .bg(bar_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                part.to_owned(),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(bar_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)),
-        ]));
+    let inner_cols = cols.saturating_sub(2).max(1);
+    let mut is_first_row = true;
+    for raw_line in text.split('\n') {
+        let mut remaining = raw_line;
+        loop {
+            let prefix = if is_first_row { "❯ " } else { "  " };
+            is_first_row = false;
+            let chunk: String = remaining.chars().take(inner_cols).collect();
+            let consumed = chunk.len();
+            let used = 2 + chunk.chars().count();
+            let pad = cols.saturating_sub(used);
+            out.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(bar_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    chunk,
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(bar_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)),
+            ]));
+            remaining = &remaining[consumed..];
+            if remaining.is_empty() {
+                break;
+            }
+        }
     }
 }
 
@@ -336,6 +348,7 @@ fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
     match name {
         "todo_write" => ("Update Todos".to_owned(), None),
         "todo_read" => ("Read Todos".to_owned(), None),
+        "switch_mode" => ("Switch Mode".to_owned(), arg_str(args, "mode", 32)),
         "bash" => {
             let cmd = args
                 .get("command")

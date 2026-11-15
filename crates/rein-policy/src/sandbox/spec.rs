@@ -275,14 +275,20 @@ pub fn run_sandboxed_command(spec: &SandboxSpec) -> Result<SandboxCommandOutput,
 pub fn execute_sandbox_child(raw_spec: &str) -> Result<i32, PolicyError> {
     let spec: SandboxSpec = serde_json::from_str(raw_spec)?;
     apply_sandbox_in_child(&spec)?;
-    let status = Command::new(&spec.program)
-        .args(&spec.args)
-        .current_dir(&spec.workspace_root)
-        .status()
-        .map_err(|source| PolicyError::Io {
-            path: PathBuf::from(&spec.program),
-            source,
-        })?;
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args).current_dir(&spec.workspace_root);
+    if !spec.read_only_workspace {
+        // Keep temp scratch on the workspace filesystem so cross-mount renames
+        // from tmpfs `/tmp` into `target/` do not fail with EXDEV.
+        let ws_tmp = spec.workspace_root.join(".rein").join("tmp");
+        if std::fs::create_dir_all(&ws_tmp).is_ok() {
+            cmd.env("TMPDIR", &ws_tmp);
+        }
+    }
+    let status = cmd.status().map_err(|source| PolicyError::Io {
+        path: PathBuf::from(&spec.program),
+        source,
+    })?;
     Ok(status.code().unwrap_or(1))
 }
 

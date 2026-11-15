@@ -58,6 +58,19 @@ impl PolicyRuleSet {
         }
     }
 
+    /// Default sandbox policy for Plan mode (read-only exploration; denies workspace writes and mutating shell commands).
+    #[must_use]
+    pub fn plan_default() -> Self {
+        Self {
+            mode: ModeId::Plan,
+            allow_personal_memory_read: true,
+            allow_personal_memory_write: false,
+            allow_workspace_write: false,
+            require_kernel_sandbox: true,
+            allowed_commands: Vec::new(),
+        }
+    }
+
     /// Default sandbox policy for Personal mode (full personal memory, asks on email/calendar writes).
     #[must_use]
     pub fn personal_default() -> Self {

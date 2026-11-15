@@ -8,7 +8,7 @@ use crate::audit::{AuditEntry, AuditLog};
 use crate::capability::{AccessMode, Capability, PersonalResource};
 use crate::classifier::{
     EffectLevel, ParsedCommand, ShellClassification, ShellClassifier, ShellPipeline, TargetScope,
-    classify_parsed_command, classify_path_token,
+    classify_parsed_command, classify_path_token, has_dangerous_env_var,
 };
 use crate::engine::{PolicyDecision, PolicyError, PolicyRuleSet};
 use crate::sandbox::{SandboxStatus, WorkspaceSandbox, probe_kernel_sandbox};
@@ -100,6 +100,9 @@ impl PolicyEngine {
                 self.decide_personal(tool_name, *resource, *mode)
             }
             Capability::Shell { program, args } => self.decide_shell(program, args),
+            Capability::ModeSwitch { target } => PolicyDecision::Allow {
+                reason: format!("mode switch to {target:?} permitted"),
+            },
             Capability::Mcp { server, tool } => {
                 if self.is_tool_allowlisted(tool_name) {
                     PolicyDecision::Allow {
@@ -130,6 +133,14 @@ impl PolicyEngine {
             return PolicyDecision::Deny {
                 reason: format!(
                     "refusing mutation of protected target: {}",
+                    classification.reason
+                ),
+            };
+        }
+        if self.rules.mode == ModeId::Plan && classification.effect > EffectLevel::ReadOnly {
+            return PolicyDecision::Deny {
+                reason: format!(
+                    "plan mode permits read-only inspection only (denied '{program}': {})",
                     classification.reason
                 ),
             };
@@ -176,10 +187,12 @@ impl PolicyEngine {
         }
         stages.iter().all(|stage| {
             let class = classify_parsed_command(stage, Some(&self.sandbox));
-            self.rules
-                .allowed_commands
-                .iter()
-                .any(|pat| stage_matches_pattern(stage, &class, pat))
+            stage_is_auto_allowed(stage, &class)
+                || self
+                    .rules
+                    .allowed_commands
+                    .iter()
+                    .any(|pat| stage_matches_pattern(stage, &class, pat))
         })
     }
 
@@ -239,6 +252,9 @@ impl PolicyEngine {
         match mode {
             AccessMode::Read => PolicyDecision::Allow {
                 reason: "workspace read within sandbox".to_owned(),
+            },
+            AccessMode::Write if self.rules.mode == ModeId::Plan => PolicyDecision::Deny {
+                reason: format!("plan mode forbids filesystem writes ('{}')", path.display()),
             },
             AccessMode::Write if self.rules.allow_workspace_write => PolicyDecision::Allow {
                 reason: "workspace write within sandbox".to_owned(),
@@ -316,8 +332,16 @@ pub fn suggest_command_allow_pattern(
         .collect::<Vec<_>>()
         .join(" && ");
     let excerpt = truncate_excerpt(&joined);
-    if stages.len() == 1
-        && let Some(stage) = stages.first()
+
+    let actionable: Vec<&ParsedCommand> = stages
+        .iter()
+        .filter(|stage| {
+            let class = classify_parsed_command(stage, Some(sandbox));
+            !stage_is_auto_allowed(stage, &class)
+        })
+        .collect();
+    if actionable.len() == 1
+        && let Some(&stage) = actionable.first()
     {
         let class = classify_parsed_command(stage, Some(sandbox));
         let base = basename(&stage.program);
@@ -326,7 +350,22 @@ pub fn suggest_command_allow_pattern(
         }
         return (excerpt, stage_text(stage));
     }
-    (excerpt, joined)
+    let actionable_joined = if actionable.is_empty() {
+        joined
+    } else {
+        actionable
+            .iter()
+            .map(|s| stage_text(s))
+            .collect::<Vec<_>>()
+            .join(" && ")
+    };
+    (excerpt, actionable_joined)
+}
+
+fn stage_is_auto_allowed(stage: &ParsedCommand, class: &ShellClassification) -> bool {
+    class.effect == EffectLevel::ReadOnly
+        && class.target == TargetScope::Workspace
+        && !has_dangerous_env_var(&stage.env_vars)
 }
 
 fn is_workspace_safe_stage(stage: &ParsedCommand, class: &ShellClassification) -> bool {
@@ -424,7 +463,10 @@ fn stage_matches_pattern(
     class: &ShellClassification,
     pattern: &str,
 ) -> bool {
-    if class.effect >= EffectLevel::Unknown || class.target == TargetScope::Protected {
+    if class.effect >= EffectLevel::Unknown
+        || class.target == TargetScope::Protected
+        || has_dangerous_env_var(&stage.env_vars)
+    {
         return false;
     }
     let pattern = pattern.trim();
@@ -705,6 +747,136 @@ mod tests {
         assert!(matches!(outside, PolicyDecision::Deny { .. }));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_readonly_consumers_do_not_block_allowlist_and_env_hijack_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ws = std::env::temp_dir().join("rein_policy_pipeline_env_audit_ws");
+        std::fs::create_dir_all(&ws)?;
+        let audit_path = ws.join("audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let sandbox = WorkspaceSandbox::new(&ws);
+        let (_, pat) = suggest_command_allow_pattern(
+            "bash",
+            &[
+                "-c".to_owned(),
+                "TMPDIR=$PWD/target/tmp cargo test --workspace 2>&1 | tail -80".to_owned(),
+            ],
+            &sandbox,
+        );
+        assert_eq!(pat, "cargo *");
+
+        let mut rules = PolicyRuleSet::coding_default();
+        rules.allowed_commands = vec![pat];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            sandbox,
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+
+        let allowed_pipe = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "TMPDIR=$PWD/target/tmp cargo test --workspace 2>&1 | tail -80".to_owned(),
+                ],
+            },
+        )?;
+        assert!(matches!(allowed_pipe, PolicyDecision::Allow { .. }));
+
+        let hijacked = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "RUSTC_WRAPPER=sh cargo check".to_owned()],
+            },
+        )?;
+        assert!(matches!(hijacked, PolicyDecision::Ask { .. }));
+
+        let safe_export = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "export TMPDIR=$PWD/target/tmp; cargo fmt --check | head -50".to_owned(),
+                ],
+            },
+        )?;
+        assert!(matches!(safe_export, PolicyDecision::Allow { .. }));
+
+        let path_export = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "export PATH=./bin:$PATH".to_owned()],
+            },
+        )?;
+        assert!(matches!(path_export, PolicyDecision::Deny { .. }));
+
+        let _ = std::fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_enforces_strict_readonly_policy_and_allows_mode_switch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ws = std::env::temp_dir().join("rein_policy_plan_mode_test");
+        std::fs::create_dir_all(&ws)?;
+        let audit_path = ws.join("audit.jsonl");
+        let _ = std::fs::remove_file(&audit_path);
+
+        let mut rules = PolicyRuleSet::plan_default();
+        rules.allowed_commands = vec!["cargo *".to_owned(), "tool:write".to_owned()];
+        let engine = PolicyEngine::with_sandbox_status(
+            rules,
+            WorkspaceSandbox::new(&ws),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+
+        let write_decision = engine.evaluate(
+            "write",
+            &Capability::FileSystem {
+                path: ws.join("src/lib.rs"),
+                mode: AccessMode::Write,
+            },
+        )?;
+        assert!(matches!(write_decision, PolicyDecision::Deny { .. }));
+
+        let mutating_shell = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "cargo test".to_owned()],
+            },
+        )?;
+        assert!(matches!(mutating_shell, PolicyDecision::Deny { .. }));
+
+        let readonly_shell = engine.evaluate(
+            "bash",
+            &Capability::Shell {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "git status".to_owned()],
+            },
+        )?;
+        assert!(matches!(readonly_shell, PolicyDecision::Allow { .. }));
+
+        let switch_decision = engine.evaluate(
+            "switch_mode",
+            &Capability::ModeSwitch {
+                target: ModeId::Coding,
+            },
+        )?;
+        assert!(matches!(switch_decision, PolicyDecision::Allow { .. }));
+
+        let _ = std::fs::remove_dir_all(&ws);
         Ok(())
     }
 }

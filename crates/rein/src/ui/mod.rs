@@ -6,6 +6,8 @@
 pub mod app;
 /// Structured transcript entries for turns, tools, diffs, and todo checklists.
 pub mod entries;
+/// Zero-dependency syntax highlighter for unboxed fenced code blocks.
+pub mod highlight;
 /// Markdown parser and styled terminal line renderer.
 pub mod markdown;
 /// Raw terminal RAII guard and interactive event loop.

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use rein_core::MemoryScope;
+use rein_core::{MemoryScope, ModeId};
 use serde::{Deserialize, Serialize};
 
 /// Read or write access intent for a capability check.
@@ -68,5 +68,10 @@ pub enum Capability {
         server: String,
         /// Tool name exposed by the MCP server.
         tool: String,
+    },
+    /// Runtime profile transition initiated via `switch_mode`.
+    ModeSwitch {
+        /// Target operating mode (`coding`, `plan`, or `personal`).
+        target: ModeId,
     },
 }

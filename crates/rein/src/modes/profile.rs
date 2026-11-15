@@ -19,6 +19,19 @@ pub const CODING_TOOLS: &[&str] = &[
     "memory",
     "todo_write",
     "todo_read",
+    "switch_mode",
+];
+
+/// Tool names enabled in the read-only Plan profile.
+pub const PLAN_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "bash",
+    "memory",
+    "todo_write",
+    "todo_read",
+    "switch_mode",
 ];
 
 /// Tool names enabled in the Personal profile.
@@ -29,12 +42,13 @@ pub const PERSONAL_TOOLS: &[&str] = &[
     "email",
     "todo_write",
     "todo_read",
+    "switch_mode",
 ];
 
 /// A self-contained mode profile keeping `rein-core` completely mode-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
-    /// Mode identifier (`Coding` or `Personal`).
+    /// Mode identifier (`Coding`, `Plan`, or `Personal`).
     pub mode: ModeId,
     /// System prompt injected into provider turns.
     pub system_prompt: String,
@@ -58,8 +72,9 @@ impl Profile {
             mode: ModeId::Coding,
             system_prompt:
                 "You are Rein in Coding mode. Work inside the workspace sandbox, prefer \
-                            read-only inspection before edits, use todo_write to track multi-step \
-                            tasks, and keep changes minimal and verified."
+                 read-only inspection before edits, use todo_write to track multi-step tasks, \
+                 and keep changes minimal and verified. Only call tools declared in the active \
+                 mode; call switch_mode to transition to `plan` or `personal` mode when needed."
                     .to_owned(),
             allowed_tools: to_owned_list(CODING_TOOLS),
             policy_rules: PolicyRuleSet::coding_default(),
@@ -69,13 +84,35 @@ impl Profile {
         }
     }
 
+    /// Plan profile: strictly read-only inspection and architectural planning before coding changes.
+    #[must_use]
+    pub fn plan() -> Self {
+        Self {
+            mode: ModeId::Plan,
+            system_prompt:
+                "You are Rein in Plan mode. Explore the workspace read-only (`read`, `glob`, \
+                 `grep`, read-only `bash`), analyze architecture and edge cases, use `todo_write` \
+                 to organize tasks, and produce concrete step-by-step plans without modifying \
+                 files. Only call tools declared in the active mode; call `switch_mode` to \
+                 enter `coding` or `personal` mode when ready to make changes."
+                    .to_owned(),
+            allowed_tools: to_owned_list(PLAN_TOOLS),
+            policy_rules: PolicyRuleSet::plan_default(),
+            readable_memory_scopes: vec![MemoryScope::Project, MemoryScope::Personal],
+            writable_memory_scopes: vec![MemoryScope::Project],
+            context_strategy: ContextStrategy::plan(),
+        }
+    }
+
     /// Personal profile: memory, notes, calendar, and email behind permissions.
     #[must_use]
     pub fn personal() -> Self {
         Self {
             mode: ModeId::Personal,
             system_prompt: "You are Rein in Personal mode. Help with notes, calendar, and email. \
-                            Always confirm before sending email or changing calendar events."
+                            Always confirm before sending email or changing calendar events. \
+                            Only call tools declared in the active mode; call `switch_mode` if \
+                            you need `coding` or `plan` mode."
                 .to_owned(),
             allowed_tools: to_owned_list(PERSONAL_TOOLS),
             policy_rules: PolicyRuleSet::personal_default(),
@@ -90,6 +127,7 @@ impl Profile {
     pub fn for_mode(mode: ModeId) -> Self {
         match mode {
             ModeId::Coding => Self::coding(),
+            ModeId::Plan => Self::plan(),
             ModeId::Personal => Self::personal(),
         }
     }

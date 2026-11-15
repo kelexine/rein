@@ -11,6 +11,8 @@ pub mod coding;
 pub mod mcp;
 /// Scoped JSONL memory store and tool.
 pub mod memory;
+/// Model-callable mode-switching tool.
+pub mod mode;
 /// Native Rust personal tools (notes, calendar, email).
 pub mod personal;
 /// Tool trait, schema, and policy-gated registry.
@@ -21,6 +23,7 @@ pub mod todos;
 pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use mcp::{JsonRpcRequest, JsonRpcResponse, McpClient, McpServerConfig, McpToolAdapter};
 pub use memory::{JsonlMemoryStore, MemoryRecord, MemoryTool};
+pub use mode::{SwitchModeTool, parse_mode_id};
 pub use personal::{
     CalendarEvent, CalendarTool, EmailMessage, EmailStatus, EmailTool, NoteEntry, NotesTool,
 };

@@ -96,6 +96,21 @@ pub trait Provider: Send {
         on_event: &mut dyn FnMut(&ProviderStreamEvent),
     ) -> Result<Vec<ProviderStreamEvent>, CoreError>;
 
+    /// Streams response events into `on_event`, aborting with [`CoreError::Cancelled`] when `cancel` is set.
+    fn stream_turn_cancellable(
+        &mut self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_event: &mut dyn FnMut(&ProviderStreamEvent),
+    ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CoreError::Cancelled);
+        }
+        self.stream_turn_with(system_prompt, messages, tools, on_event)
+    }
+
     /// Convenience helper collecting all streamed events for a turn.
     fn stream_turn(
         &mut self,

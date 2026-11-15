@@ -54,7 +54,7 @@ pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>
         }
 
         if let Some(lang) = parse_fence_open(trimmed) {
-            i = consume_code_block(&raw_lines, i + 1, lang, max_width, &mut out);
+            i = consume_code_block(&raw_lines, i + 1, lang, &mut out);
             continue;
         }
 
@@ -118,70 +118,19 @@ fn consume_code_block(
     lines: &[&str],
     mut idx: usize,
     lang: &str,
-    max_width: u16,
     out: &mut Vec<Line<'static>>,
 ) -> usize {
-    let label = if lang.is_empty() { "code" } else { lang };
-    let bar_len = usize::from(max_width.clamp(12, 40)).saturating_sub(label.chars().count() + 3);
-    out.push(Line::from(vec![
-        Span::styled("╭─ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            label.to_owned(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {}", "─".repeat(bar_len)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-
+    let mut state = super::highlight::HighlightState::default();
     while idx < lines.len() {
         let raw = lines[idx];
         if raw.trim().starts_with("```") {
             idx += 1;
             break;
         }
-        out.push(style_code_line(raw));
+        out.push(super::highlight::highlight_code_line(raw, lang, &mut state));
         idx += 1;
     }
-
-    let foot_len = usize::from(max_width.clamp(12, 40)).saturating_sub(1);
-    out.push(Line::from(Span::styled(
-        format!("╰{}", "─".repeat(foot_len)),
-        Style::default().fg(Color::DarkGray),
-    )));
     idx
-}
-
-fn style_code_line(raw: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-    let trimmed = raw.trim_start();
-    if trimmed.starts_with("//") || trimmed.starts_with("# ") || trimmed == "#" {
-        spans.push(Span::styled(
-            raw.to_owned(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    } else if let Some(rest) = raw.strip_prefix('+') {
-        spans.push(Span::styled(
-            format!("+{rest}"),
-            Style::default().fg(Color::Green),
-        ));
-    } else if let Some(rest) = raw.strip_prefix('-') {
-        spans.push(Span::styled(
-            format!("-{rest}"),
-            Style::default().fg(Color::LightRed),
-        ));
-    } else {
-        spans.push(Span::styled(
-            raw.to_owned(),
-            Style::default().fg(Color::Gray),
-        ));
-    }
-    Line::from(spans)
 }
 
 fn is_horizontal_rule(trimmed: &str) -> bool {
@@ -541,8 +490,22 @@ let x = 1;
         assert!(!joined.contains("|---|"));
         assert!(joined.contains("Crate"));
         assert!(joined.contains("─┼─"));
-        assert!(joined.contains("╭─ rust"));
-        assert!(joined.contains("│ let x = 1;"));
+        assert!(!joined.contains("╭─"));
+        assert!(!joined.contains("│ let x"));
+        assert!(!joined.contains("╰"));
+        assert!(rendered.iter().any(|line| line == "  let x = 1;"));
         assert!(!joined.contains("```rust"));
+        let code_line = lines.iter().find(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .contains("let x = 1;")
+        });
+        assert!(code_line.is_some_and(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content == "let" && s.style.fg == Some(Color::Magenta))
+        }));
     }
 }

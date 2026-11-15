@@ -145,6 +145,21 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSpec],
         on_event: &mut dyn FnMut(&ProviderStreamEvent),
     ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        self.stream_turn_cancellable(system_prompt, messages, tools, &never, on_event)
+    }
+
+    fn stream_turn_cancellable(
+        &mut self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_event: &mut dyn FnMut(&ProviderStreamEvent),
+    ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CoreError::Cancelled);
+        }
         let api_key = std::env::var(&self.config.api_key_env).map_err(|_| {
             CoreError::Provider(format!(
                 "missing environment variable '{}'",
@@ -164,7 +179,7 @@ impl Provider for AnthropicProvider {
 
         let reader = BufReader::new(response.into_reader());
         let mut acc = SseEventAccumulator::new();
-        acc.read_stream(reader, on_event)
+        acc.read_stream_cancellable(reader, cancel, on_event)
     }
 }
 
@@ -271,10 +286,25 @@ fn encode_anthropic_messages(messages: &[Message]) -> Vec<Value> {
 }
 
 fn flush_tool_results(pending: &mut Vec<Value>, encoded: &mut Vec<Value>) {
-    if !pending.is_empty() {
+    if pending.is_empty() {
+        return;
+    }
+    let has_preceding_tool_use = encoded.last().is_some_and(|turn| {
+        turn.get("role").and_then(Value::as_str) == Some("assistant")
+            && turn
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                })
+    });
+    let batch = std::mem::take(pending);
+    if has_preceding_tool_use {
         encoded.push(json!({
             "role": "user",
-            "content": std::mem::take(pending),
+            "content": batch,
         }));
     }
 }
@@ -319,5 +349,21 @@ mod tests {
             body["messages"][2]["content"].as_array().map(Vec::len),
             Some(2)
         );
+    }
+
+    #[test]
+    fn drops_orphaned_tool_results_without_preceding_tool_use() {
+        let provider = AnthropicProvider::new(AnthropicConfig::default());
+        let mut orphan = Message::new(Role::Tool, "stale output");
+        orphan.tool_calls.push(ToolCall {
+            id: "call_0".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({}),
+        });
+        let history = vec![orphan, Message::new(Role::User, "hello")];
+        let body = provider.build_request_body("sys", &history, &[]);
+        let msgs = body["messages"].as_array();
+        assert_eq!(msgs.map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["content"], "hello");
     }
 }

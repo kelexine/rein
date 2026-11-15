@@ -8,7 +8,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,7 +20,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use rein_core::{
-    EventLog, MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats,
+    CoreError, EventLog, MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats,
     login_with_browser_until,
 };
 
@@ -30,6 +33,7 @@ use crate::config::{
     generate_session_uid, list_sessions, resolve_model_target, save_provider_selection,
     write_latest_session_uid,
 };
+use crate::modes::Profile;
 use crate::ui::view::{compute_max_scroll, transcript_viewport};
 use crate::ui::{AppState, render_frame};
 
@@ -43,7 +47,12 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -53,7 +62,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -65,6 +79,7 @@ enum WorkerEvent {
     ToolFinish(ToolCall, ToolOutput),
     Usage(UsageStats),
     Quota(u8),
+    ModeSwitched(Box<Profile>),
     AskConfirm(ApprovalRequest),
     Note(String),
     Finished(Result<()>),
@@ -105,9 +120,15 @@ impl ApprovalPrompter for ChannelPrompter {
     fn on_usage(&mut self, usage: UsageStats) {
         let _ = self.tx.send(WorkerEvent::Usage(usage));
     }
+
+    fn on_mode_switched(&mut self, profile: &Profile) {
+        let _ = self
+            .tx
+            .send(WorkerEvent::ModeSwitched(Box::new(profile.clone())));
+    }
 }
 
-/// Runs the minimalist Ratatui loop in-process until the user exits with `Esc`, `Ctrl-C`, or `/quit`.
+/// Runs the minimalist Ratatui loop in-process until the user exits with `/exit`, `/quit`, or consecutive `Ctrl+C` twice within 2s.
 pub fn run_tui(
     agent: &mut AgentLoop,
     provider: &mut Box<dyn Provider>,
@@ -121,10 +142,25 @@ pub fn run_tui(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        if let Event::Key(key) = event::read()?
-            && handle_idle_key(key, agent, provider, config, paths, app, &mut guard)?
-        {
-            break;
+        match event::read()? {
+            Event::Key(key) => {
+                if handle_idle_key(key, agent, provider, config, paths, app, &mut guard)? {
+                    break;
+                }
+            }
+            Event::Paste(text) => {
+                app.clear_ctrl_c_arm();
+                if app.pending_model_picker().is_none()
+                    && app.pending_session_picker().is_none()
+                    && app.pending_approval().is_none()
+                {
+                    app.push_input_str(&text);
+                }
+            }
+            Event::Mouse(mouse) => {
+                handle_mouse_event(mouse, app, &guard)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -140,8 +176,9 @@ fn handle_idle_key(
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
     if is_ctrl_c(key) {
-        return Ok(true);
+        return Ok(app.arm_or_confirm_ctrl_c(Instant::now()));
     }
+    app.clear_ctrl_c_arm();
     if is_ctrl_o(key) {
         let _ = app.toggle_expand_outputs();
         return Ok(false);
@@ -153,10 +190,14 @@ fn handle_idle_key(
         return handle_session_picker_key(key, agent, paths, app);
     }
     if key.code == KeyCode::Esc {
-        return Ok(true);
+        return Ok(false);
     }
 
     let slash_open = !app.slash_matches().is_empty();
+    if is_newline_key(key) {
+        app.push_input_char('\n');
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Tab if slash_open => {
             if let Some(sel) = app.selected_slash() {
@@ -170,11 +211,24 @@ fn handle_idle_key(
         }
         KeyCode::Up if slash_open => app.move_slash_selection(-1),
         KeyCode::Down if slash_open => app.move_slash_selection(1),
-        KeyCode::Up => app.navigate_history(-1),
-        KeyCode::Down => app.navigate_history(1),
+        KeyCode::Up => {
+            if !app.move_cursor_vertical(-1) {
+                app.navigate_history(-1);
+            }
+        }
+        KeyCode::Down => {
+            if !app.move_cursor_vertical(1) {
+                app.navigate_history(1);
+            }
+        }
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.move_cursor_home(),
+        KeyCode::End => app.move_cursor_end(),
         KeyCode::PageUp => scroll_page(app, guard, -1)?,
         KeyCode::PageDown => scroll_page(app, guard, 1)?,
         KeyCode::Backspace => app.pop_input_char(),
+        KeyCode::Delete => app.delete_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
         KeyCode::Enter => return handle_enter(agent, provider, config, paths, app, guard),
         _ => {}
@@ -268,7 +322,7 @@ fn handle_enter(
     if trimmed.is_empty() {
         return Ok(false);
     }
-    if trimmed.starts_with('/') {
+    if trimmed.starts_with('/') && !trimmed.contains('\n') {
         return dispatch_slash(trimmed, agent, provider, config, paths, app, guard);
     }
     stream_prompt_background(
@@ -352,7 +406,9 @@ fn run_builtin_action(
             for line in lines {
                 app.push_system_note(line);
             }
-            app.push_system_note("shortcuts: ctrl+o expand/collapse · tab mode · esc quit");
+            app.push_system_note(
+                "shortcuts: ctrl+o expand/collapse · tab mode · shift+enter newline · esc stop · ctrl+c x2 exit",
+            );
         }
         BuiltinAction::Mode => run_mode_command(args, agent, app)?,
         BuiltinAction::Compact => {
@@ -547,21 +603,33 @@ fn run_login_background(
             if !app.is_busy() {
                 break;
             }
-            if event::poll(Duration::from_millis(25)).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
-            {
-                if is_ctrl_o(key) {
-                    let _ = app.toggle_expand_outputs();
-                } else if key.code == KeyCode::PageUp {
-                    let _ = scroll_page(app, guard, -1);
-                } else if key.code == KeyCode::PageDown {
-                    let _ = scroll_page(app, guard, 1);
-                } else if is_quit_key(key) {
-                    cancel.store(true, Ordering::Relaxed);
-                    if is_ctrl_c(key) {
-                        should_quit = true;
+            if event::poll(Duration::from_millis(25)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if is_ctrl_c(key) {
+                            if app.arm_or_confirm_ctrl_c(Instant::now()) {
+                                cancel.store(true, Ordering::Relaxed);
+                                should_quit = true;
+                                break;
+                            }
+                        } else {
+                            app.clear_ctrl_c_arm();
+                            if is_ctrl_o(key) {
+                                let _ = app.toggle_expand_outputs();
+                            } else if key.code == KeyCode::PageUp {
+                                let _ = scroll_page(app, guard, -1);
+                            } else if key.code == KeyCode::PageDown {
+                                let _ = scroll_page(app, guard, 1);
+                            } else if key.code == KeyCode::Esc {
+                                cancel.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
                     }
-                    break;
+                    Ok(Event::Mouse(mouse)) => {
+                        let _ = handle_mouse_event(mouse, app, guard);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -586,9 +654,12 @@ fn run_mode_command(args: &str, agent: &mut AgentLoop, app: &mut AppState) -> Re
     let mode = match args.trim().to_ascii_lowercase().as_str() {
         "" => agent.toggle_mode()?,
         "coding" | "code" => agent.set_mode(ModeId::Coding)?,
+        "plan" => agent.set_mode(ModeId::Plan)?,
         "personal" => agent.set_mode(ModeId::Personal)?,
         other => {
-            app.push_error_note(format!("unknown mode '{other}' (use coding or personal)"));
+            app.push_error_note(format!(
+                "unknown mode '{other}' (use coding, plan, or personal)"
+            ));
             return Ok(());
         }
     };
@@ -677,18 +748,29 @@ fn compact_background(
             if !app.is_busy() {
                 break;
             }
-            if event::poll(Duration::from_millis(16)).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
-            {
-                if is_ctrl_o(key) {
-                    let _ = app.toggle_expand_outputs();
-                } else if key.code == KeyCode::PageUp {
-                    let _ = scroll_page(app, guard, -1);
-                } else if key.code == KeyCode::PageDown {
-                    let _ = scroll_page(app, guard, 1);
-                } else if is_quit_key(key) {
-                    should_quit = true;
-                    break;
+            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if is_ctrl_c(key) {
+                            if app.arm_or_confirm_ctrl_c(Instant::now()) {
+                                should_quit = true;
+                                break;
+                            }
+                        } else {
+                            app.clear_ctrl_c_arm();
+                            if is_ctrl_o(key) {
+                                let _ = app.toggle_expand_outputs();
+                            } else if key.code == KeyCode::PageUp {
+                                let _ = scroll_page(app, guard, -1);
+                            } else if key.code == KeyCode::PageDown {
+                                let _ = scroll_page(app, guard, 1);
+                            }
+                        }
+                    }
+                    Ok(Event::Mouse(mouse)) => {
+                        let _ = handle_mouse_event(mouse, app, guard);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -713,17 +795,19 @@ fn stream_prompt_background(
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
+    let cancel = AtomicBool::new(false);
     let mut should_quit = false;
     let mut last_spin = Instant::now();
 
     std::thread::scope(|scope| {
+        let cancel_ref = &cancel;
         scope.spawn(move || {
             let mut prompter = ChannelPrompter {
                 tx: ev_tx.clone(),
                 confirm_rx: ans_rx,
             };
             let res = agent
-                .run_user_prompt(&prompt_for_model, provider, &mut prompter)
+                .run_user_prompt_cancellable(&prompt_for_model, provider, &mut prompter, cancel_ref)
                 .map(|_| ());
             if let Some(quota) = provider.active_model_quota() {
                 let _ = ev_tx.send(WorkerEvent::Quota(quota));
@@ -738,16 +822,29 @@ fn stream_prompt_background(
             if !app.is_busy() {
                 break;
             }
-            if event::poll(Duration::from_millis(16)).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
-                && handle_streaming_key(key, app, guard, &ans_tx)
-            {
-                should_quit = true;
-                let _ = ans_tx.send(ApprovalDecision {
-                    action: ApprovalAction::Deny,
-                    feedback: None,
-                });
-                break;
+            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if handle_streaming_key(key, app, guard, &ans_tx, &cancel) {
+                            should_quit = true;
+                            let _ = ans_tx.send(ApprovalDecision {
+                                action: ApprovalAction::Deny,
+                                feedback: None,
+                            });
+                            break;
+                        }
+                    }
+                    Ok(Event::Paste(text)) => {
+                        app.clear_ctrl_c_arm();
+                        if app.pending_approval().is_none() {
+                            app.push_input_str(&text);
+                        }
+                    }
+                    Ok(Event::Mouse(mouse)) => {
+                        let _ = handle_mouse_event(mouse, app, guard);
+                    }
+                    _ => {}
+                }
             }
         }
     });
@@ -773,11 +870,20 @@ fn drain_worker_events(ev_rx: &Receiver<WorkerEvent>, app: &mut AppState) {
             WorkerEvent::ToolFinish(call, output) => app.finish_tool_entry(&call, &output),
             WorkerEvent::Usage(usage) => app.record_usage(usage),
             WorkerEvent::Quota(quota) => app.set_model_quota(Some(quota)),
+            WorkerEvent::ModeSwitched(profile) => {
+                let mode = profile.mode;
+                app.set_active_profile(*profile);
+                app.push_system_note(format!("mode: {mode:?}"));
+            }
             WorkerEvent::AskConfirm(req) => app.set_pending_approval(Some(req)),
             WorkerEvent::Note(note) => app.push_system_note(note),
             WorkerEvent::Finished(res) => {
                 if let Err(err) = res {
-                    app.push_error_note(err.to_string());
+                    if matches!(err.downcast_ref::<CoreError>(), Some(CoreError::Cancelled)) {
+                        app.push_system_note("stopped response");
+                    } else {
+                        app.push_error_note(err.to_string());
+                    }
                 }
                 app.set_busy(false);
             }
@@ -790,10 +896,16 @@ fn handle_streaming_key(
     app: &mut AppState,
     guard: &mut TerminalGuard,
     ans_tx: &Sender<ApprovalDecision>,
+    cancel: &AtomicBool,
 ) -> bool {
     if is_ctrl_c(key) {
-        return true;
+        if app.arm_or_confirm_ctrl_c(Instant::now()) {
+            cancel.store(true, Ordering::Relaxed);
+            return true;
+        }
+        return false;
     }
+    app.clear_ctrl_c_arm();
     if is_ctrl_o(key) {
         let _ = app.toggle_expand_outputs();
         return false;
@@ -819,7 +931,16 @@ fn handle_streaming_key(
         }
 
         match key.code {
-            KeyCode::Esc => return true,
+            KeyCode::Esc => {
+                cancel.store(true, Ordering::Relaxed);
+                app.set_busy_status("Stopping…");
+                if app.take_approval_decision(Some(3)).is_some() {
+                    let _ = ans_tx.send(ApprovalDecision {
+                        action: ApprovalAction::Deny,
+                        feedback: Some("stopped by user via Esc".to_owned()),
+                    });
+                }
+            }
             KeyCode::Up => app.move_approval_selection(-1),
             KeyCode::Down => app.move_approval_selection(1),
             KeyCode::Tab => app.toggle_approval_feedback(),
@@ -854,11 +975,29 @@ fn handle_streaming_key(
     }
 
     if key.code == KeyCode::Esc {
-        return true;
+        cancel.store(true, Ordering::Relaxed);
+        app.set_busy_status("Stopping…");
+        return false;
+    }
+    if is_newline_key(key) {
+        app.push_input_char('\n');
+        return false;
     }
     match key.code {
-        KeyCode::Up => app.navigate_history(-1),
-        KeyCode::Down => app.navigate_history(1),
+        KeyCode::Up => {
+            if !app.move_cursor_vertical(-1) {
+                app.navigate_history(-1);
+            }
+        }
+        KeyCode::Down => {
+            if !app.move_cursor_vertical(1) {
+                app.navigate_history(1);
+            }
+        }
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.move_cursor_home(),
+        KeyCode::End => app.move_cursor_end(),
         KeyCode::PageUp => {
             let _ = scroll_page(app, guard, -1);
         }
@@ -866,10 +1005,28 @@ fn handle_streaming_key(
             let _ = scroll_page(app, guard, 1);
         }
         KeyCode::Backspace => app.pop_input_char(),
+        KeyCode::Delete => app.delete_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
         _ => {}
     }
     false
+}
+
+fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState, guard: &TerminalGuard) -> Result<()> {
+    let dir: i16 = match mouse.kind {
+        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::ScrollDown => 3,
+        _ => return Ok(()),
+    };
+    if app.pending_model_picker().is_some() {
+        app.move_model_selection(if dir < 0 { -1 } else { 1 });
+        return Ok(());
+    }
+    if app.pending_session_picker().is_some() {
+        app.move_session_selection(if dir < 0 { -1 } else { 1 });
+        return Ok(());
+    }
+    scroll_lines(app, guard, dir)
 }
 
 fn viewport_rect(app: &AppState, guard: &TerminalGuard) -> Result<Rect> {
@@ -880,6 +1037,13 @@ fn viewport_rect(app: &AppState, guard: &TerminalGuard) -> Result<Rect> {
     ))
 }
 
+fn scroll_lines(app: &mut AppState, guard: &TerminalGuard, delta: i16) -> Result<()> {
+    let rect = viewport_rect(app, guard)?;
+    let max_scroll = compute_max_scroll(app, rect.width, rect.height);
+    app.scroll_by(delta, max_scroll);
+    Ok(())
+}
+
 fn scroll_page(app: &mut AppState, guard: &TerminalGuard, dir: i16) -> Result<()> {
     let rect = viewport_rect(app, guard)?;
     let step = i16::try_from(rect.height.saturating_sub(2).max(1)).unwrap_or(10);
@@ -888,14 +1052,18 @@ fn scroll_page(app: &mut AppState, guard: &TerminalGuard, dir: i16) -> Result<()
     Ok(())
 }
 
+fn is_newline_key(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Enter
+        && (key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::ALT)))
+        || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
+        || matches!(key.code, KeyCode::Char('\n' | '\r'))
+}
+
 fn is_ctrl_c(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn is_ctrl_o(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn is_quit_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc || is_ctrl_c(key)
 }

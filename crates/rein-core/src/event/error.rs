@@ -29,4 +29,7 @@ pub enum CoreError {
     /// Provider communication or configuration error.
     #[error("provider error: {0}")]
     Provider(String),
+    /// Turn streaming or execution cancelled by the user (`Esc`).
+    #[error("turn cancelled by user")]
+    Cancelled,
 }

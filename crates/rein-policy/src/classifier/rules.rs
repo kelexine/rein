@@ -8,24 +8,62 @@ use crate::classifier::scope::{classify_args_scope, classify_path_token};
 use crate::classifier::tools::classify_tool_specific;
 use crate::sandbox::WorkspaceSandbox;
 
-/// Safe environment variables permitted on read-only commands (`K21`).
-const SAFE_ENV_VARS: &[&str] = &["LC_ALL", "LANG", "TZ", "NO_COLOR", "TERM"];
+/// Safe non-executable environment variables permitted without triggering `Exec` or `Unknown` (`K21`).
+const SAFE_ENV_VARS: &[&str] = &[
+    "LC_ALL",
+    "LANG",
+    "TZ",
+    "NO_COLOR",
+    "TERM",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "FORCE_COLOR",
+    "CI",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "CARGO_TERM_COLOR",
+];
+
+/// Safe directory/temp env vars whose values are still validated for path scope.
+const SAFE_PATH_ENV_VARS: &[&str] = &["TMPDIR", "TEMP", "TMP"];
 
 /// Environment variables that hijack binary loading or spawn arbitrary helper commands (`V01`–`V06`).
 const EXEC_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
     "GIT_SSH_COMMAND",
     "GIT_EXTERNAL_DIFF",
     "PAGER",
     "MANPAGER",
     "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "RUBYOPT",
     "EDITOR",
     "VISUAL",
     "BASH_ENV",
     "ENV",
     "PROMPT_COMMAND",
 ];
+
+/// Pure read-only utilities (no arguments needed or harmless flag-only execution) returning `ReadOnly`.
+const SAFE_READONLY_UTILITIES: &[&str] = &[
+    "echo", "printf", "pwd", "true", "false", ":", "whoami", "id", "uname", "which", "date",
+    "nproc", "arch", "hostname", "seq", "sleep",
+];
+
+/// Returns `true` when any env assignment modifies `PATH` or an execution-hijacking variable (`V01`–`V07`).
+#[must_use]
+pub fn has_dangerous_env_var(env_vars: &[(String, String)]) -> bool {
+    env_vars
+        .iter()
+        .any(|(k, _)| k == "PATH" || EXEC_ENV_VARS.contains(&k.as_str()))
+}
 
 /// Binaries that always execute code, scripts, or escalate privileges (`D01`–`D14`, `E33`, `E42`–`E43`, `R09`–`R11`).
 const EXEC_BINARIES: &[&str] = &[
@@ -57,29 +95,27 @@ const READONLY_PATH_BINARIES: &[&str] = &[
     "md5sum",
     "file",
     "realpath",
+    "readlink",
     "dirname",
     "basename",
     "base64",
     "xxd",
+    "tree",
+    "strings",
+    "nm",
+    "objdump",
+    "readelf",
+    "ldd",
+    "test",
+    "[",
 ];
 
-/// Classifies a single [`ParsedCommand`] within an optional [`WorkspaceSandbox`].
-#[must_use]
-pub fn classify_parsed_command(
-    cmd: &ParsedCommand,
+fn classify_env_vars(
+    env_vars: &[(String, String)],
     sandbox: Option<&WorkspaceSandbox>,
 ) -> ShellClassification {
-    let env_effect = classify_env_vars(&cmd.env_vars);
-    if cmd.program.is_empty() {
-        return env_effect;
-    }
-    let stage_effect = classify_command_body(cmd, sandbox);
-    env_effect.merge(stage_effect)
-}
-
-fn classify_env_vars(env_vars: &[(String, String)]) -> ShellClassification {
     let mut acc = ShellClassification::new(EffectLevel::ReadOnly, "no unsafe env vars");
-    for (k, _v) in env_vars {
+    for (k, v) in env_vars {
         if k == "PATH" {
             acc = acc.merge(ShellClassification::new(
                 EffectLevel::Unknown,
@@ -90,9 +126,77 @@ fn classify_env_vars(env_vars: &[(String, String)]) -> ShellClassification {
                 EffectLevel::Exec,
                 format!("environment variable '{k}' triggers command execution"),
             ));
+        } else if SAFE_PATH_ENV_VARS.contains(&k.as_str()) {
+            let scope = classify_path_token(v, sandbox);
+            acc = acc.merge(ShellClassification::with_target(
+                EffectLevel::ReadOnly,
+                scope,
+                format!("'{k}' checked for workspace scope"),
+            ));
         } else if !SAFE_ENV_VARS.contains(&k.as_str()) {
             // Local variable assignment (`c=touch`, `x=/tmp`) is tracked by the parser.
         }
+    }
+    acc
+}
+
+/// Classifies a single [`ParsedCommand`] within an optional [`WorkspaceSandbox`].
+#[must_use]
+pub fn classify_parsed_command(
+    cmd: &ParsedCommand,
+    sandbox: Option<&WorkspaceSandbox>,
+) -> ShellClassification {
+    let env_effect = classify_env_vars(&cmd.env_vars, sandbox);
+    if cmd.program.is_empty() {
+        return env_effect;
+    }
+    let stage_effect = classify_command_body(cmd, sandbox);
+    env_effect.merge(stage_effect)
+}
+
+fn classify_export(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
+    if cmd.has_short('f') || cmd.has_short('p') || cmd.positionals.is_empty() {
+        return ShellClassification::new(
+            EffectLevel::Unknown,
+            "export alters persistent shell state",
+        );
+    }
+    let mut acc = ShellClassification::new(EffectLevel::ReadOnly, "safe export assignment");
+    for arg in &cmd.positionals {
+        let Some((k, v)) = arg.split_once('=') else {
+            return ShellClassification::new(
+                EffectLevel::Unknown,
+                "export alters persistent shell state",
+            );
+        };
+        if k == "PATH" {
+            return ShellClassification::new(
+                EffectLevel::Unknown,
+                "export modifies PATH in persistent shell state",
+            );
+        }
+        if EXEC_ENV_VARS.contains(&k) {
+            return ShellClassification::new(
+                EffectLevel::Exec,
+                format!("export sets code-executing variable '{k}'"),
+            );
+        }
+        if SAFE_PATH_ENV_VARS.contains(&k) {
+            let scope = classify_path_token(v, sandbox);
+            acc = acc.merge(ShellClassification::with_target(
+                EffectLevel::ReadOnly,
+                scope,
+                format!("export sets workspace-checked '{k}'"),
+            ));
+            continue;
+        }
+        if SAFE_ENV_VARS.contains(&k) {
+            continue;
+        }
+        return ShellClassification::new(
+            EffectLevel::Unknown,
+            format!("export alters unrecognized shell variable '{k}'"),
+        );
     }
     acc
 }
@@ -117,10 +221,7 @@ fn classify_command_body(
         );
     }
     if cmd.binary == "export" {
-        return ShellClassification::new(
-            EffectLevel::Unknown,
-            "export alters persistent shell state",
-        );
+        return classify_export(cmd, sandbox);
     }
     if let Some(wrapped) = classify_wrapper(cmd, sandbox) {
         return wrapped;
@@ -134,10 +235,7 @@ fn classify_command_body(
             ),
         );
     }
-    if matches!(
-        cmd.binary.as_str(),
-        "echo" | "printf" | "pwd" | "true" | "false" | ":" | "whoami" | "id" | "uname" | "which"
-    ) {
+    if SAFE_READONLY_UTILITIES.contains(&cmd.binary.as_str()) {
         return ShellClassification::new(
             EffectLevel::ReadOnly,
             format!("'{}' is a pure builtin/read-only utility", cmd.binary),

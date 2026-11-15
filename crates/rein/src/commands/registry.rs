@@ -32,7 +32,7 @@ impl CommandSource {
 pub enum BuiltinAction {
     /// Lists commands and keyboard shortcuts.
     Help,
-    /// Switches between `coding` and `personal` mode (`[coding|personal]`).
+    /// Switches between `coding`, `plan`, and `personal` mode (`[coding|plan|personal]`).
     Mode,
     /// Clears display transcript and active in-memory history.
     Clear,
@@ -142,7 +142,7 @@ impl SlashRegistry {
             ),
             builtin(
                 "mode",
-                "Switch between coding and personal mode ([coding|personal])",
+                "Switch between coding, plan, and personal mode ([coding|plan|personal])",
                 BuiltinAction::Mode,
             ),
             builtin(
@@ -190,7 +190,11 @@ impl SlashRegistry {
                 "Interactively pick and resume a saved session in this directory",
                 BuiltinAction::Resume,
             ),
-            builtin("quit", "Exit Rein", BuiltinAction::Quit),
+            builtin(
+                "exit",
+                "Exit Rein (or press Ctrl+C twice within 2s)",
+                BuiltinAction::Quit,
+            ),
         ];
         Self { commands }
     }
@@ -236,14 +240,14 @@ impl SlashRegistry {
         prefix_hits
     }
 
-    /// Resolves a submitted `/...` input string against built-ins and skills (plus `/exit` alias).
+    /// Resolves a submitted `/...` input string against built-ins and skills (plus `/quit` alias).
     #[must_use]
     pub fn resolve<'a>(&'a self, input: &str) -> SlashResolution<'a> {
         let rest = input.trim().trim_start_matches('/');
         let mut parts = rest.splitn(2, char::is_whitespace);
         let raw_name = parts.next().unwrap_or_default().trim();
         let args = parts.next().unwrap_or_default().trim().to_owned();
-        let lookup = if raw_name == "exit" { "quit" } else { raw_name };
+        let lookup = if raw_name == "quit" { "exit" } else { raw_name };
 
         match self.commands.iter().find(|c| c.name == lookup) {
             Some(command) => SlashResolution::Matched { command, args },

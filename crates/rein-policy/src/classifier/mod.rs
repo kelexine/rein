@@ -19,6 +19,6 @@ pub mod tools;
 
 pub use effect::{EffectLevel, ShellClassification, TargetScope};
 pub use parser::{ParsedCommand, Redirection, ShellPipeline};
-pub use rules::classify_parsed_command;
+pub use rules::{classify_parsed_command, has_dangerous_env_var};
 pub use scope::{classify_args_scope, classify_path_token};
 pub use shell::ShellClassifier;

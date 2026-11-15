@@ -27,8 +27,8 @@ use rein_policy::{
 };
 use rein_tools::{
     BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
-    McpToolAdapter, MemoryTool, NotesTool, ReadTool, TodoReadTool, TodoWriteTool, ToolRegistry,
-    WriteTool,
+    McpToolAdapter, MemoryTool, NotesTool, ReadTool, SwitchModeTool, TodoReadTool, TodoWriteTool,
+    ToolRegistry, WriteTool,
 };
 
 use crate::agent::{
@@ -333,6 +333,7 @@ fn build_registry(
         BashTool::new(sandbox.clone()).with_output_dir(loaded.paths.repo_dir.join("bash-outputs")),
     ));
     registry.register(Box::new(MemoryTool::new(memory)));
+    registry.register(Box::new(SwitchModeTool::new()));
     let todos_path = loaded.paths.repo_dir.join("todos.json");
     registry.register(Box::new(TodoWriteTool::new(&todos_path)));
     registry.register(Box::new(TodoReadTool::new(&todos_path)));
