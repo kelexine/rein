@@ -20,7 +20,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use rein_core::{
-    CoreError, EventLog, MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats,
+    CoreError, EventLog, MemoryScope, Provider, ToolCall, ToolOutput, UsageStats,
     login_with_browser_until,
 };
 
@@ -208,7 +208,11 @@ fn handle_idle_key(
                 app.set_input(completed);
             }
         }
-        KeyCode::Tab => {
+        KeyCode::BackTab => {
+            let _ = agent.toggle_mode()?;
+            app.set_active_profile(agent.active_profile().clone());
+        }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
             let _ = agent.toggle_mode()?;
             app.set_active_profile(agent.active_profile().clone());
         }
@@ -286,6 +290,7 @@ fn handle_session_picker_key(
                 app.clear_transcript();
                 app.set_session_id(&chosen.uid);
                 app.extend_hydrated(items);
+                app.sync_todo_session(&chosen.uid);
                 app.set_active_profile(agent.active_profile().clone());
                 app.push_system_note(format!("resumed session {}", chosen.uid));
             }
@@ -394,6 +399,7 @@ fn run_builtin_action(
             let _ = write_latest_session_uid(paths, &new_uid);
             app.clear_transcript();
             app.set_session_id(&new_uid);
+            app.sync_todo_session(&new_uid);
             app.push_system_note(format!("started new session {new_uid}"));
         }
         BuiltinAction::Help => {
@@ -410,10 +416,9 @@ fn run_builtin_action(
                 app.push_system_note(line);
             }
             app.push_system_note(
-                "shortcuts: ctrl+o expand/collapse · tab mode · shift+enter newline · esc stop · ctrl+c x2 exit",
+                "shortcuts: ctrl+o expand/collapse · shift+tab mode · shift+enter newline · esc stop · ctrl+c x2 exit",
             );
         }
-        BuiltinAction::Mode => run_mode_command(args, agent, app)?,
         BuiltinAction::Compact => {
             return compact_background(args, agent, provider.as_mut(), app, guard);
         }
@@ -651,24 +656,6 @@ fn run_login_background(
         app.push_system_note(format!("active provider: {label}"));
     }
     Ok(should_quit)
-}
-
-fn run_mode_command(args: &str, agent: &mut AgentLoop, app: &mut AppState) -> Result<()> {
-    let mode = match args.trim().to_ascii_lowercase().as_str() {
-        "" => agent.toggle_mode()?,
-        "coding" | "code" => agent.set_mode(ModeId::Coding)?,
-        "plan" => agent.set_mode(ModeId::Plan)?,
-        "personal" => agent.set_mode(ModeId::Personal)?,
-        other => {
-            app.push_error_note(format!(
-                "unknown mode '{other}' (use coding, plan, or personal)"
-            ));
-            return Ok(());
-        }
-    };
-    app.set_active_profile(agent.active_profile().clone());
-    app.push_system_note(format!("mode: {mode:?}"));
-    Ok(())
 }
 
 fn run_memory_command(args: &str, agent: &AgentLoop, app: &mut AppState) -> Result<()> {

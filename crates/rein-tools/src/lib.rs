@@ -28,4 +28,4 @@ pub use personal::{
     CalendarEvent, CalendarTool, EmailMessage, EmailStatus, EmailTool, NoteEntry, NotesTool,
 };
 pub use registry::{Tool, ToolError, ToolRegistry, ToolSchema};
-pub use todos::{TodoItem, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};
+pub use todos::{TodoItem, TodoListState, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};

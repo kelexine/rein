@@ -65,6 +65,8 @@ pub struct ReinPaths {
     pub global_memory_dir: PathBuf,
     /// Repository project Markdown memory vault & AutoDream index (`<workspace>/.rein/memory/`).
     pub repo_memory_dir: PathBuf,
+    /// Global session-scoped todo checklists (`~/.rein/todos/`).
+    pub todos_dir: PathBuf,
     /// Global personal notes JSONL (`~/.rein/notes.jsonl`).
     pub notes: PathBuf,
     /// Global personal calendar JSONL (`~/.rein/calendar.jsonl`).
@@ -107,6 +109,7 @@ impl ReinPaths {
         Self {
             global_memory: global_dir.join("memory.jsonl"),
             global_memory_dir: global_dir.join("memory"),
+            todos_dir: global_dir.join("todos"),
             notes: global_dir.join("notes.jsonl"),
             calendar: global_dir.join("calendar.jsonl"),
             email: global_dir.join("email.jsonl"),
@@ -802,6 +805,7 @@ pub fn ensure_dirs_and_load_in(global_dir: &Path, repo_dir: &Path) -> Result<Loa
         &paths.repo_skills_dir,
         &paths.global_memory_dir,
         &paths.repo_memory_dir,
+        &paths.todos_dir,
         &paths.sessions_dir,
     ] {
         std::fs::create_dir_all(dir)

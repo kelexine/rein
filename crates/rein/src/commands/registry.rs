@@ -32,8 +32,6 @@ impl CommandSource {
 pub enum BuiltinAction {
     /// Lists commands and keyboard shortcuts.
     Help,
-    /// Switches between `coding`, `plan`, and `personal` mode (`[coding|plan|personal]`).
-    Mode,
     /// Clears display transcript and active in-memory history.
     Clear,
     /// Summarizes active conversation via the provider while preserving the session's `<uid>.full.jsonl` archive.
@@ -139,11 +137,6 @@ impl SlashRegistry {
                 "help",
                 "Show built-in slash commands and keyboard shortcuts",
                 BuiltinAction::Help,
-            ),
-            builtin(
-                "mode",
-                "Switch between coding, plan, and personal mode ([coding|plan|personal])",
-                BuiltinAction::Mode,
             ),
             builtin(
                 "clear",
@@ -288,11 +281,9 @@ mod tests {
             .collect();
         assert_eq!(
             m_hits,
-            vec![
-                "mode", "memory", "mcp", "model", "compact", "commands", "resume"
-            ]
+            vec!["memory", "mcp", "model", "compact", "commands", "resume"]
         );
-        assert!(reg.matching("/mode coding").is_empty());
+        assert!(reg.matching("/memory project").is_empty());
 
         let SlashResolution::Matched { command, args } = reg.resolve("/linux-perf hotspot") else {
             panic!("expected linux-perf match");

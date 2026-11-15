@@ -103,6 +103,9 @@ impl PolicyEngine {
             Capability::ModeSwitch { target } => PolicyDecision::Allow {
                 reason: format!("mode switch to {target:?} permitted"),
             },
+            Capability::Todo { mode } => PolicyDecision::Allow {
+                reason: format!("global session todo checklist {mode:?} permitted"),
+            },
             Capability::Mcp { server, tool } => {
                 if self.is_tool_allowlisted(tool_name) {
                     PolicyDecision::Allow {

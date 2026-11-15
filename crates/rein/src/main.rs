@@ -29,8 +29,8 @@ use rein_policy::{
 };
 use rein_tools::{
     BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
-    McpToolAdapter, MemoryTool, NotesTool, ReadTool, SwitchModeTool, TodoReadTool, TodoWriteTool,
-    ToolRegistry, WriteTool,
+    McpToolAdapter, MemoryTool, NotesTool, ReadTool, SwitchModeTool, TodoReadTool, TodoStore,
+    TodoWriteTool, ToolRegistry, WriteTool,
 };
 
 use crate::agent::{
@@ -83,7 +83,9 @@ fn main() -> Result<()> {
 
     let sandbox = WorkspaceSandbox::new(&workspace_root);
     let memory = JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory);
-    let (registry, mcp_tools, mcp_warnings) = build_registry(&loaded, &sandbox, memory.clone());
+    let todo_store = TodoStore::for_session(&loaded.paths.todos_dir, "replay");
+    let (registry, mcp_tools, mcp_warnings) =
+        build_registry(&loaded, &sandbox, memory.clone(), todo_store.clone());
 
     let initial_profile = Profile::coding()
         .with_allowed_commands(loaded.allowed_commands.clone())
@@ -119,6 +121,7 @@ fn main() -> Result<()> {
         policy,
         registry,
         memory,
+        todo_store,
         initial_profile,
         mcp_tools,
         mcp_warnings,
@@ -181,6 +184,7 @@ fn run_interactive(
     policy: PolicyEngine,
     registry: ToolRegistry,
     memory: JsonlMemoryStore,
+    todo_store: TodoStore,
     initial_profile: Profile,
     mcp_tools: Vec<String>,
     mcp_warnings: Vec<String>,
@@ -214,6 +218,7 @@ fn run_interactive(
     if config::is_valid_session_uid(&session_uid) {
         let _ = write_latest_session_uid(&loaded.paths, &session_uid);
     }
+    todo_store.set_session_uid(&session_uid);
 
     let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
     let skill_names: Vec<String> = slash_registry
@@ -246,10 +251,12 @@ fn run_interactive(
         .with_startup_notices(notices)
         .with_slash_registry(slash_registry)
         .with_configured_commands(loaded.allowed_commands)
-        .with_mcp_servers(loaded.config.mcp_servers.clone());
+        .with_mcp_servers(loaded.config.mcp_servers.clone())
+        .with_todo_store(todo_store);
 
     if should_hydrate {
         app.extend_hydrated(agent.hydrate_structured()?);
+        app.sync_todo_session(&session_uid);
         app.set_active_profile(agent.active_profile().clone());
         app.push_system_note(format!("resumed session {session_uid}"));
     }
@@ -342,6 +349,7 @@ fn build_registry(
     loaded: &LoadedReinState,
     sandbox: &WorkspaceSandbox,
     memory: JsonlMemoryStore,
+    todo_store: TodoStore,
 ) -> (ToolRegistry, Vec<String>, Vec<String>) {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool::new(sandbox.clone())));
@@ -354,9 +362,8 @@ fn build_registry(
     ));
     registry.register(Box::new(MemoryTool::new(memory)));
     registry.register(Box::new(SwitchModeTool::new()));
-    let todos_path = loaded.paths.repo_dir.join("todos.json");
-    registry.register(Box::new(TodoWriteTool::new(&todos_path)));
-    registry.register(Box::new(TodoReadTool::new(&todos_path)));
+    registry.register(Box::new(TodoWriteTool::with_store(todo_store.clone())));
+    registry.register(Box::new(TodoReadTool::with_store(todo_store)));
     registry.register(Box::new(NotesTool::new(&loaded.paths.notes)));
 
     let mut calendar = CalendarTool::new(&loaded.paths.calendar);

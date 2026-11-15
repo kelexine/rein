@@ -5,7 +5,8 @@
 use std::time::{Duration, Instant};
 
 use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
-use rein_tools::McpServerConfig;
+use rein_tools::{McpServerConfig, TodoItem, TodoListState, TodoStatus, TodoStore};
+use serde_json::Value;
 
 use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent};
 use crate::commands::{SlashCommand, SlashRegistry};
@@ -62,6 +63,9 @@ pub struct AppState {
     configured_commands: Vec<String>,
     mcp_servers: Vec<McpServerConfig>,
     entries: Vec<TranscriptEntry>,
+    active_todo_title: Option<String>,
+    active_todos: Vec<TodoItem>,
+    todo_store: Option<TodoStore>,
     input: String,
     input_cursor: usize,
     ctrl_c_armed_at: Option<Instant>,
@@ -113,6 +117,10 @@ pub fn is_model_active(current_model: &str, item_id: &str) -> bool {
         .is_some_and(|stem| item_id == format!("{stem}-high"))
 }
 
+fn is_todo_tool(name: &str) -> bool {
+    matches!(name, "todo_write" | "todo_read")
+}
+
 impl AppState {
     /// Creates a new [`AppState`] starting in `initial` profile.
     #[must_use]
@@ -135,6 +143,9 @@ impl AppState {
             configured_commands: Vec::new(),
             mcp_servers: Vec::new(),
             entries: Vec::new(),
+            active_todo_title: None,
+            active_todos: Vec::new(),
+            todo_store: None,
             input: String::new(),
             input_cursor: 0,
             ctrl_c_armed_at: None,
@@ -207,6 +218,60 @@ impl AppState {
     pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
         self.mcp_servers = servers;
         self
+    }
+
+    /// Attaches the global session-scoped [`TodoStore`] and loads any active persisted tasks.
+    #[must_use]
+    pub fn with_todo_store(mut self, store: TodoStore) -> Self {
+        if let Ok(state) = store.load_state() {
+            self.set_active_todos(state.title, state.todos);
+        }
+        self.todo_store = Some(store);
+        self
+    }
+
+    /// Switches the attached [`TodoStore`] to `session_uid` and reloads persisted tasks (or clears if absent/done).
+    pub fn sync_todo_session(&mut self, session_uid: &str) {
+        if let Some(store) = &self.todo_store {
+            store.set_session_uid(session_uid);
+            match store.load_state() {
+                Ok(state) => self.set_active_todos(state.title, state.todos),
+                Err(_) => self.clear_active_todos(),
+            }
+        } else {
+            self.clear_active_todos();
+        }
+    }
+
+    /// Updates the dynamic persistent bottom checklist, clearing it when empty or all completed.
+    pub fn set_active_todos(&mut self, title: Option<String>, todos: Vec<TodoItem>) {
+        let all_done = !todos.is_empty() && todos.iter().all(|t| t.status == TodoStatus::Completed);
+        if todos.is_empty() || all_done {
+            self.clear_active_todos();
+            return;
+        }
+        if let Some(next_title) = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+            self.active_todo_title = Some(next_title);
+        }
+        self.active_todos = todos;
+    }
+
+    /// Clears the dynamic persistent bottom checklist.
+    pub fn clear_active_todos(&mut self) {
+        self.active_todo_title = None;
+        self.active_todos.clear();
+    }
+
+    /// Returns the optional checklist title displayed in the bottom todo bar.
+    #[must_use]
+    pub fn active_todo_title(&self) -> Option<&str> {
+        self.active_todo_title.as_deref()
+    }
+
+    /// Returns the active session's todo checklist rendered persistently above the prompt.
+    #[must_use]
+    pub fn active_todos(&self) -> &[TodoItem] {
+        &self.active_todos
     }
 
     /// Updates the displayed active [`Profile`].
@@ -379,8 +444,19 @@ impl AppState {
                     self.entries.push(TranscriptEntry::SystemNote(note));
                 }
                 HydratedEvent::Tool { call, output } => {
-                    self.entries
-                        .push(TranscriptEntry::tool_completed(&call, &output));
+                    if is_todo_tool(&call.name) {
+                        if output.is_error {
+                            self.entries.push(TranscriptEntry::ErrorNote(format!(
+                                "{}: {}",
+                                call.name, output.content
+                            )));
+                        } else {
+                            self.apply_todo_output(&output.content);
+                        }
+                    } else {
+                        self.entries
+                            .push(TranscriptEntry::tool_completed(&call, &output));
+                    }
                 }
             }
         }
@@ -418,6 +494,15 @@ impl AppState {
     pub fn push_tool_running(&mut self, call: &ToolCall) {
         self.finalize_thinking();
         self.streaming_active = false;
+        if is_todo_tool(&call.name) {
+            self.busy_status = if call.name == "todo_write" {
+                self.apply_todo_call_args(&call.arguments);
+                "Updating tasks…".to_owned()
+            } else {
+                "Reading tasks…".to_owned()
+            };
+            return;
+        }
         self.busy_status = format!("Running {}…", call.name);
         self.entries.push(TranscriptEntry::tool_running(call));
         self.auto_scroll = true;
@@ -427,6 +512,18 @@ impl AppState {
     pub fn finish_tool_entry(&mut self, call: &ToolCall, output: &ToolOutput) {
         self.streaming_active = false;
         self.busy_status = "Thinking…".to_owned();
+        if is_todo_tool(&call.name) {
+            if output.is_error {
+                self.entries.push(TranscriptEntry::ErrorNote(format!(
+                    "{}: {}",
+                    call.name, output.content
+                )));
+                self.auto_scroll = true;
+            } else {
+                self.apply_todo_output(&output.content);
+            }
+            return;
+        }
         if let Some(existing) = self.entries.iter_mut().rev().find_map(|entry| match entry {
             TranscriptEntry::Tool(tool) if tool.call_id == call.id => Some(tool),
             _ => None,
@@ -442,6 +539,52 @@ impl AppState {
                 .push(TranscriptEntry::tool_completed(call, output));
         }
         self.auto_scroll = true;
+    }
+
+    fn apply_todo_call_args(&mut self, args: &Value) {
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let Some(raw_items) = args.get("todos").and_then(Value::as_array) else {
+            return;
+        };
+        let mut parsed = Vec::with_capacity(raw_items.len());
+        for (idx, item) in raw_items.iter().enumerate() {
+            let Some(content) = item.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or_else(|| (idx + 1).to_string(), str::to_owned);
+            let status = match item.get("status").and_then(Value::as_str) {
+                Some("in_progress") => TodoStatus::InProgress,
+                Some("completed") => TodoStatus::Completed,
+                _ => TodoStatus::Pending,
+            };
+            parsed.push(TodoItem {
+                id,
+                content: content.to_owned(),
+                status,
+            });
+        }
+        self.set_active_todos(title, parsed);
+    }
+
+    fn apply_todo_output(&mut self, content: &str) {
+        let Ok(val) = serde_json::from_str::<Value>(content) else {
+            return;
+        };
+        if val.get("cleared").and_then(Value::as_bool) == Some(true) {
+            self.clear_active_todos();
+            return;
+        }
+        if let Ok(state) = serde_json::from_value::<TodoListState>(val) {
+            self.set_active_todos(state.title, state.todos);
+        }
     }
 
     /// Appends streamed reasoning/thought tokens into a trailing [`TranscriptEntry::Thinking`].
@@ -1080,5 +1223,77 @@ mod tests {
         state.clear_ctrl_c_arm();
         assert!(!state.ctrl_c_exit_armed());
         assert!(!state.arm_or_confirm_ctrl_c(t0 + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn todo_tools_update_bottom_bar_without_cluttering_transcript_and_clear_on_done() {
+        use serde_json::json;
+
+        let mut state = AppState::new(Profile::coding(), "off", "antigravity/gemini-3.8-flash");
+        let write_call = ToolCall {
+            id: "call_1".to_owned(),
+            name: "todo_write".to_owned(),
+            arguments: json!({
+                "title": "Auth refactor",
+                "todos": [
+                    { "id": "1", "content": "Extract JWT parser", "status": "in_progress" },
+                    { "id": "2", "content": "Add unit tests", "status": "pending" }
+                ]
+            }),
+        };
+
+        state.push_tool_running(&write_call);
+        assert!(state.entries().is_empty());
+        assert_eq!(state.active_todo_title(), Some("Auth refactor"));
+        assert_eq!(state.active_todos().len(), 2);
+
+        state.finish_tool_entry(
+            &write_call,
+            &ToolOutput {
+                call_id: "call_1".to_owned(),
+                content: json!({
+                    "ok": true,
+                    "title": "Auth refactor",
+                    "cleared": false,
+                    "todos": [
+                        { "id": "1", "content": "Extract JWT parser", "status": "completed" },
+                        { "id": "2", "content": "Add unit tests", "status": "in_progress" }
+                    ]
+                })
+                .to_string(),
+                is_error: false,
+            },
+        );
+        assert!(state.entries().is_empty());
+        assert_eq!(state.active_todos()[0].status, TodoStatus::Completed);
+        assert_eq!(state.active_todos()[1].status, TodoStatus::InProgress);
+
+        let complete_call = ToolCall {
+            id: "call_2".to_owned(),
+            name: "todo_write".to_owned(),
+            arguments: json!({
+                "todos": [
+                    { "id": "1", "content": "Extract JWT parser", "status": "completed" },
+                    { "id": "2", "content": "Add unit tests", "status": "completed" }
+                ]
+            }),
+        };
+        state.push_tool_running(&complete_call);
+        state.finish_tool_entry(
+            &complete_call,
+            &ToolOutput {
+                call_id: "call_2".to_owned(),
+                content: json!({
+                    "ok": true,
+                    "cleared": true,
+                    "todos": []
+                })
+                .to_string(),
+                is_error: false,
+            },
+        );
+        assert!(state.entries().is_empty());
+        assert!(state.active_todo_title().is_none());
+        assert!(state.active_todos().is_empty());
     }
 }

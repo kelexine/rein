@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use rein_core::ModeId;
+use rein_tools::{TodoItem, TodoStatus};
 
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
@@ -19,6 +20,7 @@ use crate::ui::entries::render_transcript_lines;
 const MAX_MENU_ROWS: usize = 6;
 const MAX_MODEL_MENU_ROWS: usize = 10;
 const MAX_PROMPT_ROWS: usize = 6;
+const MAX_TODO_BAR_ROWS: usize = 5;
 const MIN_HEIGHT_FOR_HEADER: u16 = 14;
 const CITADEL_OWL: [&str; 3] = ["▜▙████▟▛", "▐▛▄██▄▜▌", " ▝▜▀▀▛▘ "];
 const SPINNER_FRAMES: [&str; 6] = ["✶", "✢", "✽", "✻", "✳", "·"];
@@ -42,11 +44,21 @@ fn prompt_rows(state: &AppState, total_width: u16, total_height: u16) -> u16 {
     u16::try_from(lines.len().clamp(1, max_rows.max(1))).unwrap_or(1)
 }
 
+fn todo_bar_rows(state: &AppState) -> u16 {
+    let count = state.active_todos().len();
+    if count == 0 {
+        0
+    } else {
+        u16::try_from(1 + count.min(MAX_TODO_BAR_ROWS)).unwrap_or(0)
+    }
+}
+
 fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
     let popup_rows = compute_popup_rows(state, matches.len());
     let spinner_rows = u16::from(state.is_busy() && state.pending_approval().is_none());
+    let todo_rows = todo_bar_rows(state);
     let input_rows = prompt_rows(state, area.width, area.height);
 
     Layout::default()
@@ -56,6 +68,7 @@ fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Min(3),
             Constraint::Length(spinner_rows),
             Constraint::Length(popup_rows),
+            Constraint::Length(todo_rows),
             Constraint::Length(1),
             Constraint::Length(input_rows),
             Constraint::Length(1),
@@ -108,10 +121,13 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
 
-    render_rule(frame, chunks[4]);
-    render_prompt_line(state, frame, chunks[5]);
-    render_rule(frame, chunks[6]);
-    render_status_bar(state, frame, chunks[7]);
+    if chunks[4].height > 0 {
+        render_todo_bar(state, frame, chunks[4]);
+    }
+    render_rule(frame, chunks[5]);
+    render_prompt_line(state, frame, chunks[6]);
+    render_rule(frame, chunks[7]);
+    render_status_bar(state, frame, chunks[8]);
 }
 
 /// Computes the vertical max scroll offset for the rendered transcript inside `(width, height)`.
@@ -695,6 +711,85 @@ fn render_approval_menu(pending: &PendingApproval, frame: &mut Frame<'_>, area: 
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+fn render_todo_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
+    let todos = state.active_todos();
+    if todos.is_empty() || area.height == 0 {
+        return;
+    }
+    let total = todos.len();
+    let done = todos
+        .iter()
+        .filter(|item| item.status == TodoStatus::Completed)
+        .count();
+    let title = state.active_todo_title().unwrap_or("Tasks");
+    let start = todos
+        .iter()
+        .position(|item| item.status != TodoStatus::Completed)
+        .unwrap_or(0)
+        .min(total.saturating_sub(MAX_TODO_BAR_ROWS));
+    let end = (start + MAX_TODO_BAR_ROWS).min(total);
+    let hidden_after = total.saturating_sub(end);
+
+    let mut header_spans = vec![
+        Span::styled("  ▸ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ({done}/{total})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if hidden_after > 0 {
+        header_spans.push(Span::styled(
+            format!(" · +{hidden_after} more"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let mut lines = Vec::with_capacity(usize::from(area.height));
+    lines.push(Line::from(header_spans));
+    for item in &todos[start..end] {
+        lines.push(format_todo_bar_item(item));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_todo_bar_item(item: &TodoItem) -> Line<'static> {
+    match item.status {
+        TodoStatus::Completed => Line::from(vec![
+            Span::styled("    ☑ ", Style::default().fg(Color::Rgb(115, 210, 125))),
+            Span::styled(
+                item.content.clone(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+        ]),
+        TodoStatus::InProgress => Line::from(vec![
+            Span::styled(
+                "    ▸ ",
+                Style::default()
+                    .fg(Color::Rgb(178, 165, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                item.content.clone(),
+                Style::default()
+                    .fg(Color::Rgb(178, 165, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        TodoStatus::Pending => Line::from(vec![
+            Span::styled("    ☐ ", Style::default().fg(Color::Gray)),
+            Span::styled(item.content.clone(), Style::default().fg(Color::White)),
+        ]),
+    }
+}
+
 fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
     if let Some(pending) = state.pending_approval() {
         let (label, color) = if pending.editing_feedback {
@@ -834,7 +929,7 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         (
-            format!("{toggle_label} · tab: mode · /: commands · /exit"),
+            format!("{toggle_label} · shift+tab: mode · /: commands · /exit"),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -949,8 +1044,9 @@ mod tests {
         assert!(all_text.contains("Rein v"));
         assert!(all_text.contains("~/dev/rein"));
         assert!(all_text.contains("⚠ ANTHROPIC_API_KEY not set"));
-        assert!(all_text.contains("› /mode"));
+        assert!(all_text.contains("› /memory"));
         assert!(all_text.contains("ctrl+o: expand"));
+        assert!(all_text.contains("shift+tab: mode"));
         Ok(())
     }
 
@@ -1128,6 +1224,56 @@ mod tests {
         assert!(all_text.contains("third line"));
         assert!(all_text.contains("/exit"));
         assert!(!all_text.contains("esc: quit"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_dynamic_todo_bar_above_prompt_and_collapses_when_cleared() -> std::io::Result<()> {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend)?;
+        let mut state = AppState::new(Profile::coding(), "landlock v11", "claude-sonnet-5-5");
+        state.set_active_todos(
+            Some("Refactor auth".to_owned()),
+            vec![
+                TodoItem {
+                    id: "1".to_owned(),
+                    content: "Split token module".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: "2".to_owned(),
+                    content: "Verify session hooks".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: "3".to_owned(),
+                    content: "Update integration tests".to_owned(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        );
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let active_text: String = (0..20)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(active_text.contains("Refactor auth (1/3)"));
+        assert!(active_text.contains("☑ Split token module"));
+        assert!(active_text.contains("▸ Verify session hooks"));
+        assert!(active_text.contains("☐ Update integration tests"));
+
+        state.clear_active_todos();
+        assert_eq!(todo_bar_rows(&state), 0);
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let cleared_text: String = (0..20)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!cleared_text.contains("Refactor auth"));
+        assert!(!cleared_text.contains("Verify session hooks"));
         Ok(())
     }
 }

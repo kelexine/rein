@@ -74,4 +74,9 @@ pub enum Capability {
         /// Target operating mode (`coding`, `plan`, or `personal`).
         target: ModeId,
     },
+    /// Session-scoped global todo checklist operation (`todo_read`, `todo_write`).
+    Todo {
+        /// Read or write access mode.
+        mode: AccessMode,
+    },
 }
