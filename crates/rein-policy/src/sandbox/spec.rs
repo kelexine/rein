@@ -19,7 +19,126 @@ use crate::sandbox::linux::{apply_sandbox_in_child, probe_kernel_sandbox};
 pub const SANDBOX_CHILD_FLAG: &str = "--sandbox-child";
 
 /// Default read-only system directories exposed to sandboxed child processes.
-pub const DEFAULT_READ_ONLY_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc", "/proc"];
+pub const DEFAULT_READ_ONLY_DIRS: &[&str] = &[
+    "/usr", "/bin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/opt", "/nix", "/dev",
+];
+
+/// Character device files that require read/write access even inside a read-only sandbox (e.g. `2>/dev/null`).
+pub const DEFAULT_RW_DEVICE_PATHS: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/full",
+    "/dev/tty",
+];
+
+/// Resolves read+execute system, `$PATH`, and developer toolchain paths for Landlock sandboxing without exposing `$HOME` broadly.
+#[must_use]
+pub fn default_sandbox_read_only_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for dir in DEFAULT_READ_ONLY_DIRS {
+        push_sandbox_path(&mut paths, PathBuf::from(dir), workspace_root);
+    }
+
+    if let Some(raw_path) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&raw_path) {
+            if !entry.as_os_str().is_empty() && entry != Path::new(".") {
+                push_sandbox_path(&mut paths, entry, workspace_root);
+            }
+        }
+    }
+
+    for env_var in ["CARGO_HOME", "RUSTUP_HOME", "BUN_INSTALL", "GOPATH"] {
+        if let Some(val) = std::env::var_os(env_var) {
+            push_sandbox_path(&mut paths, PathBuf::from(val), workspace_root);
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for rel in [
+            ".cargo",
+            ".rustup",
+            ".bun",
+            ".local",
+            "go",
+            ".nvm",
+            ".fnm",
+            ".pyenv",
+            ".asdf",
+            ".mise",
+            ".volta",
+            ".gitconfig",
+            ".config/git",
+        ] {
+            push_sandbox_path(&mut paths, home.join(rel), workspace_root);
+        }
+    }
+
+    paths
+}
+
+/// Resolves safe writable scratch/device paths (such as `/dev/null`, `/tmp`, and Cargo's lockfile) for Landlock sandboxing.
+#[must_use]
+pub fn default_sandbox_read_write_paths(
+    workspace_root: &Path,
+    read_only_workspace: bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for dev in DEFAULT_RW_DEVICE_PATHS {
+        let p = PathBuf::from(dev);
+        if p.exists() && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+
+    let cargo_cache = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .map(|cargo_home| cargo_home.join(".package-cache"));
+    if let Some(cache) = cargo_cache
+        && cache.exists()
+        && !paths.contains(&cache)
+    {
+        paths.push(cache);
+    }
+
+    let mut scratch_dirs = vec![std::env::temp_dir()];
+    if let Some(tmpdir) = std::env::var_os("TMPDIR").map(PathBuf::from) {
+        scratch_dirs.push(tmpdir);
+    }
+    for dir in scratch_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        // Keep read-only workspace boundaries strict when tests place a workspace under `/tmp`.
+        if read_only_workspace && workspace_root.starts_with(&dir) {
+            continue;
+        }
+        if !paths.contains(&dir) {
+            paths.push(dir);
+        }
+    }
+
+    paths
+}
+
+fn push_sandbox_path(out: &mut Vec<PathBuf>, candidate: PathBuf, workspace_root: &Path) {
+    if !candidate.exists() {
+        return;
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && candidate == home
+    {
+        return;
+    }
+    if workspace_root.starts_with(&candidate) || candidate.starts_with(workspace_root) {
+        return;
+    }
+    if !out.contains(&candidate) {
+        out.push(candidate);
+    }
+}
 
 /// Maximum bytes retained inline per stream (`stdout` / `stderr`) in [`SandboxCommandOutput`].
 pub const OUTPUT_CAP_BYTES: usize = 32 * 1024;
@@ -57,8 +176,11 @@ pub struct SandboxSpec {
     pub workspace_root: PathBuf,
     /// When true, Landlock restricts even `workspace_root` to read-only access (used for read-only commands).
     pub read_only_workspace: bool,
-    /// System paths granted read-only and execute access.
+    /// System and toolchain paths granted read-only and execute access.
     pub read_only_paths: Vec<PathBuf>,
+    /// Safe scratch/device paths granted read-write access (e.g. `/dev/null`, `/tmp`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_write_paths: Vec<PathBuf>,
     /// Target executable to run after Landlock is applied.
     pub program: String,
     /// Arguments passed to `program`.
@@ -232,4 +354,29 @@ fn drain_pipe<R: Read>(
         }
     }
     Ok((inline, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_default_paths_expose_dev_null_and_toolchains_without_home_root() {
+        let ws = std::env::temp_dir().join("rein_spec_paths_test_ws");
+        let ro = default_sandbox_read_only_paths(&ws);
+        assert!(ro.contains(&PathBuf::from("/usr")));
+        assert!(ro.contains(&PathBuf::from("/dev")));
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert!(!ro.contains(&home), "must not expose $HOME broadly");
+        }
+
+        let rw_for_ro_ws = default_sandbox_read_write_paths(&ws, true);
+        assert!(rw_for_ro_ws.contains(&PathBuf::from("/dev/null")));
+        assert!(!rw_for_ro_ws.contains(&std::env::temp_dir()));
+
+        let non_tmp_ws = PathBuf::from("/nonexistent_rein_workspace_root_for_test");
+        let rw_for_real_ws = default_sandbox_read_write_paths(&non_tmp_ws, false);
+        assert!(rw_for_real_ws.contains(&PathBuf::from("/dev/null")));
+        assert!(rw_for_real_ws.contains(&std::env::temp_dir()));
+    }
 }

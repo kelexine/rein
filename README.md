@@ -46,26 +46,26 @@ Optional environment overrides: `REIN_PROVIDER` (`anthropic` | `antigravity`), `
 # Authenticate directly with Antigravity via browser OAuth 2.0
 ./target/release/rein login
 
-# Resume the previous workspace session from .rein/session.jsonl
-./target/release/rein --resume
+# Resume a saved session in the current workspace directory
+./target/release/rein --resume <uid>
 
 # Deterministically replay and verify a recorded session log
-./target/release/rein replay .rein/session.jsonl
+./target/release/rein replay ~/.rein/sessions/<workspace-slug>/<uid>.jsonl
 ```
 
 ### Dual-Scope Configuration Layout
 
 | Scope | Path | Auto-created Files & Directories |
 |---|---|---|
-| Global / Personal | `~/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `notes.jsonl`, `calendar.jsonl`, `email.jsonl` |
-| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `skills/`, `bash-outputs/`, `memory.jsonl`, `session.jsonl`, `full-transcript.jsonl`, `audit.jsonl` |
+| Global / Personal | `~/.rein/` | `config.json`, `commands.json`, `skills/`, `memory.jsonl`, `notes.jsonl`, `calendar.jsonl`, `email.jsonl`, `sessions/<workspace-slug>/<uid>.jsonl` (event log & post-compaction state), `sessions/<workspace-slug>/<uid>.full.jsonl` (uncompacted full session transcript) |
+| Repository / Coding | `<workspace>/.rein/` | `config.json`, `commands.json`, `skills/`, `bash-outputs/`, `memory.jsonl`, `audit.jsonl` |
 
 ### Built-in Slash Commands & Skills
 
 Typing `/` opens an inline autocomplete popup above the prompt (`Up`/`Down` navigate, `Tab` completes, `Enter` runs):
 
-- Built-ins: `/help`, `/mode [coding|personal]`, `/login` (Google Antigravity OAuth browser login), `/model [provider|model]` (dynamically fetches live models and quotas from the server), `/provider [anthropic|antigravity] [model]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
-- Shortcuts: `Ctrl+O` toggles collapsed/expanded tool output previews, `Tab` toggles `coding`/`personal` mode (or edits inline approval feedback), `Up`/`Down`/`PageUp`/`PageDown` scroll the transcript, `Esc` quits.
+- Built-ins: `/help`, `/mode [coding|personal]`, `/login` (Google Antigravity OAuth browser login), `/model [provider|model]` (dynamically fetches live models and quotas from the server), `/provider [anthropic|antigravity] [model]`, `/clear`, `/compact` (summarizes active context while preserving the session's `<uid>.full.jsonl` verbatim archive), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
+- Shortcuts: `Ctrl+O` toggles collapsed/expanded tool output previews, `Tab` toggles `coding`/`personal` mode (or edits inline approval feedback), `Up`/`Down` navigate prompt history, `PageUp`/`PageDown` scroll the transcript, `Esc` quits.
 - Skills: any `<name>/SKILL.md` inside `~/.rein/skills/` (`(user)`) or `<workspace>/.rein/skills/` (`(repo)`) registers `/<name>` and instructs the model to read `SKILL.md` first before proceeding.
 
 Add pre-approved sandboxed commands or sandboxed tool patterns as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json` (or persist interactively via Option 2 / Option 3):

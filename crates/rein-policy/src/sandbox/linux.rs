@@ -18,7 +18,15 @@ const LANDLOCK_RULE_PATH_BENEATH: libc::c_uint = 1;
 #[cfg(target_os = "linux")]
 const ACCESS_FS_READ_EXEC: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 #[cfg(target_os = "linux")]
+const ACCESS_FS_FILE_READ_EXEC: u64 = (1 << 0) | (1 << 2);
+#[cfg(target_os = "linux")]
+const ACCESS_FS_FILE_RW: u64 = (1 << 1) | (1 << 2);
+#[cfg(target_os = "linux")]
 const ACCESS_FS_READ_WRITE_V1: u64 = (1 << 13) - 1;
+#[cfg(target_os = "linux")]
+const ACCESS_FS_REFER: u64 = 1 << 13;
+#[cfg(target_os = "linux")]
+const ACCESS_FS_READ_WRITE_V2: u64 = ACCESS_FS_READ_WRITE_V1 | ACCESS_FS_REFER;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -70,17 +78,43 @@ pub fn probe_kernel_sandbox() -> SandboxStatus {
 pub fn apply_sandbox_in_child(spec: &SandboxSpec) -> Result<(), PolicyError> {
     #[cfg(target_os = "linux")]
     {
+        let abi_version = match probe_kernel_sandbox() {
+            SandboxStatus::Enforced { abi_version } => abi_version,
+            SandboxStatus::Unavailable { reason } => {
+                return Err(PolicyError::SandboxUnavailable(reason));
+            }
+        };
+        let rw_dir_access = if abi_version >= 2 {
+            ACCESS_FS_READ_WRITE_V2
+        } else {
+            ACCESS_FS_READ_WRITE_V1
+        };
         set_no_new_privs()?;
-        let ruleset_fd = create_ruleset()?;
+        let ruleset_fd = create_ruleset(rw_dir_access)?;
         for ro_path in &spec.read_only_paths {
             if ro_path.exists() {
-                add_path_rule(ruleset_fd, ro_path, ACCESS_FS_READ_EXEC)?;
+                let access = if ro_path.is_dir() {
+                    ACCESS_FS_READ_EXEC
+                } else {
+                    ACCESS_FS_FILE_READ_EXEC
+                };
+                add_path_rule(ruleset_fd, ro_path, access)?;
+            }
+        }
+        for rw_path in &spec.read_write_paths {
+            if rw_path.exists() {
+                let access = if rw_path.is_dir() {
+                    rw_dir_access
+                } else {
+                    ACCESS_FS_FILE_RW
+                };
+                add_path_rule(ruleset_fd, rw_path, access)?;
             }
         }
         let ws_access = if spec.read_only_workspace {
             ACCESS_FS_READ_EXEC
         } else {
-            ACCESS_FS_READ_WRITE_V1
+            rw_dir_access
         };
         add_path_rule(ruleset_fd, &spec.workspace_root, ws_access)?;
         restrict_self(ruleset_fd)
@@ -109,10 +143,8 @@ fn set_no_new_privs() -> Result<(), PolicyError> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_ruleset() -> Result<i32, PolicyError> {
-    let attr = LandlockRulesetAttr {
-        handled_access_fs: ACCESS_FS_READ_WRITE_V1,
-    };
+fn create_ruleset(handled_access_fs: u64) -> Result<i32, PolicyError> {
+    let attr = LandlockRulesetAttr { handled_access_fs };
     // SAFETY: `attr` is a valid stack-allocated LandlockRulesetAttr with exact size.
     let fd = unsafe {
         libc::syscall(

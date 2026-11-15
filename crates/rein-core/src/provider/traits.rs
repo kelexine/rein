@@ -58,6 +58,8 @@ pub struct AvailableModel {
 /// Incremental event yielded by a [`Provider`] during a turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderStreamEvent {
+    /// Model reasoning / thought trace token delta.
+    ThinkingDelta(String),
     /// Text token delta.
     TextDelta(String),
     /// Structured tool invocation emitted by the model.

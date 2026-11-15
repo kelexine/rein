@@ -36,7 +36,8 @@ use crate::agent::{
 };
 use crate::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
-    provider_startup_notice, save_provider_selection,
+    generate_session_uid, list_sessions, provider_startup_notice, resolve_resume_session,
+    save_provider_selection, write_latest_session_uid,
 };
 use crate::modes::Profile;
 use crate::ui::{AppState, run_tui};
@@ -102,7 +103,13 @@ fn main() -> Result<()> {
         );
     }
 
-    let resume = args.iter().any(|arg| arg == "--resume");
+    let resume_spec = match parse_resume_flag(&args) {
+        Ok(spec) => spec,
+        Err(msg) => {
+            print_resume_usage_help(&msg, &loaded.paths);
+            std::process::exit(2);
+        }
+    };
     run_interactive(
         &workspace_root,
         loaded,
@@ -112,8 +119,56 @@ fn main() -> Result<()> {
         initial_profile,
         mcp_tools,
         mcp_warnings,
-        resume,
+        resume_spec,
     )
+}
+
+fn print_resume_usage_help(msg: &anyhow::Error, paths: &config::ReinPaths) {
+    eprintln!("warning: {msg}");
+    eprintln!("usage: rein --resume <uid>");
+    if let Ok(sessions) = list_sessions(paths) {
+        if sessions.is_empty() {
+            eprintln!(
+                "no saved sessions in {}; run `rein` to start a new session.",
+                paths.workspace_dir.display()
+            );
+        } else {
+            eprintln!("saved sessions in {}:", paths.workspace_dir.display());
+            for s in sessions.iter().take(5) {
+                let preview = s.preview.as_deref().unwrap_or("(empty session)");
+                eprintln!("  {:<10} {} ({} turns)", s.uid, preview, s.turn_count);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeSpec {
+    NewSession,
+    Uid(String),
+}
+
+fn parse_resume_flag(args: &[String]) -> Result<ResumeSpec> {
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if let Some(uid) = arg.strip_prefix("--resume=") {
+            let trimmed = uid.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("--resume requires a session uid (usage: rein --resume <uid>)");
+            }
+            return Ok(ResumeSpec::Uid(trimmed.to_owned()));
+        }
+        if arg == "--resume" {
+            if let Some(next) = iter.next()
+                && !next.starts_with('-')
+                && !next.trim().is_empty()
+            {
+                return Ok(ResumeSpec::Uid(next.trim().to_owned()));
+            }
+            anyhow::bail!("--resume requires a session uid (usage: rein --resume <uid>)");
+        }
+    }
+    Ok(ResumeSpec::NewSession)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -126,7 +181,7 @@ fn run_interactive(
     initial_profile: Profile,
     mcp_tools: Vec<String>,
     mcp_warnings: Vec<String>,
-    resume: bool,
+    resume_spec: ResumeSpec,
 ) -> Result<()> {
     let sandbox_label = format_sandbox_label(policy.sandbox_status());
     let active_kind = loaded.config.resolved_provider();
@@ -137,24 +192,46 @@ fn run_interactive(
     }
     notices.extend(mcp_warnings);
 
+    let (session_uid, event_log_path, full_transcript_path, should_hydrate) = match resume_spec {
+        ResumeSpec::NewSession => {
+            let uid = generate_session_uid(&loaded.paths);
+            let (log_path, full_path) = loaded.paths.session_paths_for(&uid);
+            (uid, log_path, full_path, false)
+        }
+        ResumeSpec::Uid(uid_or_prefix) => {
+            let (summary, _) = resolve_resume_session(&loaded.paths, Some(&uid_or_prefix))?;
+            (
+                summary.uid,
+                summary.event_log,
+                summary.full_transcript,
+                true,
+            )
+        }
+    };
+    if config::is_valid_session_uid(&session_uid) {
+        let _ = write_latest_session_uid(&loaded.paths, &session_uid);
+    }
+
     let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
-    let event_log = EventLog::new(&loaded.paths.session_log);
+    let event_log = EventLog::new(&event_log_path);
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)
-        .with_full_transcript_path(&loaded.paths.full_transcript)
+        .with_full_transcript_path(&full_transcript_path)
         .with_command_allowlist_paths(&loaded.paths.repo_commands, &loaded.paths.global_commands)
         .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(mcp_tools);
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_workspace_label(collapse_home_path(workspace_root))
+        .with_session_id(&session_uid)
         .with_startup_notices(notices)
         .with_slash_registry(slash_registry)
         .with_configured_commands(loaded.allowed_commands)
         .with_mcp_servers(loaded.config.mcp_servers.clone());
 
-    if resume {
+    if should_hydrate {
         app.extend_hydrated(agent.hydrate_structured()?);
         app.set_active_profile(agent.active_profile().clone());
+        app.push_system_note(format!("resumed session {session_uid}"));
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -165,6 +242,10 @@ fn run_interactive(
             &loaded.paths,
             &mut app,
         )?;
+        let active_uid = app.session_id();
+        if !active_uid.is_empty() && loaded.paths.session_paths_for(active_uid).0.exists() {
+            println!("To continue this session run rein --resume {active_uid}");
+        }
     } else {
         println!(
             "Rein initialized ({} tools active in {:?} mode; provider={}; global={}, repo={}).",
@@ -304,4 +385,44 @@ fn collapse_home_path(path: &Path) -> String {
         };
     }
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_resume_requires_explicit_uid() {
+        let plain = vec!["rein".to_owned()];
+        assert_eq!(parse_resume_flag(&plain).ok(), Some(ResumeSpec::NewSession));
+
+        let bare = vec!["rein".to_owned(), "--resume".to_owned()];
+        assert!(parse_resume_flag(&bare).is_err());
+
+        let empty_eq = vec!["rein".to_owned(), "--resume=".to_owned()];
+        assert!(parse_resume_flag(&empty_eq).is_err());
+
+        let with_flag = vec![
+            "rein".to_owned(),
+            "--resume".to_owned(),
+            "--model".to_owned(),
+        ];
+        assert!(parse_resume_flag(&with_flag).is_err());
+
+        let valid = vec![
+            "rein".to_owned(),
+            "--resume".to_owned(),
+            "a1b2c3d4".to_owned(),
+        ];
+        assert_eq!(
+            parse_resume_flag(&valid).ok(),
+            Some(ResumeSpec::Uid("a1b2c3d4".to_owned()))
+        );
+
+        let valid_eq = vec!["rein".to_owned(), "--resume=deadbeef".to_owned()];
+        assert_eq!(
+            parse_resume_flag(&valid_eq).ok(),
+            Some(ResumeSpec::Uid("deadbeef".to_owned()))
+        );
+    }
 }

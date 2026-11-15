@@ -51,13 +51,15 @@ pub struct ApprovalDecision {
     pub feedback: Option<String>,
 }
 
-/// Structured transcript event yielded when hydrating `session.jsonl` on `--resume` or `/resume`.
+/// Structured transcript event yielded when hydrating `<uid>.jsonl` on `--resume` or `/resume`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydratedEvent {
     /// Submitted user prompt.
     User(String),
     /// Completed assistant text message.
     Assistant(String),
+    /// Muted system note (for example compaction boundaries).
+    Note(String),
     /// Completed tool call paired with its output payload.
     Tool {
         /// Tool call arguments and identifier.
@@ -74,6 +76,9 @@ pub trait ApprovalPrompter {
 
     /// Receives incremental streamed text chunks during a model turn.
     fn on_delta(&mut self, _delta: &str) {}
+
+    /// Receives incremental model reasoning / thought chunks during a turn.
+    fn on_thinking_delta(&mut self, _delta: &str) {}
 
     /// Receives compact 1-line tool activity summaries (`· read Cargo.toml`).
     fn on_tool_status(&mut self, _status: &str) {}
@@ -213,6 +218,13 @@ impl AgentLoop {
         self.history.clear();
     }
 
+    /// Rebinds this [`AgentLoop`] to a new session `EventLog` and `full_transcript` archive and clears active history.
+    pub fn switch_session(&mut self, event_log: EventLog, full_transcript_path: PathBuf) {
+        self.event_log = event_log;
+        self.full_transcript_path = Some(full_transcript_path);
+        self.history.clear();
+    }
+
     /// Queries the dual-scope memory store for `scope` and substring `query`.
     pub fn query_memory(&self, scope: MemoryScope, query: &str) -> Result<Vec<MemoryRecord>> {
         self.memory
@@ -252,69 +264,47 @@ impl AgentLoop {
             .full_transcript_path
             .as_deref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".rein/full-transcript.jsonl".to_owned());
+            .unwrap_or_else(|| "session full transcript".to_owned());
         let compacted = Message::new(
             Role::User,
             format!(
                 "[Compacted summary of {prior_count} prior messages; complete verbatim turns are archived in `{archive_note}` and can be inspected anytime with `read` or `grep`]\n\n{summary}"
             ),
         );
+        self.event_log
+            .append(&SessionEvent::Compacted {
+                message: compacted.clone(),
+                prior_count,
+            })
+            .context("failed to append compaction event to session log")?;
         self.history = vec![compacted];
         Ok(format!(
             "compacted {prior_count} messages via provider (archive: {archive_note})"
         ))
     }
 
-    /// Hydrates conversation history, active mode, and clean display transcript lines from `session.jsonl`.
+    /// Hydrates conversation history, active mode, and clean display transcript lines from the bound session log.
     pub fn hydrate_from_log(&mut self) -> Result<Vec<String>> {
-        let events = self.event_log.read_all()?;
+        let structured = self.hydrate_structured()?;
         let mut display_lines = Vec::new();
-        let mut pending_calls: Vec<ToolCall> = Vec::new();
-        self.history.clear();
-
-        for ev in events {
+        for ev in structured {
             match ev {
-                SessionEvent::ModeSwitched { mode } => {
-                    let profile = self.build_profile(mode);
-                    self.policy.set_rules(profile.policy_rules.clone());
-                    self.modes = ModeManager::new(profile);
-                }
-                SessionEvent::ToolRequested { call } => {
-                    display_lines.push(format_tool_status(&call));
-                    pending_calls.push(call);
-                }
-                SessionEvent::ToolCompleted { output } => {
-                    let mut tool_msg = Message::new(Role::Tool, output.content);
-                    if let Some(matched) = pending_calls
-                        .iter()
-                        .find(|c| c.id == output.call_id)
-                        .cloned()
-                    {
-                        tool_msg.tool_calls.push(matched);
-                    }
-                    self.history.push(tool_msg);
-                }
-                SessionEvent::MessageRecorded { message } => {
-                    Self::hydrate_message(
-                        &mut self.history,
-                        &mut display_lines,
-                        &mut pending_calls,
-                        message,
-                    );
-                }
-                SessionEvent::StreamDelta { .. }
-                | SessionEvent::PolicyEvaluated { .. }
-                | SessionEvent::MemoryAccessed { .. } => {}
+                HydratedEvent::User(text) => display_lines.push(format!("❯ {text}")),
+                HydratedEvent::Assistant(text) => display_lines.push(text),
+                HydratedEvent::Note(text) => display_lines.push(format!("· {text}")),
+                HydratedEvent::Tool { call, .. } => display_lines.push(format_tool_status(&call)),
             }
         }
         Ok(display_lines)
     }
 
-    /// Hydrates conversation history and structured UI events from `session.jsonl`.
+    /// Hydrates conversation history and structured UI events from the bound session log.
     pub fn hydrate_structured(&mut self) -> Result<Vec<HydratedEvent>> {
         let events = self.event_log.read_all()?;
         let mut items = Vec::new();
         let mut pending_calls: Vec<ToolCall> = Vec::new();
+        let mut pending_tools: Vec<Message> = Vec::new();
+        let mut round_text = String::new();
         self.history.clear();
 
         for ev in events {
@@ -323,6 +313,9 @@ impl AgentLoop {
                     let profile = self.build_profile(mode);
                     self.policy.set_rules(profile.policy_rules.clone());
                     self.modes = ModeManager::new(profile);
+                }
+                SessionEvent::StreamDelta { delta } => {
+                    round_text.push_str(&delta);
                 }
                 SessionEvent::ToolRequested { call } => {
                     pending_calls.push(call);
@@ -339,23 +332,34 @@ impl AgentLoop {
                             output: output.clone(),
                         });
                         tool_msg.tool_calls.push(matched);
+                        pending_tools.push(tool_msg);
                     }
-                    self.history.push(tool_msg);
                 }
-                SessionEvent::MessageRecorded { mut message } => {
+                SessionEvent::MessageRecorded { message } => {
                     if message.role == Role::User && message.content == "[tool_result_continuation]"
                     {
+                        flush_tool_round(
+                            &mut self.history,
+                            &mut items,
+                            &mut round_text,
+                            &mut pending_calls,
+                            &mut pending_tools,
+                        );
                         continue;
                     }
+                    flush_tool_round(
+                        &mut self.history,
+                        &mut items,
+                        &mut round_text,
+                        &mut pending_calls,
+                        &mut pending_tools,
+                    );
+                    round_text.clear();
                     match message.role {
                         Role::User => {
-                            pending_calls.clear();
                             items.push(HydratedEvent::User(message.content.clone()));
                         }
                         Role::Assistant => {
-                            if !pending_calls.is_empty() && message.tool_calls.is_empty() {
-                                message.tool_calls = std::mem::take(&mut pending_calls);
-                            }
                             if !message.content.trim().is_empty() {
                                 items.push(HydratedEvent::Assistant(message.content.clone()));
                             }
@@ -364,11 +368,33 @@ impl AgentLoop {
                     }
                     self.history.push(message);
                 }
-                SessionEvent::StreamDelta { .. }
-                | SessionEvent::PolicyEvaluated { .. }
-                | SessionEvent::MemoryAccessed { .. } => {}
+                SessionEvent::Compacted {
+                    message,
+                    prior_count,
+                } => {
+                    flush_tool_round(
+                        &mut self.history,
+                        &mut items,
+                        &mut round_text,
+                        &mut pending_calls,
+                        &mut pending_tools,
+                    );
+                    round_text.clear();
+                    self.history = vec![message];
+                    items.push(HydratedEvent::Note(format!(
+                        "compacted {prior_count} prior messages"
+                    )));
+                }
+                SessionEvent::PolicyEvaluated { .. } | SessionEvent::MemoryAccessed { .. } => {}
             }
         }
+        flush_tool_round(
+            &mut self.history,
+            &mut items,
+            &mut round_text,
+            &mut pending_calls,
+            &mut pending_tools,
+        );
         Ok(items)
     }
 
@@ -403,15 +429,16 @@ impl AgentLoop {
                 &assembled.system_prompt,
                 &assembled.messages,
                 &specs,
-                &mut |ev| {
-                    if let ProviderStreamEvent::TextDelta(delta) = ev {
-                        prompter.on_delta(delta);
-                    }
+                &mut |ev| match ev {
+                    ProviderStreamEvent::ThinkingDelta(delta) => prompter.on_thinking_delta(delta),
+                    ProviderStreamEvent::TextDelta(delta) => prompter.on_delta(delta),
+                    _ => {}
                 },
             )?;
 
             for ev in events {
                 match ev {
+                    ProviderStreamEvent::ThinkingDelta(_) => {}
                     ProviderStreamEvent::TextDelta(delta) => {
                         streamed_text.push_str(&delta);
                         streaming.push_delta(&delta)?;
@@ -455,33 +482,39 @@ impl AgentLoop {
             .with_allowed_commands(self.allowed_commands.clone())
             .with_extra_tools(&self.extra_tools)
     }
+}
 
-    fn hydrate_message(
-        history: &mut Vec<Message>,
-        display_lines: &mut Vec<String>,
-        pending_calls: &mut Vec<ToolCall>,
-        mut message: Message,
-    ) {
-        if message.role == Role::User && message.content == "[tool_result_continuation]" {
-            return;
-        }
-        match message.role {
-            Role::User => {
-                pending_calls.clear();
-                display_lines.push(format!("❯ {}", message.content));
-            }
-            Role::Assistant => {
-                if !pending_calls.is_empty() && message.tool_calls.is_empty() {
-                    message.tool_calls = std::mem::take(pending_calls);
-                }
-                if !message.content.trim().is_empty() {
-                    display_lines.push(message.content.clone());
-                }
-            }
-            Role::Tool | Role::System => {}
-        }
-        history.push(message);
+fn flush_tool_round(
+    history: &mut Vec<Message>,
+    items: &mut Vec<HydratedEvent>,
+    round_text: &mut String,
+    pending_calls: &mut Vec<ToolCall>,
+    pending_tools: &mut Vec<Message>,
+) {
+    let text = std::mem::take(round_text);
+    let calls = std::mem::take(pending_calls);
+    let tools = std::mem::take(pending_tools);
+    if calls.is_empty() && tools.is_empty() {
+        return;
     }
+    let completed_calls: Vec<ToolCall> = calls
+        .into_iter()
+        .filter(|call| {
+            tools
+                .iter()
+                .any(|msg| msg.tool_calls.first().is_some_and(|c| c.id == call.id))
+        })
+        .collect();
+    if completed_calls.is_empty() {
+        return;
+    }
+    if !text.trim().is_empty() {
+        items.push(HydratedEvent::Assistant(text.clone()));
+    }
+    let mut assistant_msg = Message::new(Role::Assistant, text);
+    assistant_msg.tool_calls = completed_calls;
+    history.push(assistant_msg);
+    history.extend(tools);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -711,7 +744,7 @@ fn record_full_message(path: Option<&Path>, message: &Message) -> Result<()> {
         .append(&SessionEvent::MessageRecorded {
             message: message.clone(),
         })
-        .context("failed to append to full-transcript.jsonl")
+        .context("failed to append to session full transcript")
 }
 
 fn format_history_for_summary(history: &[Message], focus: Option<&str>) -> String {
@@ -951,6 +984,13 @@ mod tests {
         assert!(transcript.iter().any(|l| l == "❯ read both files"));
         assert!(transcript.iter().any(|l| l == "· read a.txt"));
         assert!(transcript.iter().any(|l| l == "Read alpha and beta."));
+        assert_eq!(resumed.history().len(), 5);
+        assert_eq!(resumed.history()[0].role, Role::User);
+        assert_eq!(resumed.history()[1].role, Role::Assistant);
+        assert_eq!(resumed.history()[1].tool_calls.len(), 2);
+        assert_eq!(resumed.history()[2].role, Role::Tool);
+        assert_eq!(resumed.history()[3].role, Role::Tool);
+        assert_eq!(resumed.history()[4].role, Role::Assistant);
 
         let confirm_msg = format_confirmation_prompt(
             &ToolCall {
@@ -979,22 +1019,26 @@ mod tests {
             SessionEvent::MessageRecorded {
                 message: Message::new(Role::Assistant, "concise summary of first answer"),
             },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "second answer after compaction"),
+            },
         ];
         let mut replay = ReplayProvider::from_events(&events);
         let sandbox = WorkspaceSandbox::new(&dir);
         let profile = Profile::coding();
         let policy = PolicyEngine::new(
             profile.policy_rules.clone(),
-            sandbox,
+            sandbox.clone(),
             AuditLog::new(dir.join("audit.jsonl")),
         );
-        let full_path = dir.join("full-transcript.jsonl");
+        let session_path = dir.join("a1b2c3d4.jsonl");
+        let full_path = dir.join("a1b2c3d4.full.jsonl");
         let mut agent = AgentLoop::new(
-            EventLog::new(dir.join("session.jsonl")),
+            EventLog::new(&session_path),
             policy,
             ToolRegistry::new(),
             JsonlMemoryStore::new(dir.join("memory.jsonl")),
-            profile,
+            profile.clone(),
         )
         .with_full_transcript_path(&full_path);
 
@@ -1004,10 +1048,40 @@ mod tests {
         assert!(status.contains("compacted 2 messages"));
         assert_eq!(agent.history().len(), 1);
         assert!(agent.history()[0].content.contains("concise summary"));
-        assert!(agent.history()[0].content.contains("full-transcript.jsonl"));
+        assert!(agent.history()[0].content.contains("a1b2c3d4.full.jsonl"));
+
+        let _ = agent.run_user_prompt("follow up question", &mut replay, &mut prompter)?;
 
         let archived = EventLog::new(&full_path).read_all()?;
-        assert_eq!(archived.len(), 2);
+        assert_eq!(archived.len(), 4);
+
+        let resumed_policy = PolicyEngine::new(
+            profile.policy_rules.clone(),
+            sandbox,
+            AuditLog::new(dir.join("audit.jsonl")),
+        );
+        let mut resumed = AgentLoop::new(
+            EventLog::new(&session_path),
+            resumed_policy,
+            ToolRegistry::new(),
+            JsonlMemoryStore::new(dir.join("memory.jsonl")),
+            profile,
+        )
+        .with_full_transcript_path(&full_path);
+        let hydrated = resumed.hydrate_structured()?;
+        assert!(
+            hydrated
+                .iter()
+                .any(|ev| matches!(ev, HydratedEvent::Note(n) if n.contains("compacted 2")))
+        );
+        assert_eq!(resumed.history().len(), 3);
+        assert_eq!(resumed.history()[0].role, Role::User);
+        assert!(resumed.history()[0].content.contains("concise summary"));
+        assert_eq!(resumed.history()[1].content, "follow up question");
+        assert_eq!(
+            resumed.history()[2].content,
+            "second answer after compaction"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

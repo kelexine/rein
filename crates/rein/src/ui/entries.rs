@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-15
-// Purpose: Structured transcript entries and Claude Code-inspired tool, diff, todo, and turn rendering
+// Purpose: Structured transcript entries for reasoning traces, hidden-by-default Ctrl+O tool outputs, diffs, and todos
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,10 +8,6 @@ use rein_core::{ToolCall, ToolOutput};
 use serde_json::Value;
 
 use crate::ui::markdown::render_assistant_markdown;
-
-const COLLAPSED_OUTPUT_LINES: usize = 4;
-const COLLAPSED_DIFF_LINES: usize = 6;
-const COLLAPSED_TODO_LINES: usize = 10;
 
 /// Live execution state of a rendered tool invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +20,7 @@ pub enum ToolRunState {
     Error,
 }
 
-/// Structured tool invocation entry carrying raw call metadata and output lines.
+/// Structured tool invocation entry carrying raw call metadata and captured output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolTranscriptEntry {
     /// Unique provider tool call identifier.
@@ -44,9 +40,18 @@ pub struct ToolTranscriptEntry {
 pub enum TranscriptEntry {
     /// Prompt submitted by the user.
     UserTurn(String),
+    /// Model reasoning / thought trace displayed as collapsible disclosure.
+    Thinking {
+        /// Accumulated reasoning text.
+        content: String,
+        /// Elapsed seconds while reasoning was streamed.
+        elapsed_secs: u64,
+        /// Whether tokens are still streaming into this thought block.
+        active: bool,
+    },
     /// Markdown response streamed by the assistant.
     AssistantTurn(String),
-    /// Structured tool invocation + collapsible output tree.
+    /// Structured tool invocation + `Ctrl+O` expandable `└` output tree.
     Tool(ToolTranscriptEntry),
     /// Muted status/system feedback (`· ...`).
     SystemNote(String),
@@ -84,7 +89,7 @@ impl TranscriptEntry {
     }
 }
 
-/// Renders the entire structured transcript into styled Ratatui [`Line`]s with separators and conditional `Ctrl+O` expansion.
+/// Renders the structured transcript into styled Ratatui [`Line`]s with separators and conditional `Ctrl+O` output hiding.
 #[must_use]
 pub fn render_transcript_lines(
     entries: &[TranscriptEntry],
@@ -92,15 +97,22 @@ pub fn render_transcript_lines(
     expand_outputs: bool,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let mut prev_was_note = false;
+    let mut prev_kind = EntryKind::Other;
 
     for entry in entries {
-        let is_note = matches!(entry, TranscriptEntry::SystemNote(_));
-        if !out.is_empty() && !(prev_was_note && is_note) {
+        let kind = EntryKind::from(entry);
+        let skip_blank = (prev_kind == EntryKind::Note && kind == EntryKind::Note)
+            || (!expand_outputs && prev_kind == EntryKind::Tool && kind == EntryKind::Tool);
+        if !out.is_empty() && !skip_blank {
             out.push(Line::default());
         }
         match entry {
             TranscriptEntry::UserTurn(text) => render_user_turn(text, width, &mut out),
+            TranscriptEntry::Thinking {
+                content,
+                elapsed_secs,
+                active,
+            } => render_thinking_entry(content, *elapsed_secs, *active, expand_outputs, &mut out),
             TranscriptEntry::AssistantTurn(text) => {
                 let mut md_lines = render_assistant_markdown(text, width);
                 if md_lines.is_empty() {
@@ -115,9 +127,26 @@ pub fn render_transcript_lines(
             TranscriptEntry::SystemNote(note) => render_system_note(note, &mut out),
             TranscriptEntry::ErrorNote(err) => render_error_note(err, &mut out),
         }
-        prev_was_note = is_note;
+        prev_kind = kind;
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Tool,
+    Note,
+    Other,
+}
+
+impl From<&TranscriptEntry> for EntryKind {
+    fn from(entry: &TranscriptEntry) -> Self {
+        match entry {
+            TranscriptEntry::Tool(_) => Self::Tool,
+            TranscriptEntry::SystemNote(_) => Self::Note,
+            _ => Self::Other,
+        }
+    }
 }
 
 fn render_user_turn(text: &str, width: u16, out: &mut Vec<Line<'static>>) {
@@ -143,6 +172,62 @@ fn render_user_turn(text: &str, width: u16, out: &mut Vec<Line<'static>>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)),
+        ]));
+    }
+}
+
+fn render_thinking_entry(
+    content: &str,
+    elapsed_secs: u64,
+    active: bool,
+    expand_outputs: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    let arrow = if expand_outputs { "▾ " } else { "▸ " };
+    let header_label = if active {
+        "Thinking…".to_owned()
+    } else if elapsed_secs > 0 {
+        format!("Thought for {elapsed_secs}s")
+    } else {
+        "Thought process".to_owned()
+    };
+    let toggle_hint = if expand_outputs {
+        " (ctrl+o to collapse)"
+    } else {
+        " (ctrl+o to expand)"
+    };
+    out.push(Line::from(vec![
+        Span::styled(arrow, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            header_label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(toggle_hint, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    if expand_outputs {
+        for (idx, line) in trimmed.lines().enumerate() {
+            let tree_prefix = if idx == 0 { "  └  " } else { "     " };
+            out.push(Line::from(vec![
+                Span::styled(tree_prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(line.to_owned(), style),
+            ]));
+        }
+    } else {
+        let preview = clip_single_line(trimmed, 110);
+        out.push(Line::from(vec![
+            Span::styled("  └  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(preview, style),
         ]));
     }
 }
@@ -200,30 +285,37 @@ fn render_tool_entry(
         header_spans.push(Span::styled(arg, Style::default().fg(Color::Gray)));
         header_spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
     }
-    out.push(Line::from(header_spans));
 
     if tool.state == ToolRunState::Running {
-        out.push(Line::from(vec![
-            Span::styled("  └  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Running…",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+        header_spans.push(Span::styled(
+            "  running…",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        out.push(Line::from(header_spans));
         return;
     }
 
-    let (body_lines, preview_cap) = build_tool_output_lines(tool);
-    let total = body_lines.len();
-    let visible_count = if expand_outputs {
-        total
-    } else {
-        total.min(preview_cap)
-    };
+    if !expand_outputs {
+        let suffix = match tool.state {
+            ToolRunState::Error => " (error · ctrl+o to expand)",
+            ToolRunState::Done => " (ctrl+o to expand)",
+            ToolRunState::Running => "",
+        };
+        let suffix_color = if tool.state == ToolRunState::Error {
+            Color::LightRed
+        } else {
+            Color::DarkGray
+        };
+        header_spans.push(Span::styled(suffix, Style::default().fg(suffix_color)));
+        out.push(Line::from(header_spans));
+        return;
+    }
 
-    for (idx, body) in body_lines.into_iter().take(visible_count).enumerate() {
+    out.push(Line::from(header_spans));
+    let body_lines = build_tool_output_lines(tool);
+    for (idx, body) in body_lines.into_iter().enumerate() {
         let tree_prefix = if idx == 0 { "  └  " } else { "     " };
         let mut spans = vec![Span::styled(
             tree_prefix,
@@ -232,21 +324,12 @@ fn render_tool_entry(
         spans.extend(body.spans);
         out.push(Line::from(spans));
     }
-
-    if total > preview_cap {
-        let hidden = total - visible_count;
-        let hint = if expand_outputs {
-            "     … (ctrl+o to collapse)".to_owned()
-        } else {
-            format!("     … +{hidden} lines (ctrl+o to expand)")
-        };
-        out.push(Line::from(Span::styled(
-            hint,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )));
-    }
+    out.push(Line::from(Span::styled(
+        "     (ctrl+o to collapse)",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
 }
 
 fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
@@ -293,29 +376,18 @@ fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
     }
 }
 
-fn build_tool_output_lines(tool: &ToolTranscriptEntry) -> (Vec<Line<'static>>, usize) {
+fn build_tool_output_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
     if tool.state == ToolRunState::Error {
-        let lines = split_plain_lines(&tool.output, Color::LightRed);
-        return (lines, COLLAPSED_OUTPUT_LINES);
+        return split_plain_lines(&tool.output, Color::LightRed);
     }
 
     match tool.name.as_str() {
-        "todo_write" | "todo_read" => {
-            if let Some(lines) = render_todo_lines(&tool.output) {
-                return (lines, COLLAPSED_TODO_LINES);
-            }
-            (
-                split_plain_lines(&tool.output, Color::Gray),
-                COLLAPSED_OUTPUT_LINES,
-            )
-        }
-        "edit" => (render_edit_diff_lines(tool), COLLAPSED_DIFF_LINES),
-        "write" => (render_write_lines(tool), COLLAPSED_DIFF_LINES),
-        "read" => (render_read_lines(&tool.output), COLLAPSED_OUTPUT_LINES),
-        _ => (
-            split_plain_lines(&tool.output, Color::Gray),
-            COLLAPSED_OUTPUT_LINES,
-        ),
+        "todo_write" | "todo_read" => render_todo_lines(&tool.output)
+            .unwrap_or_else(|| split_plain_lines(&tool.output, Color::Gray)),
+        "edit" => render_edit_diff_lines(tool),
+        "write" => render_write_lines(tool),
+        "read" => render_read_lines(&tool.output),
+        _ => split_plain_lines(&tool.output, Color::Gray),
     }
 }
 
@@ -508,7 +580,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn renders_tool_tree_with_ctrl_o_truncation_and_expansion() {
+    fn hides_tool_outputs_until_ctrl_o_then_renders_tree_connector() {
         let many_lines = (1..=10)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
@@ -537,14 +609,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert!(collapsed_text[0].contains("● Bash(cargo test)"));
-        assert!(collapsed_text[1].starts_with("  └  line 1"));
-        assert!(
-            collapsed_text
-                .iter()
-                .any(|l| l.contains("+6 lines (ctrl+o to expand)"))
+        assert_eq!(
+            collapsed_text,
+            vec!["● Bash(cargo test) (ctrl+o to expand)"]
         );
-        assert!(!collapsed_text.iter().any(|l| l.contains("line 10")));
 
         let expanded = render_transcript_lines(&[entry], 90, true);
         let expanded_text: Vec<String> = expanded
@@ -556,6 +624,8 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
+        assert_eq!(expanded_text[0], "● Bash(cargo test)");
+        assert_eq!(expanded_text[1], "  └  line 1");
         assert!(expanded_text.iter().any(|l| l.contains("line 10")));
         assert!(
             expanded_text
@@ -565,13 +635,13 @@ mod tests {
     }
 
     #[test]
-    fn renders_todo_checklist_with_tree_connector() {
+    fn renders_todo_and_thinking_with_ctrl_o_expansion() {
         let call = ToolCall {
             id: "t1".to_owned(),
             name: "todo_write".to_owned(),
             arguments: json!({"todos": []}),
         };
-        let entry = TranscriptEntry::tool_completed(
+        let todo_entry = TranscriptEntry::tool_completed(
             &call,
             &ToolOutput {
                 call_id: "t1".to_owned(),
@@ -586,9 +656,14 @@ mod tests {
                 is_error: false,
             },
         );
+        let thought = TranscriptEntry::Thinking {
+            content: "first line\nsecond line".to_owned(),
+            elapsed_secs: 4,
+            active: false,
+        };
 
-        let lines = render_transcript_lines(&[entry], 80, false);
-        let text: Vec<String> = lines
+        let collapsed = render_transcript_lines(&[thought.clone(), todo_entry.clone()], 90, false);
+        let collapsed_text: Vec<String> = collapsed
             .iter()
             .map(|l| {
                 l.spans
@@ -597,9 +672,30 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(text[0], "● Update Todos");
-        assert_eq!(text[1], "  └  ☑ Done step");
-        assert_eq!(text[2], "     ☐ Active step");
-        assert_eq!(text[3], "     ☐ Next step");
+        assert!(collapsed_text[0].starts_with("▸ Thought for 4s"));
+        assert_eq!(collapsed_text[1], "  └  first line");
+        assert!(!collapsed_text.iter().any(|l| l.contains("second line")));
+        assert!(
+            collapsed_text
+                .iter()
+                .any(|l| l == "● Update Todos (ctrl+o to expand)")
+        );
+
+        let expanded = render_transcript_lines(&[thought, todo_entry], 90, true);
+        let expanded_text: Vec<String> = expanded
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(expanded_text[0].starts_with("▾ Thought for 4s"));
+        assert!(expanded_text.iter().any(|l| l == "     second line"));
+        assert!(expanded_text.iter().any(|l| l == "● Update Todos"));
+        assert!(expanded_text.iter().any(|l| l == "  └  ☑ Done step"));
+        assert!(expanded_text.iter().any(|l| l == "     ☐ Active step"));
+        assert!(expanded_text.iter().any(|l| l == "     ☐ Next step"));
     }
 }

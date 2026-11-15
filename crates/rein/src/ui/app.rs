@@ -2,12 +2,14 @@
 // Date: 2026-11-14
 // Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, Slash commands, and Model picker
 
+use std::time::Instant;
+
 use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
 use rein_tools::McpServerConfig;
 
 use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent};
 use crate::commands::{SlashCommand, SlashRegistry};
-use crate::config::ProviderKind;
+use crate::config::{ProviderKind, SessionSummary};
 use crate::modes::Profile;
 use crate::ui::entries::{ToolRunState, TranscriptEntry};
 
@@ -35,6 +37,15 @@ pub struct PendingModelPicker {
     pub provider_kind: ProviderKind,
 }
 
+/// Active interactive session selection popup opened by `/resume`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSessionPicker {
+    /// Saved sessions belonging exclusively to the active workspace directory.
+    pub items: Vec<SessionSummary>,
+    /// Currently highlighted session index.
+    pub selected: usize,
+}
+
 /// State owned by the in-process minimalist Ratatui frontend.
 #[derive(Debug)]
 pub struct AppState {
@@ -44,6 +55,7 @@ pub struct AppState {
     model_quota: Option<u8>,
     usage_totals: UsageStats,
     workspace_label: String,
+    session_id: String,
     startup_notices: Vec<String>,
     slash_registry: SlashRegistry,
     slash_selected: usize,
@@ -53,6 +65,7 @@ pub struct AppState {
     input: String,
     pending_approval: Option<PendingApproval>,
     pending_model_picker: Option<PendingModelPicker>,
+    pending_session_picker: Option<PendingSessionPicker>,
     expand_outputs: bool,
     scroll_offset: u16,
     auto_scroll: bool,
@@ -60,6 +73,26 @@ pub struct AppState {
     busy_status: String,
     spinner_tick: usize,
     streaming_active: bool,
+    thinking_active: bool,
+    thinking_started: Option<Instant>,
+    prompt_history: Vec<String>,
+    history_cursor: Option<usize>,
+    draft_input: String,
+}
+
+/// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
+#[must_use]
+pub fn model_vendor_group(model_id: &str) -> (&'static str, u8) {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.starts_with("gemini-") {
+        ("Google Gemini", 0)
+    } else if lower.starts_with("claude-") {
+        ("Anthropic Claude", 1)
+    } else if lower.starts_with("gpt-") || lower.starts_with('o') {
+        ("OpenAI GPT", 2)
+    } else {
+        ("Other Models", 3)
+    }
 }
 
 impl AppState {
@@ -77,6 +110,7 @@ impl AppState {
             model_quota: None,
             usage_totals: UsageStats::default(),
             workspace_label: ".".to_owned(),
+            session_id: String::new(),
             startup_notices: Vec::new(),
             slash_registry: SlashRegistry::with_builtins(),
             slash_selected: 0,
@@ -86,6 +120,7 @@ impl AppState {
             input: String::new(),
             pending_approval: None,
             pending_model_picker: None,
+            pending_session_picker: None,
             expand_outputs: false,
             scroll_offset: 0,
             auto_scroll: true,
@@ -93,6 +128,11 @@ impl AppState {
             busy_status: "Thinking…".to_owned(),
             spinner_tick: 0,
             streaming_active: false,
+            thinking_active: false,
+            thinking_started: None,
+            prompt_history: Vec::new(),
+            history_cursor: None,
+            draft_input: String::new(),
         }
     }
 
@@ -101,6 +141,24 @@ impl AppState {
     pub fn with_workspace_label(mut self, label: impl Into<String>) -> Self {
         self.workspace_label = label.into();
         self
+    }
+
+    /// Sets the active session UID hash shown in the header for `--resume <uid>`.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
+    }
+
+    /// Updates the active session UID hash (e.g., on `/clear` or `/resume <uid>`).
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        self.session_id = session_id.into();
+    }
+
+    /// Returns the active session UID hash.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Attaches non-fatal startup notices rendered in amber beneath the header.
@@ -269,16 +327,36 @@ impl AppState {
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.streaming_active = false;
+        self.thinking_active = false;
+        self.thinking_started = None;
+    }
+
+    fn record_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.prompt_history.push(text.to_owned());
     }
 
     /// Appends hydrated structured events (used by `--resume` and `/resume`).
     pub fn extend_hydrated(&mut self, hydrated: Vec<HydratedEvent>) {
+        self.finalize_thinking();
         self.streaming_active = false;
         for ev in hydrated {
             match ev {
-                HydratedEvent::User(text) => self.entries.push(TranscriptEntry::UserTurn(text)),
+                HydratedEvent::User(text) => {
+                    self.record_history(&text);
+                    self.entries.push(TranscriptEntry::UserTurn(text));
+                }
                 HydratedEvent::Assistant(text) => {
                     self.entries.push(TranscriptEntry::AssistantTurn(text));
+                }
+                HydratedEvent::Note(note) => {
+                    self.entries.push(TranscriptEntry::SystemNote(note));
                 }
                 HydratedEvent::Tool { call, output } => {
                     self.entries
@@ -291,8 +369,13 @@ impl AppState {
 
     /// Appends a user turn prompt to the structured transcript.
     pub fn push_user_turn(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.finalize_thinking();
         self.streaming_active = false;
-        self.entries.push(TranscriptEntry::UserTurn(text.into()));
+        self.record_history(&text);
+        self.history_cursor = None;
+        self.draft_input.clear();
+        self.entries.push(TranscriptEntry::UserTurn(text));
         self.auto_scroll = true;
     }
 
@@ -305,6 +388,7 @@ impl AppState {
 
     /// Appends a highlighted error note (`! ...`).
     pub fn push_error_note(&mut self, err: impl Into<String>) {
+        self.finalize_thinking();
         self.streaming_active = false;
         self.entries.push(TranscriptEntry::ErrorNote(err.into()));
         self.auto_scroll = true;
@@ -312,6 +396,7 @@ impl AppState {
 
     /// Records a newly started tool invocation in the transcript.
     pub fn push_tool_running(&mut self, call: &ToolCall) {
+        self.finalize_thinking();
         self.streaming_active = false;
         self.busy_status = format!("Running {}…", call.name);
         self.entries.push(TranscriptEntry::tool_running(call));
@@ -339,11 +424,63 @@ impl AppState {
         self.auto_scroll = true;
     }
 
+    /// Appends streamed reasoning/thought tokens into a trailing [`TranscriptEntry::Thinking`].
+    pub fn append_thinking_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.streaming_active = false;
+        let elapsed = self
+            .thinking_started
+            .map_or(0, |started| started.elapsed().as_secs());
+        if self.thinking_active
+            && let Some(TranscriptEntry::Thinking {
+                content,
+                elapsed_secs,
+                active: true,
+            }) = self.entries.last_mut()
+        {
+            content.push_str(delta);
+            *elapsed_secs = elapsed;
+        } else {
+            self.thinking_active = true;
+            self.thinking_started = Some(Instant::now());
+            self.entries.push(TranscriptEntry::Thinking {
+                content: delta.to_owned(),
+                elapsed_secs: 0,
+                active: true,
+            });
+        }
+        self.auto_scroll = true;
+    }
+
+    /// Finalizes any currently streaming thinking trace and records elapsed seconds.
+    pub fn finalize_thinking(&mut self) {
+        if !self.thinking_active {
+            return;
+        }
+        self.thinking_active = false;
+        let elapsed = self
+            .thinking_started
+            .take()
+            .map_or(1, |started| started.elapsed().as_secs().max(1));
+        if let Some(TranscriptEntry::Thinking {
+            elapsed_secs,
+            active,
+            ..
+        }) = self.entries.last_mut()
+        {
+            *active = false;
+            *elapsed_secs = (*elapsed_secs).max(elapsed);
+        }
+    }
+
     /// Appends streamed assistant tokens cleanly into the trailing [`TranscriptEntry::AssistantTurn`].
     pub fn append_stream_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
+        self.finalize_thinking();
         if self.streaming_active
             && let Some(TranscriptEntry::AssistantTurn(buf)) = self.entries.last_mut()
         {
@@ -366,33 +503,68 @@ impl AppState {
     pub fn set_input(&mut self, text: impl Into<String>) {
         self.input = text.into();
         self.slash_selected = 0;
+        self.history_cursor = None;
+        self.draft_input.clear();
     }
 
     /// Pushes a typed character to the input buffer.
     pub fn push_input_char(&mut self, ch: char) {
         self.input.push(ch);
         self.slash_selected = 0;
+        self.history_cursor = None;
     }
 
     /// Removes the last character from the input buffer.
     pub fn pop_input_char(&mut self) {
         let _ = self.input.pop();
         self.slash_selected = 0;
+        self.history_cursor = None;
     }
 
     /// Takes and clears the current input buffer.
     pub fn take_input(&mut self) -> String {
         self.slash_selected = 0;
+        self.history_cursor = None;
+        self.draft_input.clear();
         std::mem::take(&mut self.input)
     }
 
-    /// Opens the interactive `/model` selector populated from server models.
+    /// Navigates previously submitted prompts in the input box (`-1` older, `+1` newer), restoring the live draft at the end.
+    pub fn navigate_history(&mut self, delta: isize) {
+        if self.prompt_history.is_empty() || delta == 0 {
+            return;
+        }
+        let next_idx = if delta < 0 {
+            match self.history_cursor {
+                None => {
+                    self.draft_input = self.input.clone();
+                    Some(self.prompt_history.len().saturating_sub(1))
+                }
+                Some(idx) => Some(idx.saturating_sub(1)),
+            }
+        } else {
+            match self.history_cursor {
+                None => return,
+                Some(idx) if idx + 1 < self.prompt_history.len() => Some(idx + 1),
+                Some(_) => None,
+            }
+        };
+        self.history_cursor = next_idx;
+        self.input = match next_idx {
+            Some(idx) => self.prompt_history.get(idx).cloned().unwrap_or_default(),
+            None => std::mem::take(&mut self.draft_input),
+        };
+        self.slash_selected = 0;
+    }
+
+    /// Opens the interactive `/model` selector populated from server models, grouped by vendor.
     pub fn open_model_picker(
         &mut self,
-        items: Vec<AvailableModel>,
+        mut items: Vec<AvailableModel>,
         provider_kind: ProviderKind,
         current_model: &str,
     ) {
+        items.sort_by_key(|m| model_vendor_group(&m.id).1);
         let selected = items
             .iter()
             .position(|m| current_model.ends_with(&m.id))
@@ -435,6 +607,47 @@ impl AppState {
     /// Dismisses the interactive `/model` picker without making changes.
     pub fn clear_model_picker(&mut self) {
         self.pending_model_picker = None;
+    }
+
+    /// Opens the interactive `/resume` selector populated from sessions in the current directory.
+    pub fn open_session_picker(&mut self, items: Vec<SessionSummary>) {
+        let selected = items
+            .iter()
+            .position(|s| s.uid == self.session_id)
+            .unwrap_or(0);
+        self.pending_session_picker = Some(PendingSessionPicker { items, selected });
+    }
+
+    /// Returns any active interactive `/resume` session picker state.
+    #[must_use]
+    pub fn pending_session_picker(&self) -> Option<&PendingSessionPicker> {
+        self.pending_session_picker.as_ref()
+    }
+
+    /// Moves selection up/down inside the interactive `/resume` picker with wrap-around.
+    pub fn move_session_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.pending_session_picker else {
+            return;
+        };
+        let count = picker.items.len();
+        if count == 0 {
+            picker.selected = 0;
+            return;
+        }
+        let len = isize::try_from(count).unwrap_or(1);
+        let current = isize::try_from(picker.selected.min(count - 1)).unwrap_or(0);
+        picker.selected = usize::try_from((current + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Closes the interactive `/resume` picker and returns the chosen [`SessionSummary`].
+    pub fn take_selected_session(&mut self) -> Option<SessionSummary> {
+        let picker = self.pending_session_picker.take()?;
+        picker.items.into_iter().nth(picker.selected)
+    }
+
+    /// Dismisses the interactive `/resume` picker without making changes.
+    pub fn clear_session_picker(&mut self) {
+        self.pending_session_picker = None;
     }
 
     /// Sets or clears an interactive 4-option approval prompt from the policy layer.
@@ -522,6 +735,7 @@ impl AppState {
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if !busy {
+            self.finalize_thinking();
             self.streaming_active = false;
             self.busy_status = "Thinking…".to_owned();
         }
@@ -565,6 +779,11 @@ impl AppState {
         }
     }
 
+    /// Re-enables sticky scroll-to-bottom tracking.
+    pub fn scroll_to_bottom(&mut self) {
+        self.auto_scroll = true;
+    }
+
     /// Adjusts transcript scroll offset safely against the current viewport max scroll.
     pub fn scroll_by(&mut self, delta: i16, max_scroll: u16) {
         let base = if self.auto_scroll {
@@ -581,5 +800,83 @@ impl AppState {
                 self.auto_scroll = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_navigation_restores_draft_and_hydrates() {
+        let mut state = AppState::new(
+            Profile::coding(),
+            "off",
+            "antigravity/claude-sonnet-5-5-medium",
+        );
+        state.extend_hydrated(vec![HydratedEvent::User("first prompt".to_owned())]);
+        state.push_user_turn("second prompt");
+        state.push_input_char('d');
+        state.push_input_char('r');
+
+        state.navigate_history(-1);
+        assert_eq!(state.input(), "second prompt");
+        state.navigate_history(-1);
+        assert_eq!(state.input(), "first prompt");
+        state.navigate_history(-1);
+        assert_eq!(state.input(), "first prompt");
+        state.navigate_history(1);
+        assert_eq!(state.input(), "second prompt");
+        state.navigate_history(1);
+        assert_eq!(state.input(), "dr");
+    }
+
+    #[test]
+    fn model_picker_groups_by_vendor_and_thinking_finalizes() {
+        let mut state = AppState::new(
+            Profile::coding(),
+            "off",
+            "antigravity/gemini-3.8-flash-tiered",
+        );
+        state.open_model_picker(
+            vec![
+                AvailableModel {
+                    id: "gpt-oss-120b-medium".to_owned(),
+                    display_name: "GPT-OSS 120B".to_owned(),
+                    quota_percent: Some(90),
+                    recommended: true,
+                },
+                AvailableModel {
+                    id: "claude-sonnet-5-5-medium".to_owned(),
+                    display_name: "Claude Sonnet 5.5".to_owned(),
+                    quota_percent: Some(80),
+                    recommended: true,
+                },
+                AvailableModel {
+                    id: "gemini-3.8-flash-tiered".to_owned(),
+                    display_name: "Gemini 3.8 Flash".to_owned(),
+                    quota_percent: Some(100),
+                    recommended: true,
+                },
+            ],
+            ProviderKind::Antigravity,
+            "antigravity/gemini-3.8-flash-tiered",
+        );
+        let picker = state.pending_model_picker().expect("picker open");
+        assert_eq!(picker.items[0].id, "gemini-3.8-flash-tiered");
+        assert_eq!(picker.items[1].id, "claude-sonnet-5-5-medium");
+        assert_eq!(picker.items[2].id, "gpt-oss-120b-medium");
+        assert_eq!(picker.selected, 0);
+
+        state.append_thinking_delta("checking files");
+        state.append_stream_delta("done");
+        assert!(matches!(
+            &state.entries()[0],
+            TranscriptEntry::Thinking {
+                active: false,
+                elapsed_secs,
+                ..
+            } if *elapsed_secs >= 1
+        ));
     }
 }

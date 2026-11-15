@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use rein_policy::{
-    Capability, DEFAULT_READ_ONLY_DIRS, SandboxSpec, ShellClassifier, WorkspaceSandbox,
-    run_sandboxed_command,
+    Capability, SandboxSpec, ShellClassifier, WorkspaceSandbox, default_sandbox_read_only_paths,
+    default_sandbox_read_write_paths, run_sandboxed_command,
 };
 use serde_json::{Value, json};
 
@@ -69,10 +69,15 @@ impl Tool for BashTool {
         let (program, args) = parse_command(arguments)?;
         let classification =
             ShellClassifier::classify_with_sandbox(&program, &args, Some(&self.sandbox));
+        let read_only_workspace = classification.is_read_only();
         let spec = SandboxSpec {
             workspace_root: self.sandbox.root().to_path_buf(),
-            read_only_workspace: classification.is_read_only(),
-            read_only_paths: DEFAULT_READ_ONLY_DIRS.iter().map(PathBuf::from).collect(),
+            read_only_workspace,
+            read_only_paths: default_sandbox_read_only_paths(self.sandbox.root()),
+            read_write_paths: default_sandbox_read_write_paths(
+                self.sandbox.root(),
+                read_only_workspace,
+            ),
             program,
             args,
             output_dir: self.output_dir.clone(),

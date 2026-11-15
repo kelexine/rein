@@ -53,4 +53,11 @@ pub enum SessionEvent {
         /// Key or query string.
         key: String,
     },
+    /// Conversation history compacted into a summary message while preserving the full transcript archive.
+    Compacted {
+        /// Resulting compacted summary message replacing prior model context.
+        message: Message,
+        /// Number of prior active history messages summarized.
+        prior_count: usize,
+    },
 }

@@ -153,14 +153,20 @@ impl AntigravityProvider {
                 json!([{ "functionDeclarations": decls }]),
             );
         }
-        inner.insert(
-            "generationConfig".to_owned(),
-            json!({ "maxOutputTokens": self.config.max_tokens }),
-        );
+        let normalized_model = Self::normalize_model_id(&self.config.model);
+        let gen_config = if normalized_model.starts_with("gpt-oss") {
+            json!({ "maxOutputTokens": self.config.max_tokens })
+        } else {
+            json!({
+                "maxOutputTokens": self.config.max_tokens,
+                "thinkingConfig": { "includeThoughts": true }
+            })
+        };
+        inner.insert("generationConfig".to_owned(), gen_config);
 
         json!({
             "project": project_id,
-            "model": Self::normalize_model_id(&self.config.model),
+            "model": normalized_model,
             "request": Value::Object(inner),
         })
     }
@@ -189,11 +195,14 @@ impl AntigravityProvider {
         {
             for part in parts {
                 let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
-                if !is_thought
-                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                if let Some(text) = part.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
-                    events.push(ProviderStreamEvent::TextDelta(text.to_owned()));
+                    if is_thought {
+                        events.push(ProviderStreamEvent::ThinkingDelta(text.to_owned()));
+                    } else {
+                        events.push(ProviderStreamEvent::TextDelta(text.to_owned()));
+                    }
                 }
                 if let Some(fc) = part.get("functionCall")
                     && let Some(name) = fc.get("name").and_then(Value::as_str)
@@ -381,6 +390,16 @@ impl Provider for AntigravityProvider {
             Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
                 access_token = self.try_refresh_token()?;
                 self.post_stream(&url, &access_token, &payload)
+                    .map_err(|e| format_antigravity_error(*e))?
+            }
+            Err(err)
+                if matches!(&*err, ureq::Error::Status(404, _))
+                    && base == DEFAULT_ANTIGRAVITY_BASE_URL =>
+            {
+                let fallback_url = format!(
+                    "{FALLBACK_ANTIGRAVITY_BASE_URL}/v1internal:streamGenerateContent?alt=sse"
+                );
+                self.post_stream(&fallback_url, &access_token, &payload)
                     .map_err(|e| format_antigravity_error(*e))?
             }
             Err(err) => return Err(format_antigravity_error(*err)),
@@ -713,12 +732,16 @@ mod tests {
             }
         }"#;
         let events = provider.parse_sse_chunk(chunk)?;
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(
             events[0],
+            ProviderStreamEvent::ThinkingDelta("internal plan".to_owned())
+        );
+        assert_eq!(
+            events[1],
             ProviderStreamEvent::TextDelta("Let me read that.".to_owned())
         );
-        match &events[1] {
+        match &events[2] {
             ProviderStreamEvent::ToolUse(call) => {
                 assert_eq!(call.name, "read");
                 assert_eq!(call.id, "ag_call_1");

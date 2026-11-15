@@ -15,8 +15,10 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use rein_core::{
-    MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats, login_with_browser_until,
+    EventLog, MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats,
+    login_with_browser_until,
 };
 
 use crate::agent::{
@@ -25,9 +27,10 @@ use crate::agent::{
 use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
 use crate::config::{
     ProviderKind, ReinConfig, ReinPaths, apply_provider_switch, build_provider,
-    resolve_model_target, save_provider_selection,
+    generate_session_uid, list_sessions, resolve_model_target, save_provider_selection,
+    write_latest_session_uid,
 };
-use crate::ui::view::{compute_max_scroll, header_height};
+use crate::ui::view::{compute_max_scroll, transcript_viewport};
 use crate::ui::{AppState, render_frame};
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -56,6 +59,7 @@ impl Drop for TerminalGuard {
 }
 
 enum WorkerEvent {
+    ThinkingDelta(String),
     Delta(String),
     ToolStart(ToolCall),
     ToolFinish(ToolCall, ToolOutput),
@@ -78,6 +82,10 @@ impl ApprovalPrompter for ChannelPrompter {
             action: ApprovalAction::Deny,
             feedback: None,
         }))
+    }
+
+    fn on_thinking_delta(&mut self, delta: &str) {
+        let _ = self.tx.send(WorkerEvent::ThinkingDelta(delta.to_owned()));
     }
 
     fn on_delta(&mut self, delta: &str) {
@@ -141,6 +149,9 @@ fn handle_idle_key(
     if app.pending_model_picker().is_some() {
         return handle_model_picker_key(key, provider, config, paths, app);
     }
+    if app.pending_session_picker().is_some() {
+        return handle_session_picker_key(key, agent, paths, app);
+    }
     if key.code == KeyCode::Esc {
         return Ok(true);
     }
@@ -159,10 +170,10 @@ fn handle_idle_key(
         }
         KeyCode::Up if slash_open => app.move_slash_selection(-1),
         KeyCode::Down if slash_open => app.move_slash_selection(1),
-        KeyCode::Up => scroll_app(app, guard, -1)?,
-        KeyCode::Down => scroll_app(app, guard, 1)?,
-        KeyCode::PageUp => scroll_app(app, guard, -8)?,
-        KeyCode::PageDown => scroll_app(app, guard, 8)?,
+        KeyCode::Up => app.navigate_history(-1),
+        KeyCode::Down => app.navigate_history(1),
+        KeyCode::PageUp => scroll_page(app, guard, -1)?,
+        KeyCode::PageDown => scroll_page(app, guard, 1)?,
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
         KeyCode::Enter => return handle_enter(agent, provider, config, paths, app, guard),
@@ -193,6 +204,33 @@ fn handle_model_picker_key(
                     Some(&chosen.id),
                     chosen.quota_percent,
                 );
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_session_picker_key(
+    key: KeyEvent,
+    agent: &mut AgentLoop,
+    paths: &ReinPaths,
+    app: &mut AppState,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => app.clear_session_picker(),
+        KeyCode::Up => app.move_session_selection(-1),
+        KeyCode::Down => app.move_session_selection(1),
+        KeyCode::Enter => {
+            if let Some(chosen) = app.take_selected_session() {
+                agent.switch_session(EventLog::new(&chosen.event_log), chosen.full_transcript);
+                let _ = write_latest_session_uid(paths, &chosen.uid);
+                let items = agent.hydrate_structured()?;
+                app.clear_transcript();
+                app.set_session_id(&chosen.uid);
+                app.extend_hydrated(items);
+                app.set_active_profile(agent.active_profile().clone());
+                app.push_system_note(format!("resumed session {}", chosen.uid));
             }
         }
         _ => {}
@@ -293,8 +331,13 @@ fn run_builtin_action(
     match action {
         BuiltinAction::Quit => return Ok(true),
         BuiltinAction::Clear => {
-            agent.clear_history();
+            let new_uid = generate_session_uid(paths);
+            let (log_path, full_path) = paths.session_paths_for(&new_uid);
+            agent.switch_session(EventLog::new(log_path), full_path);
+            let _ = write_latest_session_uid(paths, &new_uid);
             app.clear_transcript();
+            app.set_session_id(&new_uid);
+            app.push_system_note(format!("started new session {new_uid}"));
         }
         BuiltinAction::Help => {
             let lines: Vec<String> = app
@@ -333,10 +376,12 @@ fn run_builtin_action(
         }
         BuiltinAction::Provider => run_provider_command(args, provider, config, paths, app)?,
         BuiltinAction::Resume => {
-            let items = agent.hydrate_structured()?;
-            app.clear_transcript();
-            app.extend_hydrated(items);
-            app.set_active_profile(agent.active_profile().clone());
+            let sessions = list_sessions(paths)?;
+            if sessions.is_empty() {
+                app.push_system_note("no saved sessions in this directory yet");
+            } else {
+                app.open_session_picker(sessions);
+            }
         }
     }
     Ok(false)
@@ -507,6 +552,10 @@ fn run_login_background(
             {
                 if is_ctrl_o(key) {
                     let _ = app.toggle_expand_outputs();
+                } else if key.code == KeyCode::PageUp {
+                    let _ = scroll_page(app, guard, -1);
+                } else if key.code == KeyCode::PageDown {
+                    let _ = scroll_page(app, guard, 1);
                 } else if is_quit_key(key) {
                     cancel.store(true, Ordering::Relaxed);
                     if is_ctrl_c(key) {
@@ -633,6 +682,10 @@ fn compact_background(
             {
                 if is_ctrl_o(key) {
                     let _ = app.toggle_expand_outputs();
+                } else if key.code == KeyCode::PageUp {
+                    let _ = scroll_page(app, guard, -1);
+                } else if key.code == KeyCode::PageDown {
+                    let _ = scroll_page(app, guard, 1);
                 } else if is_quit_key(key) {
                     should_quit = true;
                     break;
@@ -714,6 +767,7 @@ fn tick_spinner(last_spin: &mut Instant, app: &mut AppState) {
 fn drain_worker_events(ev_rx: &Receiver<WorkerEvent>, app: &mut AppState) {
     while let Ok(ev) = ev_rx.try_recv() {
         match ev {
+            WorkerEvent::ThinkingDelta(delta) => app.append_thinking_delta(&delta),
             WorkerEvent::Delta(delta) => app.append_stream_delta(&delta),
             WorkerEvent::ToolStart(call) => app.push_tool_running(&call),
             WorkerEvent::ToolFinish(call, output) => app.finish_tool_entry(&call, &output),
@@ -803,17 +857,13 @@ fn handle_streaming_key(
         return true;
     }
     match key.code {
-        KeyCode::Up => {
-            let _ = scroll_app(app, guard, -1);
-        }
-        KeyCode::Down => {
-            let _ = scroll_app(app, guard, 1);
-        }
+        KeyCode::Up => app.navigate_history(-1),
+        KeyCode::Down => app.navigate_history(1),
         KeyCode::PageUp => {
-            let _ = scroll_app(app, guard, -8);
+            let _ = scroll_page(app, guard, -1);
         }
         KeyCode::PageDown => {
-            let _ = scroll_app(app, guard, 8);
+            let _ = scroll_page(app, guard, 1);
         }
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
@@ -822,12 +872,19 @@ fn handle_streaming_key(
     false
 }
 
-fn scroll_app(app: &mut AppState, guard: &TerminalGuard, delta: i16) -> Result<()> {
+fn viewport_rect(app: &AppState, guard: &TerminalGuard) -> Result<Rect> {
     let size = guard.terminal.size()?;
-    let hdr_rows = header_height(app, size.height);
-    let transcript_height = size.height.saturating_sub(hdr_rows + 5);
-    let max_scroll = compute_max_scroll(app, size.width, transcript_height);
-    app.scroll_by(delta, max_scroll);
+    Ok(transcript_viewport(
+        app,
+        Rect::new(0, 0, size.width, size.height),
+    ))
+}
+
+fn scroll_page(app: &mut AppState, guard: &TerminalGuard, dir: i16) -> Result<()> {
+    let rect = viewport_rect(app, guard)?;
+    let step = i16::try_from(rect.height.saturating_sub(2).max(1)).unwrap_or(10);
+    let max_scroll = compute_max_scroll(app, rect.width, rect.height);
+    app.scroll_by(dir.saturating_mul(step), max_scroll);
     Ok(())
 }
 

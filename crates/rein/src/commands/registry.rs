@@ -36,7 +36,7 @@ pub enum BuiltinAction {
     Mode,
     /// Clears display transcript and active in-memory history.
     Clear,
-    /// Summarizes active conversation via the provider while preserving `full-transcript.jsonl`.
+    /// Summarizes active conversation via the provider while preserving the session's `<uid>.full.jsonl` archive.
     Compact,
     /// Queries project or personal memory records (`[project|personal] [query]`).
     Memory,
@@ -50,7 +50,7 @@ pub enum BuiltinAction {
     Model,
     /// Displays or switches the active model provider (`[anthropic|antigravity] [model]`).
     Provider,
-    /// Hydrates `.rein/session.jsonl` into the current session.
+    /// Opens an interactive picker of saved sessions in the current directory.
     Resume,
     /// Exits Rein cleanly.
     Quit,
@@ -152,7 +152,7 @@ impl SlashRegistry {
             ),
             builtin(
                 "compact",
-                "Summarize conversation while keeping full-transcript.jsonl",
+                "Summarize active history while keeping session full transcript",
                 BuiltinAction::Compact,
             ),
             builtin(
@@ -187,7 +187,7 @@ impl SlashRegistry {
             ),
             builtin(
                 "resume",
-                "Reload previous turns from .rein/session.jsonl",
+                "Interactively pick and resume a saved session in this directory",
                 BuiltinAction::Resume,
             ),
             builtin("quit", "Exit Rein", BuiltinAction::Quit),

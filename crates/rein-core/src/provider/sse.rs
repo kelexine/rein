@@ -144,6 +144,12 @@ impl SseEventAccumulator {
             return Vec::new();
         };
         match delta.get("type").and_then(Value::as_str) {
+            Some("thinking_delta") => delta
+                .get("thinking")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(|t| vec![ProviderStreamEvent::ThinkingDelta(t.to_owned())])
+                .unwrap_or_default(),
             Some("text_delta") => delta
                 .get("text")
                 .and_then(Value::as_str)

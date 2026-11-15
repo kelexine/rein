@@ -6,15 +6,18 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use rein_core::ModeId;
 
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
-use crate::ui::app::{PendingApproval, PendingModelPicker};
+use crate::ui::app::{
+    PendingApproval, PendingModelPicker, PendingSessionPicker, model_vendor_group,
+};
 use crate::ui::entries::render_transcript_lines;
 
 const MAX_MENU_ROWS: usize = 6;
+const MAX_MODEL_MENU_ROWS: usize = 10;
 const MIN_HEIGHT_FOR_HEADER: u16 = 14;
 const CITADEL_OWL: [&str; 3] = ["▜▙████▟▛", "▐▛▄██▄▜▌", " ▝▜▀▀▛▘ "];
 const SPINNER_FRAMES: [&str; 6] = ["✶", "✢", "✽", "✻", "✳", "·"];
@@ -29,15 +32,13 @@ pub fn header_height(state: &AppState, total_height: u16) -> u16 {
     if notice_rows == 0 { 4 } else { 5 + notice_rows }
 }
 
-/// Renders the Citadel Owl header, styled transcript, optional popup/spinner, hairline prompt, and status bar.
-pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
-    let area = frame.area();
+fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
     let popup_rows = compute_popup_rows(state, matches.len());
     let spinner_rows = u16::from(state.is_busy() && state.pending_approval().is_none());
 
-    let chunks = Layout::default()
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(hdr_rows),
@@ -49,7 +50,21 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(area)
+}
+
+/// Returns the exact transcript viewport [`Rect`] computed identically to [`render_frame`].
+#[must_use]
+pub fn transcript_viewport(state: &AppState, area: Rect) -> Rect {
+    split_layout(state, area)[1]
+}
+
+/// Renders the Citadel Owl header, styled transcript, optional popup/spinner, hairline prompt, and status bar.
+pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
+    let area = frame.area();
+    let hdr_rows = header_height(state, area.height);
+    let matches = state.slash_matches();
+    let chunks = split_layout(state, area);
 
     if hdr_rows > 0 {
         render_header(state, frame, chunks[0]);
@@ -57,14 +72,12 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
 
     let styled_lines =
         render_transcript_lines(state.entries(), chunks[1].width, state.expand_outputs());
-    let max_scroll = compute_lines_max_scroll(&styled_lines, chunks[1].width, chunks[1].height);
+    let wrapped_lines = wrap_styled_lines(styled_lines, chunks[1].width);
+    let max_scroll = compute_wrapped_max_scroll(wrapped_lines.len(), chunks[1].height);
     let scroll = state.effective_scroll(max_scroll);
-    let transcript = Paragraph::new(styled_lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(transcript, chunks[1]);
+    frame.render_widget(Paragraph::new(wrapped_lines).scroll((scroll, 0)), chunks[1]);
 
-    if spinner_rows > 0 {
+    if chunks[2].height > 0 {
         render_busy_spinner(state, frame, chunks[2]);
     }
 
@@ -72,7 +85,15 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         render_approval_menu(pending, frame, chunks[3]);
     } else if let Some(picker) = state.pending_model_picker() {
         render_model_picker(picker, state.model_name(), frame, chunks[3]);
-    } else if popup_rows > 0 {
+    } else if let Some(picker) = state.pending_session_picker() {
+        render_session_picker(
+            picker,
+            state.workspace_label(),
+            state.session_id(),
+            frame,
+            chunks[3],
+        );
+    } else if chunks[3].height > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
 
@@ -86,7 +107,8 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
 #[must_use]
 pub fn compute_max_scroll(state: &AppState, width: u16, area_height: u16) -> u16 {
     let lines = render_transcript_lines(state.entries(), width, state.expand_outputs());
-    compute_lines_max_scroll(&lines, width, area_height)
+    let wrapped = wrap_styled_lines(lines, width);
+    compute_wrapped_max_scroll(wrapped.len(), area_height)
 }
 
 fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
@@ -97,24 +119,134 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
             5
         }
     } else if let Some(picker) = state.pending_model_picker() {
-        let count = picker.items.len().min(MAX_MENU_ROWS);
+        let group_headers = count_model_groups(picker);
+        let body_rows = (picker.items.len() + group_headers).clamp(1, MAX_MODEL_MENU_ROWS);
+        u16::try_from(body_rows + 1).unwrap_or(2)
+    } else if let Some(picker) = state.pending_session_picker() {
+        let count = picker.items.len().clamp(1, MAX_MENU_ROWS);
         u16::try_from(count + 1).unwrap_or(2)
     } else {
         u16::try_from(slash_count.min(MAX_MENU_ROWS)).unwrap_or(0)
     }
 }
 
-fn compute_lines_max_scroll(lines: &[Line<'_>], width: u16, area_height: u16) -> u16 {
-    let cols = usize::from(width.max(1));
-    let total_rows: usize = lines
-        .iter()
-        .map(|l| {
-            let len: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-            if len == 0 { 1 } else { len.div_ceil(cols) }
-        })
-        .sum();
+fn count_model_groups(picker: &PendingModelPicker) -> usize {
+    let mut last_group: Option<&'static str> = None;
+    let mut count = 0usize;
+    for item in &picker.items {
+        let group = model_vendor_group(&item.id).0;
+        if last_group != Some(group) {
+            count += 1;
+            last_group = Some(group);
+        }
+    }
+    count
+}
+
+fn compute_wrapped_max_scroll(total_rows: usize, area_height: u16) -> u16 {
     let overflow = total_rows.saturating_sub(usize::from(area_height));
     u16::try_from(overflow).unwrap_or(u16::MAX)
+}
+
+fn wrap_styled_lines(lines: Vec<Line<'_>>, width: u16) -> Vec<Line<'_>> {
+    let cols = usize::from(width.max(1));
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= cols {
+            out.push(line);
+            continue;
+        }
+        wrap_single_line(line, cols, &mut out);
+    }
+    out
+}
+
+fn wrap_single_line<'a>(line: Line<'a>, cols: usize, out: &mut Vec<Line<'a>>) {
+    let mut row: Vec<Span<'a>> = Vec::new();
+    let mut used = 0usize;
+
+    for span in line.spans {
+        let style = span.style;
+        for token in split_tokens(span.content.as_ref()) {
+            let tok_width = Span::raw(token).width();
+            let is_ws = token.chars().all(char::is_whitespace);
+
+            if is_ws {
+                if used > 0 && used + tok_width <= cols {
+                    row.push(Span::styled(token.to_owned(), style));
+                    used += tok_width;
+                }
+                continue;
+            }
+
+            if used > 0 && used + tok_width > cols {
+                out.push(Line::from(std::mem::take(&mut row)));
+                used = 0;
+            }
+
+            if tok_width <= cols {
+                row.push(Span::styled(token.to_owned(), style));
+                used += tok_width;
+                continue;
+            }
+
+            push_long_token(token, style, cols, &mut row, &mut used, out);
+        }
+    }
+
+    if !row.is_empty() || out.is_empty() {
+        out.push(Line::from(row));
+    }
+}
+
+fn push_long_token<'a>(
+    token: &str,
+    style: Style,
+    cols: usize,
+    row: &mut Vec<Span<'a>>,
+    used: &mut usize,
+    out: &mut Vec<Line<'a>>,
+) {
+    let mut chunk = String::new();
+    let mut chunk_w = 0usize;
+    for ch in token.chars() {
+        let mut buf = [0u8; 4];
+        let ch_w = Span::raw(&*ch.encode_utf8(&mut buf)).width();
+        if *used + chunk_w + ch_w > cols && (*used > 0 || chunk_w > 0) {
+            if !chunk.is_empty() {
+                row.push(Span::styled(std::mem::take(&mut chunk), style));
+                chunk_w = 0;
+            }
+            out.push(Line::from(std::mem::take(row)));
+            *used = 0;
+        }
+        chunk.push(ch);
+        chunk_w += ch_w;
+    }
+    if !chunk.is_empty() {
+        *used += chunk_w;
+        row.push(Span::styled(chunk, style));
+    }
+}
+
+fn split_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    let mut last_ws: Option<bool> = None;
+    for (idx, ch) in text.char_indices() {
+        let ws = ch.is_whitespace();
+        if let Some(prev_ws) = last_ws
+            && prev_ws != ws
+        {
+            tokens.push(&text[start..idx]);
+            start = idx;
+        }
+        last_ws = Some(ws);
+    }
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+    tokens
 }
 
 fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
@@ -171,10 +303,24 @@ fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
                 Style::default().fg(sandbox_color(state.sandbox_summary())),
             ),
         ]),
-        Line::from(Span::styled(
-            state.workspace_label(),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(if state.session_id().is_empty() {
+            vec![Span::styled(
+                state.workspace_label(),
+                Style::default().fg(Color::DarkGray),
+            )]
+        } else {
+            vec![
+                Span::styled(
+                    state.workspace_label(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("session {}", state.session_id()),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]
+        }),
     ];
     frame.render_widget(Paragraph::new(info_lines), cols[3]);
 
@@ -225,8 +371,7 @@ fn render_model_picker(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let mut rows = Vec::with_capacity(MAX_MENU_ROWS + 1);
-    rows.push(Line::from(vec![
+    let title = Line::from(vec![
         Span::styled(
             format!("? Models ({}) ", picker.provider_kind.as_str()),
             Style::default()
@@ -237,28 +382,49 @@ fn render_model_picker(
             "[↑/↓ · Enter: switch · Esc: cancel]",
             Style::default().fg(Color::DarkGray),
         ),
-    ]));
+    ]);
 
     let total = picker.items.len();
     if total == 0 {
-        rows.push(Line::from(Span::styled(
-            "  (no models returned by server)",
-            Style::default().fg(Color::DarkGray),
-        )));
-        frame.render_widget(Paragraph::new(rows), area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                title,
+                Line::from(Span::styled(
+                    "  (no models returned by server)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            area,
+        );
         return;
     }
 
     let clamped = picker.selected.min(total.saturating_sub(1));
-    let window_start = clamped.saturating_sub(MAX_MENU_ROWS - 1);
-    let window_end = (window_start + MAX_MENU_ROWS).min(total);
     let col_width = usize::from(area.width);
     let id_col = 28usize.min(col_width / 2);
 
-    for (offset, item) in picker.items[window_start..window_end].iter().enumerate() {
-        let is_selected = window_start + offset == clamped;
+    let mut body_rows = Vec::with_capacity(total + 4);
+    let mut selected_row = 0usize;
+    let mut last_group: Option<&'static str> = None;
+
+    for (idx, item) in picker.items.iter().enumerate() {
+        let group = model_vendor_group(&item.id).0;
+        if last_group != Some(group) {
+            body_rows.push(Line::from(Span::styled(
+                format!("  {group}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            last_group = Some(group);
+        }
+
+        let is_selected = idx == clamped;
+        if is_selected {
+            selected_row = body_rows.len();
+        }
         let is_active = current_model.ends_with(&item.id);
-        let marker = if is_selected { "› " } else { "  " };
+        let marker = if is_selected { "  › " } else { "    " };
         let padded_id = format!("{marker}{:<width$}", item.id, width = id_col);
 
         let id_style = if is_selected {
@@ -288,6 +454,101 @@ fn render_model_picker(
                 Style::default().fg(quota_color(pct)),
             ));
         }
+        if is_active {
+            spans.push(Span::styled(" (active)", Style::default().fg(Color::Green)));
+        }
+        body_rows.push(Line::from(spans));
+    }
+
+    let body_cap = usize::from(area.height.saturating_sub(1)).min(MAX_MODEL_MENU_ROWS);
+    let window_start = if body_cap == 0 {
+        0
+    } else {
+        selected_row
+            .saturating_sub(body_cap.saturating_sub(1))
+            .min(body_rows.len().saturating_sub(body_cap))
+    };
+    let window_end = (window_start + body_cap).min(body_rows.len());
+
+    let mut rows = Vec::with_capacity(body_cap + 1);
+    rows.push(title);
+    rows.extend(body_rows.drain(window_start..window_end));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_session_picker(
+    picker: &PendingSessionPicker,
+    workspace_label: &str,
+    current_session_id: &str,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let mut rows = Vec::with_capacity(MAX_MENU_ROWS + 1);
+    rows.push(Line::from(vec![
+        Span::styled(
+            format!("? Sessions ({workspace_label}) "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "[↑/↓ · Enter: resume · Esc: cancel]",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    let total = picker.items.len();
+    if total == 0 {
+        rows.push(Line::from(Span::styled(
+            "  (no saved sessions in this directory)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(Paragraph::new(rows), area);
+        return;
+    }
+
+    let clamped = picker.selected.min(total.saturating_sub(1));
+    let window_start = clamped.saturating_sub(MAX_MENU_ROWS - 1);
+    let window_end = (window_start + MAX_MENU_ROWS).min(total);
+
+    for (offset, item) in picker.items[window_start..window_end].iter().enumerate() {
+        let is_selected = window_start + offset == clamped;
+        let is_active = item.uid == current_session_id;
+        let marker = if is_selected { "› " } else { "  " };
+        let uid_col = format!("{marker}{:<10}", item.uid);
+
+        let uid_style = if is_selected {
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        } else if is_active {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let preview = item.preview.as_deref().unwrap_or("(empty session)");
+        let turns_label = if item.turn_count == 1 {
+            "1 turn".to_owned()
+        } else {
+            format!("{} turns", item.turn_count)
+        };
+        let mut spans = vec![
+            Span::styled(uid_col, uid_style),
+            Span::styled(
+                format!(" {preview}"),
+                if is_selected {
+                    Style::default().fg(Color::LightBlue)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(
+                format!(" · {turns_label}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
         if is_active {
             spans.push(Span::styled(" (active)", Style::default().fg(Color::Green)));
         }
@@ -661,8 +922,82 @@ mod tests {
 
         assert!(all_text.contains("Thinking… (esc to interrupt)"));
         assert!(all_text.contains("Models (antigravity)"));
+        assert!(all_text.contains("Google Gemini"));
+        assert!(all_text.contains("Anthropic Claude"));
         assert!(all_text.contains("Claude Sonnet 5.5 (Medium) · 98% (active)"));
         assert!(all_text.contains("Gemini 4 Argon (Medium) · 45%"));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_max_scroll_matches_word_wrapped_paragraph_bottom() -> std::io::Result<()> {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend)?;
+        let mut state = AppState::new(Profile::coding(), "off", "antigravity/claude-sonnet-5-5");
+        state.push_user_turn("explain wrapping behavior across narrow viewports");
+        state.append_stream_delta(
+            "wordone wordtwo wordthree wordfour wordfive wordsix wordseven wordeight wordnine \
+             wordten wordeleven wordtwelve wordthirteen wordfourteen wordfifteen wordsixteen \
+             wordseventeen wordeighteen wordnineteen wordtwenty tail_end_marker",
+        );
+
+        let viewport = transcript_viewport(&state, Rect::new(0, 0, 40, 14));
+        let max_scroll = compute_max_scroll(&state, viewport.width, viewport.height);
+        assert!(max_scroll > 0);
+        assert_eq!(state.effective_scroll(max_scroll), max_scroll);
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let all_text: String = (0..14)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("tail_end_marker"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_interactive_resume_session_picker() -> std::io::Result<()> {
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend)?;
+        let mut state = AppState::new(
+            Profile::coding(),
+            "landlock v11",
+            "antigravity/claude-sonnet-5-5",
+        )
+        .with_workspace_label("~/dev/rein")
+        .with_session_id("a1b2c3d4");
+        state.open_session_picker(vec![
+            crate::config::SessionSummary {
+                uid: "a1b2c3d4".to_owned(),
+                event_log: std::path::PathBuf::from("/tmp/a1b2c3d4.jsonl"),
+                full_transcript: std::path::PathBuf::from("/tmp/a1b2c3d4.full.jsonl"),
+                preview: Some("refactor session management".to_owned()),
+                turn_count: 3,
+            },
+            crate::config::SessionSummary {
+                uid: "deadbeef".to_owned(),
+                event_log: std::path::PathBuf::from("/tmp/deadbeef.jsonl"),
+                full_transcript: std::path::PathBuf::from("/tmp/deadbeef.full.jsonl"),
+                preview: Some("audit policy rules".to_owned()),
+                turn_count: 1,
+            },
+        ]);
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let all_text: String = (0..20)
+            .map(|y| (0..90).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(all_text.contains("session a1b2c3d4"));
+        assert!(all_text.contains("Sessions (~/dev/rein)"));
+        assert!(all_text.contains("a1b2c3d4"));
+        assert!(all_text.contains("refactor session management"));
+        assert!(all_text.contains("3 turns"));
+        assert!(all_text.contains("(active)"));
+        assert!(all_text.contains("deadbeef"));
         Ok(())
     }
 }

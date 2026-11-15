@@ -3,13 +3,15 @@
 // Purpose: Auto-creates ~/.rein and <workspace>/.rein layouts and merges JSON configs & commands.json allowlists
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rein_core::{
-    AnthropicConfig, AnthropicProvider, AntigravityConfig, AntigravityProvider, Provider,
-    resolve_token,
+    AnthropicConfig, AnthropicProvider, AntigravityConfig, AntigravityProvider, Provider, Role,
+    SessionEvent, resolve_token,
 };
 use rein_tools::McpServerConfig;
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,8 @@ pub struct ReinPaths {
     pub global_dir: PathBuf,
     /// Repository workspace directory (`<workspace>/.rein`).
     pub repo_dir: PathBuf,
+    /// Canonical workspace directory (`<workspace>`) owning this session group.
+    pub workspace_dir: PathBuf,
     /// Global personal memory JSONL (`~/.rein/memory.jsonl`).
     pub global_memory: PathBuf,
     /// Repository project memory JSONL (`<workspace>/.rein/memory.jsonl`).
@@ -63,9 +67,13 @@ pub struct ReinPaths {
     pub calendar: PathBuf,
     /// Global personal email spool JSONL (`~/.rein/email.jsonl`).
     pub email: PathBuf,
-    /// Repository event-sourced session transcript (`<workspace>/.rein/session.jsonl`).
+    /// Directory storing per-session UID event logs grouped by workspace directory (`~/.rein/sessions/<dir-bucket>/`).
+    pub sessions_dir: PathBuf,
+    /// Marker file holding the most recently active session UID in this workspace group.
+    pub latest_session: PathBuf,
+    /// Legacy single-file session transcript (`<workspace>/.rein/session.jsonl`).
     pub session_log: PathBuf,
-    /// Append-only full uncompacted conversation archive (`<workspace>/.rein/full-transcript.jsonl`).
+    /// Legacy uncompacted conversation archive (`<workspace>/.rein/full-transcript.jsonl`).
     pub full_transcript: PathBuf,
     /// Repository policy audit log (`<workspace>/.rein/audit.jsonl`).
     pub audit_log: PathBuf,
@@ -84,9 +92,14 @@ pub struct ReinPaths {
 }
 
 impl ReinPaths {
-    /// Constructs resolved paths from explicit `global_dir` and `repo_dir`.
+    /// Constructs resolved paths from explicit `global_dir` and `repo_dir`, grouping sessions by workspace directory.
     #[must_use]
     pub fn from_dirs(global_dir: PathBuf, repo_dir: PathBuf) -> Self {
+        let raw_workspace = repo_dir.parent().unwrap_or(&repo_dir).to_path_buf();
+        let workspace_dir = std::fs::canonicalize(&raw_workspace).unwrap_or(raw_workspace);
+        let bucket = workspace_session_bucket(&workspace_dir);
+        let sessions_dir = global_dir.join("sessions").join(bucket);
+        let latest_session = sessions_dir.join("latest");
         Self {
             global_memory: global_dir.join("memory.jsonl"),
             notes: global_dir.join("notes.jsonl"),
@@ -96,6 +109,8 @@ impl ReinPaths {
             global_commands: global_dir.join("commands.json"),
             global_skills_dir: global_dir.join("skills"),
             repo_memory: repo_dir.join("memory.jsonl"),
+            sessions_dir,
+            latest_session,
             session_log: repo_dir.join("session.jsonl"),
             full_transcript: repo_dir.join("full-transcript.jsonl"),
             audit_log: repo_dir.join("audit.jsonl"),
@@ -104,7 +119,338 @@ impl ReinPaths {
             repo_skills_dir: repo_dir.join("skills"),
             global_dir,
             repo_dir,
+            workspace_dir,
         }
+    }
+
+    /// Returns `(event_log_path, full_transcript_path)` for the given validated session `uid`.
+    #[must_use]
+    pub fn session_paths_for(&self, uid: &str) -> (PathBuf, PathBuf) {
+        (
+            self.sessions_dir.join(format!("{uid}.jsonl")),
+            self.sessions_dir.join(format!("{uid}.full.jsonl")),
+        )
+    }
+}
+
+fn workspace_session_bucket(workspace_dir: &Path) -> String {
+    let mut parts: Vec<String> = workspace_dir
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => {
+                let cleaned: String = os
+                    .to_string_lossy()
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let trimmed = cleaned.trim_matches('-').to_owned();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }
+            _ => None,
+        })
+        .collect();
+    if parts.len() > 2 {
+        parts = parts.split_off(parts.len() - 2);
+    }
+    let slug = if parts.is_empty() {
+        "root".to_owned()
+    } else {
+        parts.join("-")
+    };
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in workspace_dir.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!(
+        "{slug}-{:08x}",
+        u32::try_from(hash & 0xFFFF_FFFF).unwrap_or(0)
+    )
+}
+
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Metadata summary for a saved workspace session in `.rein/sessions/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// Short lowercase hash identifier resumable with `--resume <uid>`.
+    pub uid: String,
+    /// Path to the session's `EventLog` JSONL file.
+    pub event_log: PathBuf,
+    /// Path to the session's uncompacted full-transcript JSONL archive.
+    pub full_transcript: PathBuf,
+    /// First non-continuation user prompt recorded in this session, if any.
+    pub preview: Option<String>,
+    /// Number of user turns recorded in this session.
+    pub turn_count: usize,
+}
+
+/// Returns `true` when `raw` is a safe session identifier (`4..=32` ASCII `[a-z0-9_-]`).
+#[must_use]
+pub fn is_valid_session_uid(raw: &str) -> bool {
+    let len = raw.len();
+    (4..=32).contains(&len)
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Generates a unique 8-char hex session UID not yet present in `paths.sessions_dir`.
+#[must_use]
+pub fn generate_session_uid(paths: &ReinPaths) -> String {
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u64, |d| u64::try_from(d.as_nanos()).unwrap_or(d.as_secs()));
+    seed ^= u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for byte in paths.repo_dir.to_string_lossy().as_bytes() {
+        seed ^= u64::from(*byte);
+        seed = seed.wrapping_mul(0x1000_0000_01B3);
+    }
+
+    loop {
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mixed = splitmix64(seed.wrapping_add(seq));
+        let uid = format!("{:08x}", u32::try_from(mixed & 0xFFFF_FFFF).unwrap_or(0));
+        let (log_path, _) = paths.session_paths_for(&uid);
+        if !log_path.exists() {
+            return uid;
+        }
+        seed = mixed;
+    }
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Records `uid` as the active/latest session UID in `.rein/sessions/latest`.
+pub fn write_latest_session_uid(paths: &ReinPaths, uid: &str) -> Result<()> {
+    if !is_valid_session_uid(uid) {
+        anyhow::bail!("invalid session uid '{uid}'");
+    }
+    std::fs::create_dir_all(&paths.sessions_dir).with_context(|| {
+        format!(
+            "failed to create sessions dir '{}'",
+            paths.sessions_dir.display()
+        )
+    })?;
+    std::fs::write(&paths.latest_session, format!("{uid}\n")).with_context(|| {
+        format!(
+            "failed to write latest session marker '{}'",
+            paths.latest_session.display()
+        )
+    })
+}
+
+/// Reads the most recently recorded session UID from `.rein/sessions/latest`.
+#[must_use]
+pub fn read_latest_session_uid(paths: &ReinPaths) -> Option<String> {
+    let raw = std::fs::read_to_string(&paths.latest_session).ok()?;
+    let uid = raw.trim().to_owned();
+    is_valid_session_uid(&uid).then_some(uid)
+}
+
+/// Resolves `--resume [uid|prefix]` to a [`SessionSummary`], or starts a fresh UID if bare `--resume` has no saved sessions.
+pub fn resolve_resume_session(
+    paths: &ReinPaths,
+    target: Option<&str>,
+) -> Result<(SessionSummary, bool)> {
+    if let Some(raw) = target.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = raw.to_ascii_lowercase();
+        if !lower
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        {
+            anyhow::bail!("invalid session uid '{raw}' (expected lowercase hex/alphanumeric id)");
+        }
+        let exact = paths.session_paths_for(&lower);
+        if is_valid_session_uid(&lower) && exact.0.exists() {
+            return Ok((summarize_session_file(&lower, exact.0, exact.1), true));
+        }
+        let saved = list_sessions(paths)?;
+        let matches: Vec<SessionSummary> = saved
+            .into_iter()
+            .filter(|s| s.uid.starts_with(&lower))
+            .collect();
+        return match matches.as_slice() {
+            [] => {
+                if let Some(other_dir) = find_session_owner_dir(paths, &lower) {
+                    anyhow::bail!(
+                        "session '{raw}' belongs to directory '{other_dir}'; run rein there to resume it"
+                    );
+                }
+                anyhow::bail!(
+                    "no saved session matching uid '{raw}' in '{}'",
+                    paths.workspace_dir.display()
+                );
+            }
+            [single] => Ok((single.clone(), true)),
+            many => {
+                let ids: Vec<&str> = many.iter().map(|s| s.uid.as_str()).collect();
+                anyhow::bail!(
+                    "ambiguous session prefix '{raw}' matches: {}",
+                    ids.join(", ")
+                )
+            }
+        };
+    }
+
+    if let Some(latest_uid) = read_latest_session_uid(paths) {
+        let (log, full) = paths.session_paths_for(&latest_uid);
+        if log.exists() {
+            return Ok((summarize_session_file(&latest_uid, log, full), true));
+        }
+    }
+
+    if let Some(newest) = list_sessions(paths)?.into_iter().next() {
+        return Ok((newest, true));
+    }
+
+    if paths.session_log.exists() {
+        return Ok((
+            summarize_session_file(
+                "legacy",
+                paths.session_log.clone(),
+                paths.full_transcript.clone(),
+            ),
+            true,
+        ));
+    }
+
+    let uid = generate_session_uid(paths);
+    let (log, full) = paths.session_paths_for(&uid);
+    Ok((
+        SessionSummary {
+            uid,
+            event_log: log,
+            full_transcript: full,
+            preview: None,
+            turn_count: 0,
+        },
+        false,
+    ))
+}
+
+/// Lists saved sessions under `.rein/sessions/` sorted by most recently modified first.
+pub fn list_sessions(paths: &ReinPaths) -> Result<Vec<SessionSummary>> {
+    if !paths.sessions_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&paths.sessions_dir).with_context(|| {
+        format!(
+            "failed to read sessions dir '{}'",
+            paths.sessions_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jsonl") || name.ends_with(".full.jsonl") {
+            continue;
+        }
+        let uid = name.trim_end_matches(".jsonl").to_owned();
+        if !is_valid_session_uid(&uid) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let (_, full) = paths.session_paths_for(&uid);
+        entries.push((modified, summarize_session_file(&uid, path, full)));
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.uid.cmp(&b.1.uid)));
+    Ok(entries.into_iter().map(|(_, s)| s).collect())
+}
+
+fn find_session_owner_dir(paths: &ReinPaths, uid_or_prefix: &str) -> Option<String> {
+    let sessions_root = paths.global_dir.join("sessions");
+    let entries = std::fs::read_dir(sessions_root).ok()?;
+    for entry in entries.flatten() {
+        let bucket = entry.path();
+        if bucket == paths.sessions_dir || !bucket.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&bucket) else {
+            continue;
+        };
+        let matched = files.flatten().any(|f| {
+            let name = f.file_name();
+            let s = name.to_string_lossy();
+            s.ends_with(".jsonl")
+                && !s.ends_with(".full.jsonl")
+                && s.trim_end_matches(".jsonl").starts_with(uid_or_prefix)
+        });
+        if matched {
+            let owner = std::fs::read_to_string(bucket.join(".workspace"))
+                .ok()
+                .map(|raw| raw.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| bucket.display().to_string());
+            return Some(owner);
+        }
+    }
+    None
+}
+
+fn summarize_session_file(
+    uid: &str,
+    event_log: PathBuf,
+    full_transcript: PathBuf,
+) -> SessionSummary {
+    let mut preview: Option<String> = None;
+    let mut turn_count = 0usize;
+    let source = if full_transcript.exists() {
+        &full_transcript
+    } else {
+        &event_log
+    };
+    if let Ok(file) = std::fs::File::open(source) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let Ok(SessionEvent::MessageRecorded { message }) =
+                serde_json::from_str::<SessionEvent>(&line)
+            else {
+                continue;
+            };
+            if message.role != Role::User {
+                continue;
+            }
+            let content = message.content.trim();
+            if content.is_empty() || content == "[tool_result_continuation]" {
+                continue;
+            }
+            turn_count += 1;
+            if preview.is_none() {
+                let first_line = content.lines().next().unwrap_or(content).trim();
+                let clipped: String = first_line.chars().take(52).collect();
+                let ellipsis = if first_line.chars().count() > 52 {
+                    "…"
+                } else {
+                    ""
+                };
+                preview = Some(format!("{clipped}{ellipsis}"));
+            }
+        }
+    }
+    SessionSummary {
+        uid: uid.to_owned(),
+        event_log,
+        full_transcript,
+        preview,
+        turn_count,
     }
 }
 
@@ -397,9 +743,17 @@ pub fn ensure_dirs_and_load_in(global_dir: &Path, repo_dir: &Path) -> Result<Loa
         .with_context(|| format!("failed to create repo dir '{}'", repo_dir.display()))?;
 
     let paths = ReinPaths::from_dirs(global_dir.to_path_buf(), repo_dir.to_path_buf());
-    for dir in [&paths.global_skills_dir, &paths.repo_skills_dir] {
+    for dir in [
+        &paths.global_skills_dir,
+        &paths.repo_skills_dir,
+        &paths.sessions_dir,
+    ] {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create directory '{}'", dir.display()))?;
+    }
+    let marker = paths.sessions_dir.join(".workspace");
+    if !marker.exists() {
+        let _ = std::fs::write(&marker, format!("{}\n", paths.workspace_dir.display()));
     }
     let starter_global = serde_json::to_string_pretty(&ReinConfig::global_starter())?;
     ensure_file_if_missing(&paths.global_config, &format!("{starter_global}\n"))?;
@@ -533,6 +887,56 @@ mod tests {
         apply_provider_switch(&mut switched, ProviderKind::Anthropic, None);
         assert_eq!(switched.provider, Some(ProviderKind::Anthropic));
         assert_eq!(switched.model, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn generates_unique_session_uids_and_resolves_prefix_and_latest() -> Result<()> {
+        let root = std::env::temp_dir().join("rein_session_uid_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let global = root.join("home/.rein");
+        let repo = root.join("repo/.rein");
+        let loaded = ensure_dirs_and_load_in(&global, &repo)?;
+
+        assert!(loaded.paths.sessions_dir.is_dir());
+        let u1 = generate_session_uid(&loaded.paths);
+        let u2 = generate_session_uid(&loaded.paths);
+        assert_ne!(u1, u2);
+        assert!(is_valid_session_uid(&u1));
+        assert!(!is_valid_session_uid("../etc"));
+
+        let (p1, full1) = loaded.paths.session_paths_for(&u1);
+        let ev1 = SessionEvent::MessageRecorded {
+            message: rein_core::Message::new(Role::User, "analyze workspace architecture"),
+        };
+        std::fs::write(&p1, format!("{}\n", serde_json::to_string(&ev1)?))?;
+        std::fs::write(&full1, format!("{}\n", serde_json::to_string(&ev1)?))?;
+        write_latest_session_uid(&loaded.paths, &u1)?;
+
+        let (latest_res, found_latest) = resolve_resume_session(&loaded.paths, None)?;
+        assert!(found_latest);
+        assert_eq!(latest_res.uid, u1);
+        assert_eq!(latest_res.turn_count, 1);
+        assert_eq!(
+            latest_res.preview.as_deref(),
+            Some("analyze workspace architecture")
+        );
+
+        let prefix = &u1[..4];
+        let (pref_res, found_pref) = resolve_resume_session(&loaded.paths, Some(prefix))?;
+        assert!(found_pref);
+        assert_eq!(pref_res.uid, u1);
+
+        assert!(resolve_resume_session(&loaded.paths, Some("deadbeef99")).is_err());
+
+        let other_repo = root.join("other/.rein");
+        let other = ensure_dirs_and_load_in(&global, &other_repo)?;
+        assert_ne!(loaded.paths.sessions_dir, other.paths.sessions_dir);
+        let err = resolve_resume_session(&other.paths, Some(&u1))
+            .expect_err("must refuse cross-directory resume");
+        assert!(err.to_string().contains("belongs to directory"));
 
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
