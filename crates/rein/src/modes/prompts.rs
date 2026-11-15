@@ -2,6 +2,8 @@
 // Date: 2026-11-15
 // Purpose: Composable system prompt builders and runtime environment formatting per Rein mode
 
+use std::path::PathBuf;
+
 use rein_core::ModeId;
 
 use crate::modes::Profile;
@@ -17,6 +19,10 @@ pub struct RuntimeContext {
     pub current_date: Option<String>,
     /// Names of discovered `/skill` entries loaded from `~/.rein/skills` and `.rein/skills`.
     pub skill_names: Vec<String>,
+    /// Optional repository memory vault directory containing `MEMORY.md` and topic files.
+    pub project_memory_dir: Option<PathBuf>,
+    /// Optional global personal memory vault directory containing `MEMORY.md` and topic files.
+    pub personal_memory_dir: Option<PathBuf>,
 }
 
 impl RuntimeContext {
@@ -51,6 +57,18 @@ impl RuntimeContext {
     #[must_use]
     pub fn with_skill_names(mut self, skills: Vec<String>) -> Self {
         self.skill_names = skills;
+        self
+    }
+
+    /// Sets scoped `project` and `personal` Markdown memory vault directories.
+    #[must_use]
+    pub fn with_memory_dirs(
+        mut self,
+        project_dir: impl Into<PathBuf>,
+        personal_dir: impl Into<PathBuf>,
+    ) -> Self {
+        self.project_memory_dir = Some(project_dir.into());
+        self.personal_memory_dir = Some(personal_dir.into());
         self
     }
 }

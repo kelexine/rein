@@ -204,6 +204,12 @@ impl AgentLoop {
         &self.history
     }
 
+    /// Returns a reference to the dual-scope [`JsonlMemoryStore`].
+    #[must_use]
+    pub fn memory_store(&self) -> &JsonlMemoryStore {
+        &self.memory
+    }
+
     /// Cycles between `Coding`, `Plan`, and `Personal` profiles via [`ModeManager`].
     pub fn toggle_mode(&mut self) -> Result<ModeId> {
         let next_mode = match self.modes.active().mode {

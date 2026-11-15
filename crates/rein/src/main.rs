@@ -11,6 +11,8 @@ pub mod agent;
 pub mod commands;
 /// Dual-scope (`~/.rein` and `<workspace>/.rein`) config and command allowlist loader.
 pub mod config;
+/// Automatic memory consolidation (`AutoDream`), vault tools, and Ebbinghaus salience decay.
+pub mod memory;
 /// Mode profiles, context strategy, and runtime switcher.
 pub mod modes;
 /// In-process Ratatui terminal interface.
@@ -225,7 +227,11 @@ fn run_interactive(
         .with_workspace_label(&workspace_label)
         .with_sandbox_label(&sandbox_label)
         .with_current_date(utc_today_iso())
-        .with_skill_names(skill_names);
+        .with_skill_names(skill_names)
+        .with_memory_dirs(
+            &loaded.paths.repo_memory_dir,
+            &loaded.paths.global_memory_dir,
+        );
     let event_log = EventLog::new(&event_log_path);
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)

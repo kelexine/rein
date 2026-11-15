@@ -22,7 +22,7 @@ pub mod todos;
 
 pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use mcp::{JsonRpcRequest, JsonRpcResponse, McpClient, McpServerConfig, McpToolAdapter};
-pub use memory::{JsonlMemoryStore, MemoryRecord, MemoryTool};
+pub use memory::{JsonlMemoryStore, MemoryKind, MemoryRecord, MemoryTool, now_unix_secs};
 pub use mode::{SwitchModeTool, parse_mode_id};
 pub use personal::{
     CalendarEvent, CalendarTool, EmailMessage, EmailStatus, EmailTool, NoteEntry, NotesTool,

@@ -33,6 +33,7 @@ use crate::config::{
     generate_session_uid, list_sessions, resolve_model_target, save_provider_selection,
     write_latest_session_uid,
 };
+use crate::memory::AutoDreamCoordinator;
 use crate::modes::Profile;
 use crate::ui::view::{compute_max_scroll, transcript_viewport};
 use crate::ui::{AppState, render_frame};
@@ -137,7 +138,9 @@ pub fn run_tui(
     app: &mut AppState,
 ) -> Result<()> {
     let mut guard = TerminalGuard::enter()?;
+    let auto_dream = AutoDreamCoordinator::new();
     loop {
+        auto_dream.maybe_spawn(config, paths, agent.memory_store());
         guard.terminal.draw(|f| render_frame(app, f))?;
         if !event::poll(Duration::from_millis(50))? {
             continue;

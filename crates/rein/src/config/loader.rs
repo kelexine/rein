@@ -61,6 +61,10 @@ pub struct ReinPaths {
     pub global_memory: PathBuf,
     /// Repository project memory JSONL (`<workspace>/.rein/memory.jsonl`).
     pub repo_memory: PathBuf,
+    /// Global personal Markdown memory vault & AutoDream index (`~/.rein/memory/`).
+    pub global_memory_dir: PathBuf,
+    /// Repository project Markdown memory vault & AutoDream index (`<workspace>/.rein/memory/`).
+    pub repo_memory_dir: PathBuf,
     /// Global personal notes JSONL (`~/.rein/notes.jsonl`).
     pub notes: PathBuf,
     /// Global personal calendar JSONL (`~/.rein/calendar.jsonl`).
@@ -102,6 +106,7 @@ impl ReinPaths {
         let latest_session = sessions_dir.join("latest");
         Self {
             global_memory: global_dir.join("memory.jsonl"),
+            global_memory_dir: global_dir.join("memory"),
             notes: global_dir.join("notes.jsonl"),
             calendar: global_dir.join("calendar.jsonl"),
             email: global_dir.join("email.jsonl"),
@@ -109,6 +114,7 @@ impl ReinPaths {
             global_commands: global_dir.join("commands.json"),
             global_skills_dir: global_dir.join("skills"),
             repo_memory: repo_dir.join("memory.jsonl"),
+            repo_memory_dir: repo_dir.join("memory"),
             sessions_dir,
             latest_session,
             session_log: repo_dir.join("session.jsonl"),
@@ -454,6 +460,50 @@ fn summarize_session_file(
     }
 }
 
+/// Automatic memory consolidation (`AutoDream`) scheduling configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DreamConfig {
+    /// Enable automatic background memory consolidation (defaults to `true`).
+    #[serde(default = "default_dream_enabled")]
+    pub enabled: bool,
+    /// Minimum hours between automatic consolidation passes (defaults to `24`).
+    #[serde(default = "default_dream_min_hours")]
+    pub min_hours: u64,
+    /// Minimum newly modified session logs required to trigger consolidation (defaults to `5`).
+    #[serde(default = "default_dream_min_sessions")]
+    pub min_sessions: usize,
+    /// Maximum tool-execution turns allowed during a single dream pass (defaults to `12`).
+    #[serde(default = "default_dream_max_turns")]
+    pub max_turns: usize,
+}
+
+fn default_dream_enabled() -> bool {
+    true
+}
+
+fn default_dream_min_hours() -> u64 {
+    24
+}
+
+fn default_dream_min_sessions() -> usize {
+    5
+}
+
+fn default_dream_max_turns() -> usize {
+    12
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dream_enabled(),
+            min_hours: default_dream_min_hours(),
+            min_sessions: default_dream_min_sessions(),
+            max_turns: default_dream_max_turns(),
+        }
+    }
+}
+
 /// User and workspace configuration schema stored as JSON in `config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReinConfig {
@@ -490,6 +540,9 @@ pub struct ReinConfig {
     /// Configured stdio MCP servers discovered at startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Optional background AutoDream memory consolidation settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream: Option<DreamConfig>,
 }
 
 impl ReinConfig {
@@ -538,6 +591,7 @@ impl ReinConfig {
             ics_dir: repo.ics_dir.clone().or_else(|| self.ics_dir.clone()),
             maildir: repo.maildir.clone().or_else(|| self.maildir.clone()),
             mcp_servers,
+            dream: repo.dream.clone().or_else(|| self.dream.clone()),
         }
     }
 
@@ -746,6 +800,8 @@ pub fn ensure_dirs_and_load_in(global_dir: &Path, repo_dir: &Path) -> Result<Loa
     for dir in [
         &paths.global_skills_dir,
         &paths.repo_skills_dir,
+        &paths.global_memory_dir,
+        &paths.repo_memory_dir,
         &paths.sessions_dir,
     ] {
         std::fs::create_dir_all(dir)

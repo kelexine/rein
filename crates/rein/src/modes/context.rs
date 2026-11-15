@@ -2,8 +2,10 @@
 // Date: 2026-11-14
 // Purpose: Per-profile context strategy that assembles system prompt, scoped memory, history, and tools
 
+use std::path::Path;
+
 use rein_core::{MemoryScope, Message, Role};
-use rein_tools::{JsonlMemoryStore, ToolError, ToolRegistry, ToolSchema};
+use rein_tools::{JsonlMemoryStore, MemoryKind, MemoryRecord, ToolError, ToolRegistry, ToolSchema};
 use serde::{Deserialize, Serialize};
 
 use crate::modes::{Profile, RuntimeContext, prompts};
@@ -115,22 +117,79 @@ impl<'a> ContextBuilder<'a> {
 
     fn append_scoped_memory(&self, prompt: &mut String) -> Result<(), ToolError> {
         for scope in &self.profile.readable_memory_scopes {
-            let records = self.memory.query(*scope, "")?;
-            if records.is_empty() {
+            let index_block = self.read_scope_index(*scope);
+            let mut records = self.memory.query(*scope, "")?;
+            if index_block.is_none() && records.is_empty() {
                 continue;
             }
             prompt.push_str(&format!(
                 "\n\n## {} memory (recalled background context)\n",
                 scope_label(*scope)
             ));
-            let skip = records
-                .len()
-                .saturating_sub(self.profile.context_strategy.max_memory_records);
-            for record in records.into_iter().skip(skip) {
-                prompt.push_str(&format!("- {}: {}\n", record.key, record.value));
+            if let Some(index) = index_block {
+                prompt.push_str(&index);
+                prompt.push('\n');
+            }
+            sort_records_by_salience(&mut records);
+            for record in records
+                .into_iter()
+                .take(self.profile.context_strategy.max_memory_records)
+            {
+                prompt.push_str(&format_memory_line(&record));
             }
         }
         Ok(())
+    }
+
+    fn read_scope_index(&self, scope: MemoryScope) -> Option<String> {
+        let runtime = self.runtime?;
+        let dir = match scope {
+            MemoryScope::Project => runtime.project_memory_dir.as_deref()?,
+            MemoryScope::Personal => runtime.personal_memory_dir.as_deref()?,
+        };
+        read_capped_index(&dir.join("MEMORY.md"))
+    }
+}
+
+fn read_capped_index(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, line) in trimmed.lines().take(200).enumerate() {
+        if out.len() + line.len() + 1 > 8_192 {
+            out.push_str("…[MEMORY.md truncated]\n");
+            break;
+        }
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    Some(out)
+}
+
+fn sort_records_by_salience(records: &mut [MemoryRecord]) {
+    records.sort_by(|a, b| {
+        b.consolidated
+            .cmp(&a.consolidated)
+            .then_with(|| b.salience.total_cmp(&a.salience))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+}
+
+fn format_memory_line(record: &MemoryRecord) -> String {
+    if record.kind == MemoryKind::General {
+        format!("- {}: {}\n", record.key, record.value)
+    } else {
+        format!(
+            "- [{}] {}: {}\n",
+            record.kind.as_str(),
+            record.key,
+            record.value
+        )
     }
 }
 
@@ -190,16 +249,8 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
 
         let memory = JsonlMemoryStore::new(dir.join("memory.jsonl"));
-        memory.append(&MemoryRecord {
-            scope: MemoryScope::Personal,
-            key: "editor".to_owned(),
-            value: "helix".to_owned(),
-        })?;
-        memory.append(&MemoryRecord {
-            scope: MemoryScope::Project,
-            key: "msrv".to_owned(),
-            value: "1.99".to_owned(),
-        })?;
+        memory.append(&MemoryRecord::new(MemoryScope::Personal, "editor", "helix"))?;
+        memory.append(&MemoryRecord::new(MemoryScope::Project, "msrv", "1.99"))?;
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ReadTool::new(WorkspaceSandbox::new(&dir))));
@@ -303,11 +354,7 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
 
         let memory = JsonlMemoryStore::new(dir.join("memory.jsonl"));
-        memory.append(&MemoryRecord {
-            scope: MemoryScope::Project,
-            key: "crate".to_owned(),
-            value: "rein".to_owned(),
-        })?;
+        memory.append(&MemoryRecord::new(MemoryScope::Project, "crate", "rein"))?;
         let registry = ToolRegistry::new();
         let coding = Profile::coding();
         let runtime = RuntimeContext::new()
@@ -330,6 +377,48 @@ mod tests {
                 .contains("## Project memory (recalled background context)")
         );
         assert!(ctx.system_prompt.contains("crate: rein"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn context_builder_injects_scoped_memory_index_and_orders_salience()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_context_index_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj_mem = dir.join("proj_mem");
+        let pers_mem = dir.join("pers_mem");
+        std::fs::create_dir_all(&proj_mem)?;
+        std::fs::create_dir_all(&pers_mem)?;
+        std::fs::write(
+            proj_mem.join("MEMORY.md"),
+            "- [Build](build.md) — cargo test --workspace\n",
+        )?;
+
+        let memory = JsonlMemoryStore::dual(dir.join("proj.jsonl"), dir.join("pers.jsonl"));
+        let mut low = MemoryRecord::new(MemoryScope::Project, "old", "stale");
+        low.salience = 0.1;
+        let high = MemoryRecord::new(MemoryScope::Project, "arch", "typestate")
+            .with_kind(MemoryKind::Project)
+            .with_consolidated(true);
+        memory.append(&low)?;
+        memory.append(&high)?;
+
+        let registry = ToolRegistry::new();
+        let coding = Profile::coding();
+        let runtime = RuntimeContext::new().with_memory_dirs(&proj_mem, &pers_mem);
+        let ctx = ContextBuilder::new(&coding, &memory)
+            .with_runtime_context(&runtime)
+            .build(&[], &registry)?;
+
+        let arch_pos = ctx
+            .system_prompt
+            .find("[project] arch: typestate")
+            .unwrap_or(usize::MAX);
+        let old_pos = ctx.system_prompt.find("old: stale").unwrap_or(usize::MAX);
+        assert!(ctx.system_prompt.contains("- [Build](build.md)"));
+        assert!(arch_pos < old_pos);
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

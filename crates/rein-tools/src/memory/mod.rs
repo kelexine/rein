@@ -7,5 +7,5 @@ pub mod store;
 /// Policy-gated memory tool implementation.
 pub mod tool;
 
-pub use store::{JsonlMemoryStore, MemoryRecord};
+pub use store::{JsonlMemoryStore, MemoryKind, MemoryRecord, now_unix_secs};
 pub use tool::MemoryTool;

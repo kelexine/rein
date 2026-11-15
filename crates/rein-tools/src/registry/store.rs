@@ -117,11 +117,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir)?;
 
         let store = JsonlMemoryStore::new(temp_dir.join("mem.jsonl"));
-        store.append(&MemoryRecord {
-            scope: MemoryScope::Personal,
-            key: "editor".to_owned(),
-            value: "helix".to_owned(),
-        })?;
+        store.append(&MemoryRecord::new(MemoryScope::Personal, "editor", "helix"))?;
 
         let sandbox = WorkspaceSandbox::new(&temp_dir);
         let mut registry = ToolRegistry::new();
