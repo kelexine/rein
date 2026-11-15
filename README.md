@@ -8,7 +8,7 @@ Rein separates tool execution from model reasoning with an explicit typestate tu
 
 ## Features
 
-- **Compile-time Typestate Turn Loop** (`rein-core`): Forces every tool call through explicit policy evaluation (`PolicyEvaluated`) before execution, with event-sourced `session.jsonl` logging, Anthropic SSE streaming with full HTTP error surfacing, and batched multi-tool rounds.
+- **Compile-time Typestate Turn Loop & Providers** (`rein-core`): Forces every tool call through explicit policy evaluation (`PolicyEvaluated`) before execution, with event-sourced `session.jsonl` logging, Anthropic Messages SSE streaming, Google Antigravity (`daily-cloudcode-pa.googleapis.com`) SSE streaming with tool calling and OAuth 2.0 loopback browser login, and batched multi-tool rounds.
 - **Kernel-enforced Sandbox & Bash Classifier** (`rein-policy`): Classifies `bash -c` pipelines and subcommands (`read_only` vs `mutating` vs `network`/`outside_write`, `workspace` vs `outside_workspace` vs `protected`) with scoped allowlisting (allowing `cargo *` permits workspace builds/tests without permitting `cargo install` or `cargo publish`), enforces Linux Landlock LSM + `PR_SET_NO_NEW_PRIVS` via self `--sandbox-child` re-exec with no command timeouts, caps inline `stdout`/`stderr` at 32 KiB per stream while streaming full output logs to `<workspace>/.rein/bash-outputs/`, and fails closed when kernel isolation is unavailable.
 - **Coding, Personal & MCP Tools** (`rein-tools`):
   - Coding: `read`, `write`, `edit`, `glob`, `grep`, `bash` (runs `command` via `bash -c` or structured `program`/`args`).
@@ -22,19 +22,29 @@ Rein separates tool execution from model reasoning with an explicit typestate tu
 cargo build --release --bin rein
 ```
 
-Set your Anthropic API key in the environment before starting an interactive session:
+Either authenticate directly with **Google Antigravity** (saves `~/.rein/antigravity-oauth.json` and sets `"provider": "antigravity"` in `~/.rein/config.json`) or set your Anthropic API key:
 
 ```bash
+# Direct Google Antigravity OAuth browser login (also available via /login in TUI)
+./target/release/rein login
+
+# Or use Anthropic Messages API
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Optional environment overrides: `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `REIN_HOME`.
+Optional environment overrides: `REIN_PROVIDER` (`anthropic` | `antigravity`), `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `ANTIGRAVITY_BASE_URL`, `ANTIGRAVITY_MODEL`, `ANTIGRAVITY_TOKEN`, `ANTIGRAVITY_TOKEN_PATH`, `ANTIGRAVITY_PROJECT_ID`, `REIN_HOME`.
 
 ## Usage
 
 ```bash
 # Start interactive borderless TUI (auto-creates ~/.rein/ and ./.rein/)
 ./target/release/rein
+
+# Override provider / model for a session
+./target/release/rein --provider antigravity --model gemini-3.8-flash-medium
+
+# Authenticate directly with Antigravity via browser OAuth 2.0
+./target/release/rein login
 
 # Resume the previous workspace session from .rein/session.jsonl
 ./target/release/rein --resume
@@ -54,7 +64,7 @@ Optional environment overrides: `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `REIN_H
 
 Typing `/` opens an inline autocomplete popup above the prompt (`Up`/`Down` navigate, `Tab` completes, `Enter` runs):
 
-- Built-ins: `/help`, `/mode [coding|personal]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
+- Built-ins: `/help`, `/mode [coding|personal]`, `/login` (Google Antigravity OAuth browser login), `/provider [anthropic|antigravity] [model]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
 - Skills: any `<name>/SKILL.md` inside `~/.rein/skills/` (`(user)`) or `<workspace>/.rein/skills/` (`(repo)`) registers `/<name>` and instructs the model to read `SKILL.md` first before proceeding.
 
 Add pre-approved sandboxed commands or sandboxed tool patterns as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json` (or persist interactively via Option 2 / Option 3):
@@ -67,10 +77,14 @@ Optional keys in `config.json`:
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "provider": "antigravity",
+  "model": "claude-sonnet-5-5-medium",
   "endpoint": "https://api.anthropic.com/v1/messages",
   "max_tokens": 8192,
   "api_key_env": "ANTHROPIC_API_KEY",
+  "antigravity_base_url": "https://daily-cloudcode-pa.googleapis.com",
+  "antigravity_token_path": "/home/user/.rein/antigravity-oauth.json",
+  "antigravity_project_id": "aicode-consumers",
   "ics_dir": "/path/to/calendars",
   "maildir": "/path/to/Maildir",
   "mcp_servers": [
@@ -83,7 +97,7 @@ Optional keys in `config.json`:
 
 ```
 crates/
-├── rein-core/     # EventLog, Typestate Turn<S>, Provider trait, Anthropic SSE + ReplayProvider
+├── rein-core/     # EventLog, Typestate Turn<S>, Provider trait, Anthropic + Antigravity SSE & OAuth, ReplayProvider
 ├── rein-policy/   # Shell AST/pipeline classifier, PolicyEngine, Landlock child sandbox
 ├── rein-tools/    # Coding tools, Dual-scope JSONL memory, Personal (.ics/Maildir), MCP stdio
 └── rein/          # Dual-scope config loader, AgentLoop, ModeManager, borderless Ratatui TUI

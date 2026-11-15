@@ -3,6 +3,7 @@
 // Purpose: Crossterm raw-mode guard, slash command dispatcher, and non-blocking Ratatui loop
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -14,12 +15,16 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use rein_core::{MemoryScope, ModeId, Provider};
+use rein_core::{MemoryScope, ModeId, Provider, login_with_browser_until};
 
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
 };
 use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
+use crate::config::{
+    ProviderKind, ReinConfig, ReinPaths, apply_provider_switch, build_provider,
+    save_provider_selection,
+};
 use crate::ui::view::{compute_max_scroll, header_height};
 use crate::ui::{AppState, render_frame};
 
@@ -82,7 +87,9 @@ impl ApprovalPrompter for ChannelPrompter {
 /// Runs the minimalist Ratatui loop in-process until the user exits with `Esc`, `Ctrl-C`, or `/quit`.
 pub fn run_tui(
     agent: &mut AgentLoop,
-    provider: &mut dyn Provider,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
     app: &mut AppState,
 ) -> Result<()> {
     let mut guard = TerminalGuard::enter()?;
@@ -92,7 +99,7 @@ pub fn run_tui(
             continue;
         }
         if let Event::Key(key) = event::read()?
-            && handle_idle_key(key, agent, provider, app, &mut guard)?
+            && handle_idle_key(key, agent, provider, config, paths, app, &mut guard)?
         {
             break;
         }
@@ -103,7 +110,9 @@ pub fn run_tui(
 fn handle_idle_key(
     key: KeyEvent,
     agent: &mut AgentLoop,
-    provider: &mut dyn Provider,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
@@ -130,7 +139,7 @@ fn handle_idle_key(
         KeyCode::PageDown => scroll_app(app, guard, 8)?,
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
-        KeyCode::Enter => return handle_enter(agent, provider, app, guard),
+        KeyCode::Enter => return handle_enter(agent, provider, config, paths, app, guard),
         _ => {}
     }
     Ok(false)
@@ -138,7 +147,9 @@ fn handle_idle_key(
 
 fn handle_enter(
     agent: &mut AgentLoop,
-    provider: &mut dyn Provider,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
@@ -165,13 +176,13 @@ fn handle_enter(
         return Ok(false);
     }
     if trimmed.starts_with('/') {
-        return dispatch_slash(trimmed, agent, provider, app, guard);
+        return dispatch_slash(trimmed, agent, provider, config, paths, app, guard);
     }
     stream_prompt_background(
         trimmed.to_owned(),
         trimmed.to_owned(),
         agent,
-        provider,
+        provider.as_mut(),
         app,
         guard,
     )
@@ -180,7 +191,9 @@ fn handle_enter(
 fn dispatch_slash(
     raw: &str,
     agent: &mut AgentLoop,
-    provider: &mut dyn Provider,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
@@ -192,23 +205,33 @@ fn dispatch_slash(
         }
         SlashResolution::Matched { command, args } => match &command.kind {
             SlashKind::Builtin(action) => {
-                run_builtin_action(*action, &args, agent, provider, app, guard)
+                run_builtin_action(*action, &args, agent, provider, config, paths, app, guard)
             }
             SlashKind::Skill { .. } => {
                 let prompt = command
                     .expand_skill_prompt(&args)
                     .unwrap_or_else(|| raw.to_owned());
-                stream_prompt_background(raw.to_owned(), prompt, agent, provider, app, guard)
+                stream_prompt_background(
+                    raw.to_owned(),
+                    prompt,
+                    agent,
+                    provider.as_mut(),
+                    app,
+                    guard,
+                )
             }
         },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_builtin_action(
     action: BuiltinAction,
     args: &str,
     agent: &mut AgentLoop,
-    provider: &mut dyn Provider,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
@@ -233,7 +256,9 @@ fn run_builtin_action(
             }
         }
         BuiltinAction::Mode => run_mode_command(args, agent, app)?,
-        BuiltinAction::Compact => return compact_background(args, agent, provider, app, guard),
+        BuiltinAction::Compact => {
+            return compact_background(args, agent, provider.as_mut(), app, guard);
+        }
         BuiltinAction::Memory => run_memory_command(args, agent, app)?,
         BuiltinAction::Commands => {
             if app.configured_commands().is_empty() {
@@ -246,6 +271,8 @@ fn run_builtin_action(
             }
         }
         BuiltinAction::Mcp => run_mcp_command(agent, app),
+        BuiltinAction::Login => return run_login_background(provider, config, paths, app, guard),
+        BuiltinAction::Provider => run_provider_command(args, provider, config, paths, app)?,
         BuiltinAction::Resume => {
             let lines = agent.hydrate_from_log()?;
             app.clear_transcript();
@@ -254,6 +281,120 @@ fn run_builtin_action(
         }
     }
     Ok(false)
+}
+
+fn run_provider_command(
+    args: &str,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+) -> Result<()> {
+    let mut parts = args.split_whitespace();
+    let Some(first) = parts.next() else {
+        app.push_line(format!("· provider: {}", app.model_name()));
+        return Ok(());
+    };
+    let explicit_model = parts.next();
+    let Some(kind) = ProviderKind::parse(first) else {
+        app.push_line("! usage: /provider [anthropic|antigravity] [model]");
+        return Ok(());
+    };
+    apply_provider_switch(config, kind, explicit_model);
+    let (next_provider, label) = build_provider(kind, config);
+    *provider = next_provider;
+    app.set_model_name(&label);
+    let _ = save_provider_selection(&paths.global_config, kind, config.model.as_deref());
+    app.push_line(format!("· switched provider: {label}"));
+    Ok(())
+}
+
+fn run_login_background(
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+    guard: &mut TerminalGuard,
+) -> Result<bool> {
+    let token_path = config
+        .antigravity_token_path
+        .clone()
+        .unwrap_or_else(|| paths.global_dir.join("antigravity-oauth.json"));
+    app.push_line("· launching Google Antigravity OAuth login in browser…");
+    app.set_busy(true);
+    guard.terminal.draw(|f| render_frame(app, f))?;
+
+    let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
+    let cancel = AtomicBool::new(false);
+    let login_ok = AtomicBool::new(false);
+    let mut should_quit = false;
+
+    std::thread::scope(|scope| {
+        let cancel_ref = &cancel;
+        let login_ok_ref = &login_ok;
+        let token_path_ref = &token_path;
+        let ev_tx_worker = ev_tx.clone();
+        scope.spawn(move || {
+            let res = login_with_browser_until(
+                token_path_ref,
+                |url| {
+                    let _ = ev_tx_worker.send(WorkerEvent::Note(format!(
+                        "· open URL if browser did not open: {url}"
+                    )));
+                },
+                cancel_ref,
+            );
+            let status = match res {
+                Ok(info) => {
+                    let who = info.email.as_deref().unwrap_or("authenticated account");
+                    let _ = ev_tx_worker.send(WorkerEvent::Note(format!(
+                        "· signed in as {who} (saved {})",
+                        info.token_path.display()
+                    )));
+                    Ok(true)
+                }
+                Err(err) => Err(err.into()),
+            };
+            match status {
+                Ok(ok) => {
+                    login_ok_ref.store(ok, Ordering::Relaxed);
+                    let _ = ev_tx_worker.send(WorkerEvent::Finished(Ok(())));
+                }
+                Err(err) => {
+                    let _ = ev_tx_worker.send(WorkerEvent::Finished(Err(err)));
+                }
+            }
+        });
+
+        while app.is_busy() {
+            drain_worker_events(&ev_rx, app);
+            let _ = guard.terminal.draw(|f| render_frame(app, f));
+            if !app.is_busy() {
+                break;
+            }
+            if event::poll(Duration::from_millis(25)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+                && is_quit_key(key)
+            {
+                cancel.store(true, Ordering::Relaxed);
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    should_quit = true;
+                }
+                break;
+            }
+        }
+    });
+
+    app.set_busy(false);
+    if login_ok.load(Ordering::Relaxed) {
+        apply_provider_switch(config, ProviderKind::Antigravity, None);
+        let (next_provider, label) = build_provider(ProviderKind::Antigravity, config);
+        *provider = next_provider;
+        app.set_model_name(&label);
+        let _ = save_provider_selection(&paths.global_config, ProviderKind::Antigravity, None);
+        app.push_line(format!("· active provider: {label}"));
+    }
+    Ok(should_quit)
 }
 
 fn run_mode_command(args: &str, agent: &mut AgentLoop, app: &mut AppState) -> Result<()> {

@@ -6,6 +6,7 @@
 pub mod loader;
 
 pub use loader::{
-    LoadedReinState, ReinConfig, ReinPaths, append_allowed_command, ensure_dirs_and_load,
-    ensure_dirs_and_load_in,
+    LoadedReinState, ProviderKind, ReinConfig, ReinPaths, append_allowed_command,
+    apply_provider_switch, build_provider, ensure_dirs_and_load, ensure_dirs_and_load_in,
+    provider_startup_notice, save_provider_selection,
 };

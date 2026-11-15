@@ -20,7 +20,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rein_core::{AnthropicProvider, EventLog, ReplayProvider, Role, SessionEvent};
+use rein_core::{EventLog, ReplayProvider, Role, SessionEvent, login_with_browser};
 use rein_policy::{
     AuditLog, PolicyEngine, SANDBOX_CHILD_FLAG, SandboxStatus, WorkspaceSandbox,
     execute_sandbox_child,
@@ -33,7 +33,10 @@ use rein_tools::{
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
 };
-use crate::config::{LoadedReinState, ensure_dirs_and_load};
+use crate::config::{
+    LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
+    provider_startup_notice, save_provider_selection,
+};
 use crate::modes::Profile;
 use crate::ui::{AppState, run_tui};
 
@@ -57,7 +60,22 @@ fn main() -> Result<()> {
     }
 
     let workspace_root = std::env::current_dir().context("failed to resolve workspace root")?;
-    let loaded = ensure_dirs_and_load(&workspace_root)?;
+    let mut loaded = ensure_dirs_and_load(&workspace_root)?;
+
+    if args.get(1).map(String::as_str) == Some("login") {
+        return run_login_cli(&loaded);
+    }
+
+    if let Some(cli_provider) = parse_flag_value(&args, "--provider") {
+        let kind = ProviderKind::parse(cli_provider).with_context(|| {
+            format!("unknown provider '{cli_provider}' (use anthropic or antigravity)")
+        })?;
+        apply_provider_switch(&mut loaded.config, kind, None);
+    }
+    if let Some(cli_model) = parse_flag_value(&args, "--model") {
+        loaded.config.model = Some(cli_model.to_owned());
+    }
+
     let sandbox = WorkspaceSandbox::new(&workspace_root);
     let memory = JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory);
     let (registry, mcp_tools, mcp_warnings) = build_registry(&loaded, &sandbox, memory.clone());
@@ -100,7 +118,7 @@ fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     workspace_root: &Path,
-    loaded: LoadedReinState,
+    mut loaded: LoadedReinState,
     policy: PolicyEngine,
     registry: ToolRegistry,
     memory: JsonlMemoryStore,
@@ -110,14 +128,11 @@ fn run_interactive(
     resume: bool,
 ) -> Result<()> {
     let sandbox_label = format_sandbox_label(policy.sandbox_status());
-    let anthropic_cfg = loaded.config.to_anthropic_config();
-    let model_label = anthropic_cfg.model.clone();
+    let active_kind = loaded.config.resolved_provider();
+    let (mut provider, model_label) = build_provider(active_kind, &loaded.config);
     let mut notices = Vec::new();
-    if std::env::var_os(&anthropic_cfg.api_key_env).is_none() {
-        notices.push(format!(
-            "{} not set · export it before sending prompts",
-            anthropic_cfg.api_key_env
-        ));
+    if let Some(notice) = provider_startup_notice(active_kind, &loaded.config) {
+        notices.push(notice);
     }
     notices.extend(mcp_warnings);
 
@@ -129,13 +144,12 @@ fn run_interactive(
         .with_command_allowlist_paths(&loaded.paths.repo_commands, &loaded.paths.global_commands)
         .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(mcp_tools);
-    let mut provider = AnthropicProvider::new(anthropic_cfg);
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_workspace_label(collapse_home_path(workspace_root))
         .with_startup_notices(notices)
         .with_slash_registry(slash_registry)
         .with_configured_commands(loaded.allowed_commands)
-        .with_mcp_servers(loaded.config.mcp_servers);
+        .with_mcp_servers(loaded.config.mcp_servers.clone());
 
     if resume {
         app.extend_transcript(agent.hydrate_from_log()?);
@@ -143,17 +157,57 @@ fn run_interactive(
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        run_tui(&mut agent, &mut provider, &mut app)?;
+        run_tui(
+            &mut agent,
+            &mut provider,
+            &mut loaded.config,
+            &loaded.paths,
+            &mut app,
+        )?;
     } else {
         println!(
-            "Rein initialized ({} tools active in {:?} mode; global={}, repo={}).",
+            "Rein initialized ({} tools active in {:?} mode; provider={}; global={}, repo={}).",
             agent.active_profile().allowed_tools.len(),
             agent.active_profile().mode,
+            active_kind.as_str(),
             loaded.paths.global_dir.display(),
             loaded.paths.repo_dir.display(),
         );
     }
     Ok(())
+}
+
+fn run_login_cli(loaded: &LoadedReinState) -> Result<()> {
+    let token_path = loaded
+        .config
+        .antigravity_token_path
+        .clone()
+        .unwrap_or_else(|| loaded.paths.global_dir.join("antigravity-oauth.json"));
+    let result = login_with_browser(&token_path, |url| {
+        println!("Opening Google Sign-In for Antigravity…");
+        println!("If your browser did not open, visit:\n{url}\n");
+    })?;
+    save_provider_selection(&loaded.paths.global_config, ProviderKind::Antigravity, None)?;
+    let who = result.email.as_deref().unwrap_or("Google account");
+    println!(
+        "Authenticated {who}; credentials saved to {} and provider set to `antigravity` in {}.",
+        result.token_path.display(),
+        loaded.paths.global_config.display(),
+    );
+    Ok(())
+}
+
+fn parse_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            return iter.next().map(String::as_str);
+        }
+        if let Some(rest) = arg.strip_prefix(&format!("{flag}=")) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 fn run_replay_cli(

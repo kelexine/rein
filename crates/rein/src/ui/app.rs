@@ -110,6 +110,11 @@ impl AppState {
         self.active_profile = profile;
     }
 
+    /// Updates the displayed model identifier in the status bar after `/login` or `/provider`.
+    pub fn set_model_name(&mut self, model: impl Into<String>) {
+        self.model_name = model.into();
+    }
+
     /// Returns the currently displayed [`Profile`].
     #[must_use]
     pub fn active_profile(&self) -> &Profile {

@@ -44,6 +44,10 @@ pub enum BuiltinAction {
     Commands,
     /// Lists configured MCP servers and active tool adapters.
     Mcp,
+    /// Authenticates directly with Antigravity via browser OAuth 2.0.
+    Login,
+    /// Displays or switches the active model provider (`[anthropic|antigravity] [model]`).
+    Provider,
     /// Hydrates `.rein/session.jsonl` into the current session.
     Resume,
     /// Exits Rein cleanly.
@@ -163,6 +167,16 @@ impl SlashRegistry {
                 "mcp",
                 "Show configured MCP servers and active tools",
                 BuiltinAction::Mcp,
+            ),
+            builtin(
+                "login",
+                "Authenticate directly with Google Antigravity OAuth",
+                BuiltinAction::Login,
+            ),
+            builtin(
+                "provider",
+                "Show or switch provider/model ([anthropic|antigravity] [model])",
+                BuiltinAction::Provider,
             ),
             builtin(
                 "resume",

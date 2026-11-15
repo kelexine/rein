@@ -7,9 +7,44 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rein_core::AnthropicConfig;
+use rein_core::{
+    AnthropicConfig, AnthropicProvider, AntigravityConfig, AntigravityProvider, Provider,
+    resolve_token,
+};
 use rein_tools::McpServerConfig;
 use serde::{Deserialize, Serialize};
+
+/// Selected cloud LLM provider backend configured in `config.json` or `REIN_PROVIDER`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// Anthropic Messages SSE API (`https://api.anthropic.com/v1/messages`).
+    #[default]
+    Anthropic,
+    /// Google Antigravity Cloud Code PA (`https://daily-cloudcode-pa.googleapis.com`).
+    Antigravity,
+}
+
+impl ProviderKind {
+    /// Parses a case-insensitive provider name (`"anthropic"` or `"antigravity"`).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Some(Self::Anthropic),
+            "antigravity" | "agy" => Some(Self::Antigravity),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical lowercase provider identifier.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Antigravity => "antigravity",
+        }
+    }
+}
 
 /// Resolved filesystem layout for global (`~/.rein`) and repository (`<workspace>/.rein`) state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +111,9 @@ impl ReinPaths {
 /// User and workspace configuration schema stored as JSON in `config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReinConfig {
+    /// Preferred provider backend (`"anthropic"` or `"antigravity"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     /// Optional model identifier override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -88,6 +126,15 @@ pub struct ReinConfig {
     /// Environment variable name supplying the API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Optional Antigravity base URL override (`https://daily-cloudcode-pa.googleapis.com`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_base_url: Option<String>,
+    /// Optional explicit OAuth token JSON path for Antigravity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_token_path: Option<PathBuf>,
+    /// Optional Cloud AI companion project ID (`aicode-consumers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_project_id: Option<String>,
     /// Optional directory containing external `.ics` calendar files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ics_dir: Option<PathBuf>,
@@ -122,6 +169,7 @@ impl ReinConfig {
             }
         }
         Self {
+            provider: repo.provider.or(self.provider),
             model: repo.model.clone().or_else(|| self.model.clone()),
             endpoint: repo.endpoint.clone().or_else(|| self.endpoint.clone()),
             max_tokens: repo.max_tokens.or(self.max_tokens),
@@ -129,10 +177,33 @@ impl ReinConfig {
                 .api_key_env
                 .clone()
                 .or_else(|| self.api_key_env.clone()),
+            antigravity_base_url: repo
+                .antigravity_base_url
+                .clone()
+                .or_else(|| self.antigravity_base_url.clone()),
+            antigravity_token_path: repo
+                .antigravity_token_path
+                .clone()
+                .or_else(|| self.antigravity_token_path.clone()),
+            antigravity_project_id: repo
+                .antigravity_project_id
+                .clone()
+                .or_else(|| self.antigravity_project_id.clone()),
             ics_dir: repo.ics_dir.clone().or_else(|| self.ics_dir.clone()),
             maildir: repo.maildir.clone().or_else(|| self.maildir.clone()),
             mcp_servers,
         }
+    }
+
+    /// Resolves the active [`ProviderKind`], honoring `REIN_PROVIDER` before config fields.
+    #[must_use]
+    pub fn resolved_provider(&self) -> ProviderKind {
+        if let Ok(env_val) = std::env::var("REIN_PROVIDER")
+            && let Some(kind) = ProviderKind::parse(&env_val)
+        {
+            return kind;
+        }
+        self.provider.unwrap_or_default()
     }
 
     /// Converts merged configuration into [`AnthropicConfig`], preserving env overrides when unset.
@@ -152,6 +223,124 @@ impl ReinConfig {
             cfg.api_key_env.clone_from(api_key_env);
         }
         cfg
+    }
+
+    /// Converts merged configuration into [`AntigravityConfig`], preserving env overrides when unset.
+    #[must_use]
+    pub fn to_antigravity_config(&self) -> AntigravityConfig {
+        let mut cfg = AntigravityConfig::default();
+        if let Some(base_url) = &self.antigravity_base_url {
+            cfg.base_url.clone_from(base_url);
+        }
+        if let Some(model) = &self.model {
+            cfg.model.clone_from(model);
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            cfg.max_tokens = max_tokens;
+        }
+        if let Some(project_id) = &self.antigravity_project_id {
+            cfg.project_id = Some(project_id.clone());
+        }
+        if let Some(token_path) = &self.antigravity_token_path {
+            cfg.token_path = Some(token_path.clone());
+        }
+        cfg
+    }
+}
+
+/// Updates the `provider` (and optional `model`) persisted inside `config_path` (e.g. `~/.rein/config.json`).
+pub fn save_provider_selection(
+    config_path: &Path,
+    provider: ProviderKind,
+    model: Option<&str>,
+) -> Result<()> {
+    let mut cfg: ReinConfig = if config_path.exists() {
+        read_json_file(config_path)?
+    } else {
+        ReinConfig::global_starter()
+    };
+    cfg.provider = Some(provider);
+    if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+        cfg.model = Some(m.trim().to_owned());
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    }
+    let encoded = serde_json::to_string_pretty(&cfg).context("failed to serialize config JSON")?;
+    std::fs::write(config_path, format!("{encoded}\n"))
+        .with_context(|| format!("failed to write config '{}'", config_path.display()))?;
+    Ok(())
+}
+
+/// Instantiates the active [`Provider`] and status-bar display label (`<provider>/<model>`).
+#[must_use]
+pub fn build_provider(kind: ProviderKind, config: &ReinConfig) -> (Box<dyn Provider>, String) {
+    match kind {
+        ProviderKind::Anthropic => {
+            let cfg = config.to_anthropic_config();
+            let label = format!("anthropic/{}", cfg.model);
+            (Box::new(AnthropicProvider::new(cfg)), label)
+        }
+        ProviderKind::Antigravity => {
+            let cfg = config.to_antigravity_config();
+            let label = format!("antigravity/{}", cfg.model);
+            (Box::new(AntigravityProvider::new(cfg)), label)
+        }
+    }
+}
+
+/// Returns a non-fatal startup notice when credentials for `kind` are absent.
+#[must_use]
+pub fn provider_startup_notice(kind: ProviderKind, config: &ReinConfig) -> Option<String> {
+    match kind {
+        ProviderKind::Anthropic => {
+            let cfg = config.to_anthropic_config();
+            if std::env::var_os(&cfg.api_key_env).is_none() {
+                Some(format!(
+                    "{} not set · export it or run /login for Antigravity",
+                    cfg.api_key_env
+                ))
+            } else {
+                None
+            }
+        }
+        ProviderKind::Antigravity => {
+            let cfg = config.to_antigravity_config();
+            if resolve_token(cfg.token_path.as_deref()).is_err() {
+                Some("Antigravity credentials missing · run `/login` or `rein login`".to_owned())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Updates in-memory `config` when switching providers interactively without carrying incompatible model IDs.
+pub fn apply_provider_switch(
+    config: &mut ReinConfig,
+    kind: ProviderKind,
+    explicit_model: Option<&str>,
+) {
+    config.provider = Some(kind);
+    if let Some(model) = explicit_model.filter(|s| !s.trim().is_empty()) {
+        config.model = Some(model.trim().to_owned());
+        return;
+    }
+    if let Some(current) = config.model.as_deref() {
+        let is_antigravity_model = current.starts_with("gemini-")
+            || current.starts_with("claude-sonnet-5")
+            || current.starts_with("claude-opus-5")
+            || current.starts_with("gpt-oss");
+        let mismatch = match kind {
+            ProviderKind::Anthropic => is_antigravity_model,
+            ProviderKind::Antigravity => {
+                !is_antigravity_model && current.starts_with("claude-sonnet-4")
+            }
+        };
+        if mismatch {
+            config.model = None;
+        }
     }
 }
 
@@ -300,6 +489,23 @@ mod tests {
         append_allowed_command(&initial.paths.repo_commands, "cargo *")?;
         let updated: Vec<String> = read_json_file(&initial.paths.repo_commands)?;
         assert_eq!(updated, vec!["bun", "git", "cargo *"]);
+
+        save_provider_selection(
+            &initial.paths.global_config,
+            ProviderKind::Antigravity,
+            Some("gemini-3.8-flash-medium"),
+        )?;
+        let reloaded = ensure_dirs_and_load_in(&global, &repo)?;
+        assert_eq!(reloaded.config.provider, Some(ProviderKind::Antigravity));
+        assert_eq!(
+            reloaded.config.model.as_deref(),
+            Some("gemini-3.8-flash-medium")
+        );
+
+        let mut switched = reloaded.config.clone();
+        apply_provider_switch(&mut switched, ProviderKind::Anthropic, None);
+        assert_eq!(switched.provider, Some(ProviderKind::Anthropic));
+        assert_eq!(switched.model, None);
 
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
