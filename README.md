@@ -64,7 +64,8 @@ Optional environment overrides: `REIN_PROVIDER` (`anthropic` | `antigravity`), `
 
 Typing `/` opens an inline autocomplete popup above the prompt (`Up`/`Down` navigate, `Tab` completes, `Enter` runs):
 
-- Built-ins: `/help`, `/mode [coding|personal]`, `/login` (Google Antigravity OAuth browser login), `/provider [anthropic|antigravity] [model]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
+- Built-ins: `/help`, `/mode [coding|personal]`, `/login` (Google Antigravity OAuth browser login), `/model [provider|model]` (dynamically fetches live models and quotas from the server), `/provider [anthropic|antigravity] [model]`, `/clear`, `/compact` (summarizes via model while preserving `.rein/full-transcript.jsonl`), `/memory`, `/commands`, `/mcp`, `/resume`, `/quit`.
+- Shortcuts: `Ctrl+O` toggles collapsed/expanded tool output previews, `Tab` toggles `coding`/`personal` mode (or edits inline approval feedback), `Up`/`Down`/`PageUp`/`PageDown` scroll the transcript, `Esc` quits.
 - Skills: any `<name>/SKILL.md` inside `~/.rein/skills/` (`(user)`) or `<workspace>/.rein/skills/` (`(repo)`) registers `/<name>` and instructs the model to read `SKILL.md` first before proceeding.
 
 Add pre-approved sandboxed commands or sandboxed tool patterns as JSON arrays in `~/.rein/commands.json` or `<workspace>/.rein/commands.json` (or persist interactively via Option 2 / Option 3):

@@ -18,8 +18,9 @@ pub use event::{CoreError, EventLog, SessionEvent};
 pub use message::{MemoryScope, Message, ModeId, Role, ToolCall, ToolOutput};
 pub use provider::{
     ANTHROPIC_API_VERSION, AnthropicConfig, AnthropicProvider, AntigravityConfig,
-    AntigravityLoginResult, AntigravityProvider, AntigravityTokenSet, DEFAULT_ANTIGRAVITY_BASE_URL,
-    DEFAULT_ANTIGRAVITY_MODEL, Provider, ProviderStreamEvent, ReplayProvider, SseEventAccumulator,
-    ToolSpec, default_rein_token_path, login_with_browser, login_with_browser_until, resolve_token,
+    AntigravityLoginResult, AntigravityProvider, AntigravityTokenSet, AvailableModel,
+    DEFAULT_ANTIGRAVITY_BASE_URL, DEFAULT_ANTIGRAVITY_MODEL, Provider, ProviderStreamEvent,
+    ReplayProvider, SseEventAccumulator, ToolSpec, UsageStats, default_rein_token_path,
+    login_with_browser, login_with_browser_until, resolve_token,
 };
 pub use state::{AwaitingPolicy, Executing, Idle, Streaming, Turn};

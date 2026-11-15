@@ -27,7 +27,8 @@ use rein_policy::{
 };
 use rein_tools::{
     BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
-    McpToolAdapter, MemoryTool, NotesTool, ReadTool, ToolRegistry, WriteTool,
+    McpToolAdapter, MemoryTool, NotesTool, ReadTool, TodoReadTool, TodoWriteTool, ToolRegistry,
+    WriteTool,
 };
 
 use crate::agent::{
@@ -152,7 +153,7 @@ fn run_interactive(
         .with_mcp_servers(loaded.config.mcp_servers.clone());
 
     if resume {
-        app.extend_transcript(agent.hydrate_from_log()?);
+        app.extend_hydrated(agent.hydrate_structured()?);
         app.set_active_profile(agent.active_profile().clone());
     }
 
@@ -251,6 +252,9 @@ fn build_registry(
         BashTool::new(sandbox.clone()).with_output_dir(loaded.paths.repo_dir.join("bash-outputs")),
     ));
     registry.register(Box::new(MemoryTool::new(memory)));
+    let todos_path = loaded.paths.repo_dir.join("todos.json");
+    registry.register(Box::new(TodoWriteTool::new(&todos_path)));
+    registry.register(Box::new(TodoReadTool::new(&todos_path)));
     registry.register(Box::new(NotesTool::new(&loaded.paths.notes)));
 
     let mut calendar = CalendarTool::new(&loaded.paths.calendar);

@@ -15,6 +15,8 @@ pub mod memory;
 pub mod personal;
 /// Tool trait, schema, and policy-gated registry.
 pub mod registry;
+/// Session and workspace todo checklist tools.
+pub mod todos;
 
 pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use mcp::{JsonRpcRequest, JsonRpcResponse, McpClient, McpServerConfig, McpToolAdapter};
@@ -23,3 +25,4 @@ pub use personal::{
     CalendarEvent, CalendarTool, EmailMessage, EmailStatus, EmailTool, NoteEntry, NotesTool,
 };
 pub use registry::{Tool, ToolError, ToolRegistry, ToolSchema};
+pub use todos::{TodoItem, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};

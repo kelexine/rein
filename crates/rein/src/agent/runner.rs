@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rein_core::{
     EventLog, MemoryScope, Message, ModeId, Provider, ProviderStreamEvent, Role, SessionEvent,
-    ToolCall, ToolSpec, Turn,
+    ToolCall, ToolOutput, ToolSpec, Turn, UsageStats,
 };
 use rein_policy::{PolicyDecision, PolicyEngine, WorkspaceSandbox, suggest_command_allow_pattern};
 use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema};
@@ -51,6 +51,22 @@ pub struct ApprovalDecision {
     pub feedback: Option<String>,
 }
 
+/// Structured transcript event yielded when hydrating `session.jsonl` on `--resume` or `/resume`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HydratedEvent {
+    /// Submitted user prompt.
+    User(String),
+    /// Completed assistant text message.
+    Assistant(String),
+    /// Completed tool call paired with its output payload.
+    Tool {
+        /// Tool call arguments and identifier.
+        call: ToolCall,
+        /// Tool output or denial text.
+        output: ToolOutput,
+    },
+}
+
 /// Interactive callbacks used by [`AgentLoop`] for numbered policy confirmation, streaming deltas, and tool status.
 pub trait ApprovalPrompter {
     /// Displays `request` options (`1..=4`) to the user and returns the chosen [`ApprovalDecision`].
@@ -61,6 +77,15 @@ pub trait ApprovalPrompter {
 
     /// Receives compact 1-line tool activity summaries (`· read Cargo.toml`).
     fn on_tool_status(&mut self, _status: &str) {}
+
+    /// Notified right when a tool call begins policy check / execution.
+    fn on_tool_start(&mut self, _call: &ToolCall) {}
+
+    /// Notified once a tool finishes (or is denied) with its resulting output.
+    fn on_tool_finish(&mut self, _call: &ToolCall, _output: &ToolOutput) {}
+
+    /// Notified once per provider turn with reported token usage.
+    fn on_usage(&mut self, _usage: UsageStats) {}
 }
 
 /// Coordinates the single-process agent turn loop across Core, Policy, Tools, and Modes.
@@ -285,6 +310,68 @@ impl AgentLoop {
         Ok(display_lines)
     }
 
+    /// Hydrates conversation history and structured UI events from `session.jsonl`.
+    pub fn hydrate_structured(&mut self) -> Result<Vec<HydratedEvent>> {
+        let events = self.event_log.read_all()?;
+        let mut items = Vec::new();
+        let mut pending_calls: Vec<ToolCall> = Vec::new();
+        self.history.clear();
+
+        for ev in events {
+            match ev {
+                SessionEvent::ModeSwitched { mode } => {
+                    let profile = self.build_profile(mode);
+                    self.policy.set_rules(profile.policy_rules.clone());
+                    self.modes = ModeManager::new(profile);
+                }
+                SessionEvent::ToolRequested { call } => {
+                    pending_calls.push(call);
+                }
+                SessionEvent::ToolCompleted { output } => {
+                    let mut tool_msg = Message::new(Role::Tool, output.content.clone());
+                    if let Some(matched) = pending_calls
+                        .iter()
+                        .find(|c| c.id == output.call_id)
+                        .cloned()
+                    {
+                        items.push(HydratedEvent::Tool {
+                            call: matched.clone(),
+                            output: output.clone(),
+                        });
+                        tool_msg.tool_calls.push(matched);
+                    }
+                    self.history.push(tool_msg);
+                }
+                SessionEvent::MessageRecorded { mut message } => {
+                    if message.role == Role::User && message.content == "[tool_result_continuation]"
+                    {
+                        continue;
+                    }
+                    match message.role {
+                        Role::User => {
+                            pending_calls.clear();
+                            items.push(HydratedEvent::User(message.content.clone()));
+                        }
+                        Role::Assistant => {
+                            if !pending_calls.is_empty() && message.tool_calls.is_empty() {
+                                message.tool_calls = std::mem::take(&mut pending_calls);
+                            }
+                            if !message.content.trim().is_empty() {
+                                items.push(HydratedEvent::Assistant(message.content.clone()));
+                            }
+                        }
+                        Role::Tool | Role::System => {}
+                    }
+                    self.history.push(message);
+                }
+                SessionEvent::StreamDelta { .. }
+                | SessionEvent::PolicyEvaluated { .. }
+                | SessionEvent::MemoryAccessed { .. } => {}
+            }
+        }
+        Ok(items)
+    }
+
     /// Executes a user prompt through the typestate loop until the model finishes or reaches max rounds.
     pub fn run_user_prompt(
         &mut self,
@@ -311,6 +398,7 @@ impl AgentLoop {
 
             let mut streamed_text = String::new();
             let mut requested_calls: Vec<ToolCall> = Vec::new();
+            let mut turn_usage: Option<UsageStats> = None;
             let events = provider.stream_turn_with(
                 &assembled.system_prompt,
                 &assembled.messages,
@@ -329,8 +417,12 @@ impl AgentLoop {
                         streaming.push_delta(&delta)?;
                     }
                     ProviderStreamEvent::ToolUse(call) => requested_calls.push(call),
+                    ProviderStreamEvent::Usage(usage) => turn_usage = Some(usage),
                     ProviderStreamEvent::Done => {}
                 }
+            }
+            if let Some(usage) = turn_usage {
+                prompter.on_usage(usage);
             }
 
             if requested_calls.is_empty() {
@@ -460,6 +552,7 @@ fn execute_awaiting<'a>(
 ) -> Result<Turn<'a, rein_core::Idle>> {
     let call = awaiting.pending_call().clone();
     prompter.on_tool_status(&format_tool_status(&call));
+    prompter.on_tool_start(&call);
 
     let decision =
         registry.evaluate_turn_for_profile(&awaiting, policy, &modes.active().allowed_tools)?;
@@ -525,6 +618,7 @@ fn execute_awaiting<'a>(
     if output.content.is_empty() {
         output.content = "(no output)".to_owned();
     }
+    prompter.on_tool_finish(&call, &output);
     let mut tool_msg = Message::new(Role::Tool, output.content);
     tool_msg.tool_calls.push(call);
     record_full_message(full_transcript_path, &tool_msg)?;

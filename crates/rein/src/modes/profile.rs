@@ -9,10 +9,27 @@ use serde::{Deserialize, Serialize};
 use crate::modes::ContextStrategy;
 
 /// Tool names enabled in the Coding profile.
-pub const CODING_TOOLS: &[&str] = &["read", "write", "edit", "glob", "grep", "bash", "memory"];
+pub const CODING_TOOLS: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "bash",
+    "memory",
+    "todo_write",
+    "todo_read",
+];
 
 /// Tool names enabled in the Personal profile.
-pub const PERSONAL_TOOLS: &[&str] = &["memory", "notes", "calendar", "email"];
+pub const PERSONAL_TOOLS: &[&str] = &[
+    "memory",
+    "notes",
+    "calendar",
+    "email",
+    "todo_write",
+    "todo_read",
+];
 
 /// A self-contained mode profile keeping `rein-core` completely mode-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,9 +56,11 @@ impl Profile {
     pub fn coding() -> Self {
         Self {
             mode: ModeId::Coding,
-            system_prompt: "You are Rein in Coding mode. Work inside the workspace sandbox, prefer \
-                            read-only inspection before edits, and keep changes minimal and verified."
-                .to_owned(),
+            system_prompt:
+                "You are Rein in Coding mode. Work inside the workspace sandbox, prefer \
+                            read-only inspection before edits, use todo_write to track multi-step \
+                            tasks, and keep changes minimal and verified."
+                    .to_owned(),
             allowed_tools: to_owned_list(CODING_TOOLS),
             policy_rules: PolicyRuleSet::coding_default(),
             readable_memory_scopes: vec![MemoryScope::Project, MemoryScope::Personal],

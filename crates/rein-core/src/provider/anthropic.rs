@@ -10,13 +10,13 @@ use serde_json::{Value, json};
 use crate::event::CoreError;
 use crate::message::{Message, Role};
 use crate::provider::sse::SseEventAccumulator;
-use crate::provider::{Provider, ProviderStreamEvent, ToolSpec};
+use crate::provider::{AvailableModel, Provider, ProviderStreamEvent, ToolSpec};
 
 /// Default Anthropic Messages API endpoint.
 pub const DEFAULT_ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 
 /// Default Claude model identifier for v1 cloud inference.
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
 
 /// Required Anthropic API version header value.
 pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -116,6 +116,28 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn list_models(&mut self) -> Result<Vec<AvailableModel>, CoreError> {
+        let api_key = std::env::var(&self.config.api_key_env).map_err(|_| {
+            CoreError::Provider(format!(
+                "missing environment variable '{}'",
+                self.config.api_key_env
+            ))
+        })?;
+        let url = models_endpoint_for(&self.config.endpoint);
+        let resp = self
+            .agent
+            .get(&url)
+            .set("x-api-key", &api_key)
+            .set("anthropic-version", ANTHROPIC_API_VERSION)
+            .call()
+            .map_err(format_ureq_error)?;
+        let body = resp
+            .into_string()
+            .map_err(|err| CoreError::Provider(format!("Anthropic models read error: {err}")))?;
+        let val: Value = serde_json::from_str(&body)?;
+        Ok(parse_anthropic_models(&val))
+    }
+
     fn stream_turn_with(
         &mut self,
         system_prompt: &str,
@@ -144,6 +166,41 @@ impl Provider for AnthropicProvider {
         let mut acc = SseEventAccumulator::new();
         acc.read_stream(reader, on_event)
     }
+}
+
+fn models_endpoint_for(messages_endpoint: &str) -> String {
+    if let Some(prefix) = messages_endpoint.strip_suffix("/v1/messages") {
+        format!("{}/v1/models", prefix.trim_end_matches('/'))
+    } else {
+        "https://api.anthropic.com/v1/models".to_owned()
+    }
+}
+
+fn parse_anthropic_models(val: &Value) -> Vec<AvailableModel> {
+    let Some(data) = val.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let display_name = item
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_owned();
+            Some(AvailableModel {
+                id: id.to_owned(),
+                display_name,
+                quota_percent: None,
+                recommended: id.contains("sonnet") || id.contains("opus"),
+            })
+        })
+        .collect()
 }
 
 fn format_ureq_error(err: ureq::Error) -> CoreError {

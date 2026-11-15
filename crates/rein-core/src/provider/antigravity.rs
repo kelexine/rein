@@ -14,7 +14,7 @@ use crate::message::{Message, Role, ToolCall};
 use crate::provider::antigravity_auth::{
     AntigravityTokenSet, refresh_access_token, resolve_token, save_token_file,
 };
-use crate::provider::{Provider, ProviderStreamEvent, ToolSpec};
+use crate::provider::{AvailableModel, Provider, ProviderStreamEvent, ToolSpec, UsageStats};
 
 /// Primary Cloud Code PA endpoint used by Antigravity.
 pub const DEFAULT_ANTIGRAVITY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
@@ -77,6 +77,7 @@ pub struct AntigravityProvider {
     token_file_path: Option<PathBuf>,
     resolved_project: Option<String>,
     thought_signatures: HashMap<String, String>,
+    last_models: Vec<AvailableModel>,
     call_seq: u64,
 }
 
@@ -91,6 +92,7 @@ impl AntigravityProvider {
             token_file_path: None,
             resolved_project: None,
             thought_signatures: HashMap::new(),
+            last_models: Vec::new(),
             call_seq: 0,
         }
     }
@@ -178,54 +180,51 @@ impl AntigravityProvider {
         }
 
         let root = val.get("response").unwrap_or(&val);
-        let Some(candidates) = root.get("candidates").and_then(Value::as_array) else {
-            return Ok(Vec::new());
-        };
-        let Some(candidate) = candidates.first() else {
-            return Ok(Vec::new());
-        };
-        let Some(parts) = candidate
-            .pointer("/content/parts")
-            .and_then(Value::as_array)
-        else {
-            return Ok(Vec::new());
-        };
-
         let mut events = Vec::new();
-        for part in parts {
-            let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
-            if !is_thought
-                && let Some(text) = part.get("text").and_then(Value::as_str)
-                && !text.is_empty()
-            {
-                events.push(ProviderStreamEvent::TextDelta(text.to_owned()));
-            }
-            if let Some(fc) = part.get("functionCall")
-                && let Some(name) = fc.get("name").and_then(Value::as_str)
-            {
-                let id = fc
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        self.call_seq += 1;
-                        format!("ag_call_{}", self.call_seq)
-                    });
-                if let Some(sig) = part
-                    .get("thoughtSignature")
-                    .or_else(|| part.get("thought_signature"))
-                    .and_then(Value::as_str)
+        if let Some(candidates) = root.get("candidates").and_then(Value::as_array)
+            && let Some(candidate) = candidates.first()
+            && let Some(parts) = candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+        {
+            for part in parts {
+                let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+                if !is_thought
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
                 {
-                    self.thought_signatures.insert(id.clone(), sig.to_owned());
+                    events.push(ProviderStreamEvent::TextDelta(text.to_owned()));
                 }
-                let arguments = fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                events.push(ProviderStreamEvent::ToolUse(ToolCall {
-                    id,
-                    name: name.to_owned(),
-                    arguments,
-                }));
+                if let Some(fc) = part.get("functionCall")
+                    && let Some(name) = fc.get("name").and_then(Value::as_str)
+                {
+                    let id = fc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            self.call_seq += 1;
+                            format!("ag_call_{}", self.call_seq)
+                        });
+                    if let Some(sig) = part
+                        .get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .and_then(Value::as_str)
+                    {
+                        self.thought_signatures.insert(id.clone(), sig.to_owned());
+                    }
+                    let arguments = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                    events.push(ProviderStreamEvent::ToolUse(ToolCall {
+                        id,
+                        name: name.to_owned(),
+                        arguments,
+                    }));
+                }
             }
+        }
+        if let Some(usage) = extract_usage_metadata(root) {
+            events.push(ProviderStreamEvent::Usage(usage));
         }
         Ok(events)
     }
@@ -326,6 +325,40 @@ impl AntigravityProvider {
 impl Provider for AntigravityProvider {
     fn name(&self) -> &str {
         "antigravity"
+    }
+
+    fn list_models(&mut self) -> Result<Vec<AvailableModel>, CoreError> {
+        let mut access_token = self.ensure_tokens()?;
+        let project_id = self.ensure_project_id(&access_token);
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1internal:fetchAvailableModels");
+        let payload = json!({ "project": project_id }).to_string();
+
+        let resp = match self.post_stream(&url, &access_token, &payload) {
+            Ok(resp) => resp,
+            Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
+                access_token = self.try_refresh_token()?;
+                self.post_stream(&url, &access_token, &payload)
+                    .map_err(|e| format_antigravity_error(*e))?
+            }
+            Err(err) => return Err(format_antigravity_error(*err)),
+        };
+
+        let body = resp
+            .into_string()
+            .map_err(|err| CoreError::Provider(format!("Antigravity models read error: {err}")))?;
+        let parsed: Value = serde_json::from_str(&body)?;
+        let models = parse_available_models(&parsed);
+        self.last_models = models.clone();
+        Ok(models)
+    }
+
+    fn active_model_quota(&self) -> Option<u8> {
+        let normalized = Self::normalize_model_id(&self.config.model);
+        self.last_models
+            .iter()
+            .find(|m| m.id == self.config.model || m.id == normalized)
+            .and_then(|m| m.quota_percent)
     }
 
     fn stream_turn_with(
@@ -475,6 +508,108 @@ fn flush_function_responses(pending: &mut Vec<Value>, contents: &mut Vec<Value>)
     }
 }
 
+fn extract_usage_metadata(root: &Value) -> Option<UsageStats> {
+    let meta = root.get("usageMetadata")?;
+    let input_tokens = meta
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = meta
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = meta
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(UsageStats {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn parse_available_models(root: &Value) -> Vec<AvailableModel> {
+    let Some(models_map) = root.get("models").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut recommended_ids = Vec::new();
+    if let Some(sorts) = root.get("agentModelSorts").and_then(Value::as_array) {
+        for sort in sorts {
+            if let Some(groups) = sort.get("groups").and_then(Value::as_array) {
+                for group in groups {
+                    if let Some(ids) = group.get("modelIds").and_then(Value::as_array) {
+                        for id in ids.iter().filter_map(Value::as_str) {
+                            if !recommended_ids.iter().any(|existing| existing == id) {
+                                recommended_ids.push(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for id in &recommended_ids {
+        if let Some(entry) = models_map.get(id)
+            && let Some(model) = model_from_entry(id, entry, true)
+        {
+            out.push(model);
+        }
+    }
+
+    let mut extra_ids: Vec<&String> = models_map
+        .keys()
+        .filter(|id| !recommended_ids.iter().any(|r| r == *id))
+        .collect();
+    extra_ids.sort();
+    for id in extra_ids {
+        if is_noise_model_id(id) {
+            continue;
+        }
+        if let Some(entry) = models_map.get(id)
+            && let Some(model) = model_from_entry(id, entry, false)
+        {
+            out.push(model);
+        }
+    }
+    out
+}
+
+fn is_noise_model_id(id: &str) -> bool {
+    id.starts_with("chat_") || id.starts_with("tab_") || id.ends_with("-image")
+}
+
+fn model_from_entry(id: &str, entry: &Value, recommended: bool) -> Option<AvailableModel> {
+    if entry.get("isInternal").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let display_name = entry
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id)
+        .to_owned();
+    let quota_percent = entry
+        .pointer("/quotaInfo/remainingFraction")
+        .and_then(Value::as_f64)
+        .map(|frac| {
+            let pct = (frac * 100.0).clamp(0.0, 100.0).round();
+            format!("{pct:.0}").parse::<u8>().unwrap_or(0)
+        });
+    Some(AvailableModel {
+        id: id.to_owned(),
+        display_name,
+        quota_percent,
+        recommended,
+    })
+}
+
 fn sanitize_gemini_schema(schema: &Value) -> Value {
     match schema {
         Value::Object(map) => {
@@ -597,6 +732,51 @@ mod tests {
             }
             other => return Err(format!("unexpected event: {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_available_models_and_usage_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = json!({
+            "agentModelSorts": [{
+                "displayName": "Recommended",
+                "groups": [{ "modelIds": ["claude-sonnet-5-5-medium"] }]
+            }],
+            "models": {
+                "claude-sonnet-5-5-medium": {
+                    "displayName": "Claude Sonnet 5.5 (Medium)",
+                    "quotaInfo": { "remainingFraction": 0.984 }
+                },
+                "gemini-3.8-flash-tiered": {
+                    "displayName": "Gemini 3.8 Flash (Tiered)",
+                    "quotaInfo": { "remainingFraction": 0.844 }
+                },
+                "chat_20706": {
+                    "displayName": "Internal Chat",
+                    "isInternal": true
+                }
+            }
+        });
+        let models = parse_available_models(&payload);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-5-5-medium");
+        assert_eq!(models[0].quota_percent, Some(98));
+        assert!(models[0].recommended);
+        assert_eq!(models[1].id, "gemini-3.8-flash-tiered");
+        assert_eq!(models[1].quota_percent, Some(84));
+
+        let mut provider = AntigravityProvider::new(AntigravityConfig::default());
+        let events = provider.parse_sse_chunk(
+            r#"{"response":{"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":30,"totalTokenCount":150}}}"#,
+        )?;
+        assert_eq!(
+            events,
+            vec![ProviderStreamEvent::Usage(UsageStats {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+            })]
+        );
         Ok(())
     }
 }

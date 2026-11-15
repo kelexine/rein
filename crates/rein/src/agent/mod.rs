@@ -6,5 +6,6 @@
 pub mod runner;
 
 pub use runner::{
-    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, MAX_TOOL_ROUNDS,
+    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, HydratedEvent,
+    MAX_TOOL_ROUNDS,
 };

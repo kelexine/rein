@@ -316,6 +316,39 @@ pub fn provider_startup_notice(kind: ProviderKind, config: &ReinConfig) -> Optio
     }
 }
 
+/// Resolves a `/model <spec>` argument into `(ProviderKind, model_id)`.
+#[must_use]
+pub fn resolve_model_target(config: &ReinConfig, raw_spec: &str) -> (ProviderKind, String) {
+    let trimmed = raw_spec.trim();
+    if let Some((prefix, rest)) = trimmed.split_once('/')
+        && let Some(kind) = ProviderKind::parse(prefix)
+        && !rest.trim().is_empty()
+    {
+        return (kind, rest.trim().to_owned());
+    }
+    if is_antigravity_model_id(trimmed) {
+        return (ProviderKind::Antigravity, trimmed.to_owned());
+    }
+    if is_anthropic_model_id(trimmed) {
+        return (ProviderKind::Anthropic, trimmed.to_owned());
+    }
+    (config.resolved_provider(), trimmed.to_owned())
+}
+
+fn is_antigravity_model_id(model: &str) -> bool {
+    model.starts_with("gemini-")
+        || model.starts_with("gpt-oss")
+        || model.ends_with("-medium")
+        || model.ends_with("-high")
+        || model.ends_with("-low")
+        || model.ends_with("-minimal")
+        || model.ends_with("-tiered")
+}
+
+fn is_anthropic_model_id(model: &str) -> bool {
+    model.starts_with("claude-") && !is_antigravity_model_id(model)
+}
+
 /// Updates in-memory `config` when switching providers interactively without carrying incompatible model IDs.
 pub fn apply_provider_switch(
     config: &mut ReinConfig,
@@ -328,15 +361,9 @@ pub fn apply_provider_switch(
         return;
     }
     if let Some(current) = config.model.as_deref() {
-        let is_antigravity_model = current.starts_with("gemini-")
-            || current.starts_with("claude-sonnet-5")
-            || current.starts_with("claude-opus-5")
-            || current.starts_with("gpt-oss");
         let mismatch = match kind {
-            ProviderKind::Anthropic => is_antigravity_model,
-            ProviderKind::Antigravity => {
-                !is_antigravity_model && current.starts_with("claude-sonnet-4")
-            }
+            ProviderKind::Anthropic => is_antigravity_model_id(current),
+            ProviderKind::Antigravity => is_anthropic_model_id(current),
         };
         if mismatch {
             config.model = None;

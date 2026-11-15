@@ -8,5 +8,5 @@ pub mod loader;
 pub use loader::{
     LoadedReinState, ProviderKind, ReinConfig, ReinPaths, append_allowed_command,
     apply_provider_switch, build_provider, ensure_dirs_and_load, ensure_dirs_and_load_in,
-    provider_startup_notice, save_provider_selection,
+    provider_startup_notice, resolve_model_target, save_provider_selection,
 };

@@ -1,12 +1,15 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, and Slash commands
+// Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, Slash commands, and Model picker
 
+use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
 use rein_tools::McpServerConfig;
 
-use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest};
+use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent};
 use crate::commands::{SlashCommand, SlashRegistry};
+use crate::config::ProviderKind;
 use crate::modes::Profile;
+use crate::ui::entries::{ToolRunState, TranscriptEntry};
 
 /// Active interactive 4-option permission prompt with inline `Tab` feedback editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,24 +24,41 @@ pub struct PendingApproval {
     pub feedback: String,
 }
 
+/// Active interactive model selection popup opened by `/model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingModelPicker {
+    /// Models fetched dynamically from the provider backend.
+    pub items: Vec<AvailableModel>,
+    /// Currently highlighted model index.
+    pub selected: usize,
+    /// Target provider owning these server models.
+    pub provider_kind: ProviderKind,
+}
+
 /// State owned by the in-process minimalist Ratatui frontend.
 #[derive(Debug)]
 pub struct AppState {
     active_profile: Profile,
     sandbox_summary: String,
     model_name: String,
+    model_quota: Option<u8>,
+    usage_totals: UsageStats,
     workspace_label: String,
     startup_notices: Vec<String>,
     slash_registry: SlashRegistry,
     slash_selected: usize,
     configured_commands: Vec<String>,
     mcp_servers: Vec<McpServerConfig>,
-    transcript: Vec<String>,
+    entries: Vec<TranscriptEntry>,
     input: String,
     pending_approval: Option<PendingApproval>,
+    pending_model_picker: Option<PendingModelPicker>,
+    expand_outputs: bool,
     scroll_offset: u16,
     auto_scroll: bool,
     busy: bool,
+    busy_status: String,
+    spinner_tick: usize,
     streaming_active: bool,
 }
 
@@ -54,18 +74,24 @@ impl AppState {
             active_profile: initial,
             sandbox_summary: sandbox_summary.into(),
             model_name: model_name.into(),
+            model_quota: None,
+            usage_totals: UsageStats::default(),
             workspace_label: ".".to_owned(),
             startup_notices: Vec::new(),
             slash_registry: SlashRegistry::with_builtins(),
             slash_selected: 0,
             configured_commands: Vec::new(),
             mcp_servers: Vec::new(),
-            transcript: Vec::new(),
+            entries: Vec::new(),
             input: String::new(),
             pending_approval: None,
+            pending_model_picker: None,
+            expand_outputs: false,
             scroll_offset: 0,
             auto_scroll: true,
             busy: false,
+            busy_status: "Thinking…".to_owned(),
+            spinner_tick: 0,
             streaming_active: false,
         }
     }
@@ -110,9 +136,31 @@ impl AppState {
         self.active_profile = profile;
     }
 
-    /// Updates the displayed model identifier in the status bar after `/login` or `/provider`.
+    /// Updates the displayed model identifier in the header and status bar.
     pub fn set_model_name(&mut self, model: impl Into<String>) {
         self.model_name = model.into();
+    }
+
+    /// Updates the remaining quota percentage (`0..=100`) shown in the status bar.
+    pub fn set_model_quota(&mut self, quota: Option<u8>) {
+        self.model_quota = quota;
+    }
+
+    /// Returns cached remaining quota percentage for the active model, if known.
+    #[must_use]
+    pub fn model_quota(&self) -> Option<u8> {
+        self.model_quota
+    }
+
+    /// Accumulates per-turn token usage into session totals.
+    pub fn record_usage(&mut self, turn_usage: UsageStats) {
+        self.usage_totals.add_assign_turn(turn_usage);
+    }
+
+    /// Returns cumulative session token usage.
+    #[must_use]
+    pub fn usage_totals(&self) -> UsageStats {
+        self.usage_totals
     }
 
     /// Returns the currently displayed [`Profile`].
@@ -166,7 +214,7 @@ impl AppState {
     /// Returns matching slash entries while typing a `/command` token (hidden while busy/asking).
     #[must_use]
     pub fn slash_matches(&self) -> Vec<&SlashCommand> {
-        if self.busy || self.pending_approval.is_some() {
+        if self.busy || self.pending_approval.is_some() || self.pending_model_picker.is_some() {
             return Vec::new();
         }
         self.slash_registry.matching(&self.input)
@@ -197,23 +245,114 @@ impl AppState {
         self.slash_selected = (current + delta).rem_euclid(len) as usize;
     }
 
-    /// Returns the rendered transcript lines.
+    /// Returns structured transcript entries.
     #[must_use]
-    pub fn transcript(&self) -> &[String] {
-        &self.transcript
+    pub fn entries(&self) -> &[TranscriptEntry] {
+        &self.entries
+    }
+
+    /// Returns whether truncated tool outputs are currently expanded (`Ctrl+O`).
+    #[must_use]
+    pub fn expand_outputs(&self) -> bool {
+        self.expand_outputs
+    }
+
+    /// Toggles collapsed/expanded tool output rendering (`Ctrl+O`) and returns the new state.
+    pub fn toggle_expand_outputs(&mut self) -> bool {
+        self.expand_outputs = !self.expand_outputs;
+        self.expand_outputs
     }
 
     /// Clears the display transcript and resets scroll position.
     pub fn clear_transcript(&mut self) {
-        self.transcript.clear();
+        self.entries.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.streaming_active = false;
     }
 
-    /// Appends hydrated lines (used by `--resume` and `/resume`).
-    pub fn extend_transcript(&mut self, lines: impl IntoIterator<Item = String>) {
-        self.transcript.extend(lines);
+    /// Appends hydrated structured events (used by `--resume` and `/resume`).
+    pub fn extend_hydrated(&mut self, hydrated: Vec<HydratedEvent>) {
+        self.streaming_active = false;
+        for ev in hydrated {
+            match ev {
+                HydratedEvent::User(text) => self.entries.push(TranscriptEntry::UserTurn(text)),
+                HydratedEvent::Assistant(text) => {
+                    self.entries.push(TranscriptEntry::AssistantTurn(text));
+                }
+                HydratedEvent::Tool { call, output } => {
+                    self.entries
+                        .push(TranscriptEntry::tool_completed(&call, &output));
+                }
+            }
+        }
+        self.auto_scroll = true;
+    }
+
+    /// Appends a user turn prompt to the structured transcript.
+    pub fn push_user_turn(&mut self, text: impl Into<String>) {
+        self.streaming_active = false;
+        self.entries.push(TranscriptEntry::UserTurn(text.into()));
+        self.auto_scroll = true;
+    }
+
+    /// Appends a muted system note (`· ...`).
+    pub fn push_system_note(&mut self, note: impl Into<String>) {
+        self.streaming_active = false;
+        self.entries.push(TranscriptEntry::SystemNote(note.into()));
+        self.auto_scroll = true;
+    }
+
+    /// Appends a highlighted error note (`! ...`).
+    pub fn push_error_note(&mut self, err: impl Into<String>) {
+        self.streaming_active = false;
+        self.entries.push(TranscriptEntry::ErrorNote(err.into()));
+        self.auto_scroll = true;
+    }
+
+    /// Records a newly started tool invocation in the transcript.
+    pub fn push_tool_running(&mut self, call: &ToolCall) {
+        self.streaming_active = false;
+        self.busy_status = format!("Running {}…", call.name);
+        self.entries.push(TranscriptEntry::tool_running(call));
+        self.auto_scroll = true;
+    }
+
+    /// Updates a running tool entry with its output (or appends a completed entry if unmatched).
+    pub fn finish_tool_entry(&mut self, call: &ToolCall, output: &ToolOutput) {
+        self.streaming_active = false;
+        self.busy_status = "Thinking…".to_owned();
+        if let Some(existing) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            TranscriptEntry::Tool(tool) if tool.call_id == call.id => Some(tool),
+            _ => None,
+        }) {
+            existing.state = if output.is_error {
+                ToolRunState::Error
+            } else {
+                ToolRunState::Done
+            };
+            existing.output = output.content.clone();
+        } else {
+            self.entries
+                .push(TranscriptEntry::tool_completed(call, output));
+        }
+        self.auto_scroll = true;
+    }
+
+    /// Appends streamed assistant tokens cleanly into the trailing [`TranscriptEntry::AssistantTurn`].
+    pub fn append_stream_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.streaming_active
+            && let Some(TranscriptEntry::AssistantTurn(buf)) = self.entries.last_mut()
+        {
+            buf.push_str(delta);
+        } else {
+            self.entries
+                .push(TranscriptEntry::AssistantTurn(delta.to_owned()));
+            self.streaming_active = true;
+        }
         self.auto_scroll = true;
     }
 
@@ -245,6 +384,57 @@ impl AppState {
     pub fn take_input(&mut self) -> String {
         self.slash_selected = 0;
         std::mem::take(&mut self.input)
+    }
+
+    /// Opens the interactive `/model` selector populated from server models.
+    pub fn open_model_picker(
+        &mut self,
+        items: Vec<AvailableModel>,
+        provider_kind: ProviderKind,
+        current_model: &str,
+    ) {
+        let selected = items
+            .iter()
+            .position(|m| current_model.ends_with(&m.id))
+            .unwrap_or(0);
+        self.pending_model_picker = Some(PendingModelPicker {
+            items,
+            selected,
+            provider_kind,
+        });
+    }
+
+    /// Returns any active interactive `/model` picker state.
+    #[must_use]
+    pub fn pending_model_picker(&self) -> Option<&PendingModelPicker> {
+        self.pending_model_picker.as_ref()
+    }
+
+    /// Moves selection up/down inside the interactive `/model` picker with wrap-around.
+    pub fn move_model_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.pending_model_picker else {
+            return;
+        };
+        let count = picker.items.len();
+        if count == 0 {
+            picker.selected = 0;
+            return;
+        }
+        let len = isize::try_from(count).unwrap_or(1);
+        let current = isize::try_from(picker.selected.min(count - 1)).unwrap_or(0);
+        picker.selected = usize::try_from((current + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Closes the interactive `/model` picker and returns the chosen `(ProviderKind, AvailableModel)`.
+    pub fn take_selected_model(&mut self) -> Option<(ProviderKind, AvailableModel)> {
+        let picker = self.pending_model_picker.take()?;
+        let chosen = picker.items.into_iter().nth(picker.selected)?;
+        Some((picker.provider_kind, chosen))
+    }
+
+    /// Dismisses the interactive `/model` picker without making changes.
+    pub fn clear_model_picker(&mut self) {
+        self.pending_model_picker = None;
     }
 
     /// Sets or clears an interactive 4-option approval prompt from the policy layer.
@@ -328,47 +518,41 @@ impl AppState {
         Some(ApprovalDecision { action, feedback })
     }
 
-    /// Marks whether a background model turn is currently running.
+    /// Marks whether a background model turn, login, or compaction is running.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if !busy {
             self.streaming_active = false;
+            self.busy_status = "Thinking…".to_owned();
         }
     }
 
-    /// Returns `true` while a turn or compaction is running in the background.
+    /// Updates the concise status label next to the animated busy spinner.
+    pub fn set_busy_status(&mut self, status: impl Into<String>) {
+        self.busy_status = status.into();
+    }
+
+    /// Returns the active busy status message (`Thinking…`, `Running bash…`).
+    #[must_use]
+    pub fn busy_status(&self) -> &str {
+        &self.busy_status
+    }
+
+    /// Advances the animated spinner frame counter while waiting on background work.
+    pub fn advance_spinner(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// Returns the current spinner animation frame index.
+    #[must_use]
+    pub fn spinner_tick(&self) -> usize {
+        self.spinner_tick
+    }
+
+    /// Returns `true` while a turn, login, or compaction is running in the background.
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy
-    }
-
-    /// Appends a standalone line to the transcript (user prompt, tool status, or error).
-    pub fn push_line(&mut self, line: impl Into<String>) {
-        self.streaming_active = false;
-        self.transcript.push(line.into());
-        self.auto_scroll = true;
-    }
-
-    /// Appends streamed assistant tokens cleanly, handling embedded newlines.
-    pub fn append_stream_delta(&mut self, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        let mut parts = delta.split('\n');
-        if let Some(first) = parts.next() {
-            if self.streaming_active
-                && let Some(last) = self.transcript.last_mut()
-            {
-                last.push_str(first);
-            } else {
-                self.transcript.push(first.to_owned());
-                self.streaming_active = true;
-            }
-        }
-        for rest in parts {
-            self.transcript.push(rest.to_owned());
-        }
-        self.auto_scroll = true;
     }
 
     /// Returns the effective vertical scroll offset against `max_scroll`.

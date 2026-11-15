@@ -1,11 +1,11 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Crossterm raw-mode guard, slash command dispatcher, and non-blocking Ratatui loop
+// Purpose: Crossterm raw-mode guard, slash & /model dispatcher, Ctrl+O toggle, and non-blocking Ratatui loop
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -15,7 +15,9 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use rein_core::{MemoryScope, ModeId, Provider, login_with_browser_until};
+use rein_core::{
+    MemoryScope, ModeId, Provider, ToolCall, ToolOutput, UsageStats, login_with_browser_until,
+};
 
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
@@ -23,7 +25,7 @@ use crate::agent::{
 use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
 use crate::config::{
     ProviderKind, ReinConfig, ReinPaths, apply_provider_switch, build_provider,
-    save_provider_selection,
+    resolve_model_target, save_provider_selection,
 };
 use crate::ui::view::{compute_max_scroll, header_height};
 use crate::ui::{AppState, render_frame};
@@ -55,7 +57,10 @@ impl Drop for TerminalGuard {
 
 enum WorkerEvent {
     Delta(String),
-    ToolStatus(String),
+    ToolStart(ToolCall),
+    ToolFinish(ToolCall, ToolOutput),
+    Usage(UsageStats),
+    Quota(u8),
     AskConfirm(ApprovalRequest),
     Note(String),
     Finished(Result<()>),
@@ -79,8 +84,18 @@ impl ApprovalPrompter for ChannelPrompter {
         let _ = self.tx.send(WorkerEvent::Delta(delta.to_owned()));
     }
 
-    fn on_tool_status(&mut self, status: &str) {
-        let _ = self.tx.send(WorkerEvent::ToolStatus(status.to_owned()));
+    fn on_tool_start(&mut self, call: &ToolCall) {
+        let _ = self.tx.send(WorkerEvent::ToolStart(call.clone()));
+    }
+
+    fn on_tool_finish(&mut self, call: &ToolCall, output: &ToolOutput) {
+        let _ = self
+            .tx
+            .send(WorkerEvent::ToolFinish(call.clone(), output.clone()));
+    }
+
+    fn on_usage(&mut self, usage: UsageStats) {
+        let _ = self.tx.send(WorkerEvent::Usage(usage));
     }
 }
 
@@ -116,9 +131,20 @@ fn handle_idle_key(
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
-    if is_quit_key(key) {
+    if is_ctrl_c(key) {
         return Ok(true);
     }
+    if is_ctrl_o(key) {
+        let _ = app.toggle_expand_outputs();
+        return Ok(false);
+    }
+    if app.pending_model_picker().is_some() {
+        return handle_model_picker_key(key, provider, config, paths, app);
+    }
+    if key.code == KeyCode::Esc {
+        return Ok(true);
+    }
+
     let slash_open = !app.slash_matches().is_empty();
     match key.code {
         KeyCode::Tab if slash_open => {
@@ -140,6 +166,35 @@ fn handle_idle_key(
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
         KeyCode::Enter => return handle_enter(agent, provider, config, paths, app, guard),
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_model_picker_key(
+    key: KeyEvent,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => app.clear_model_picker(),
+        KeyCode::Up => app.move_model_selection(-1),
+        KeyCode::Down => app.move_model_selection(1),
+        KeyCode::Enter => {
+            if let Some((kind, chosen)) = app.take_selected_model() {
+                switch_and_persist_provider(
+                    provider,
+                    config,
+                    paths,
+                    app,
+                    kind,
+                    Some(&chosen.id),
+                    chosen.quota_percent,
+                );
+            }
+        }
         _ => {}
     }
     Ok(false)
@@ -200,7 +255,7 @@ fn dispatch_slash(
     let registry = app.slash_registry().clone();
     match registry.resolve(raw) {
         SlashResolution::Unknown(name) => {
-            app.push_line(format!("! unknown command: /{name} (try /help)"));
+            app.push_error_note(format!("unknown command: /{name} (try /help)"));
             Ok(false)
         }
         SlashResolution::Matched { command, args } => match &command.kind {
@@ -247,13 +302,14 @@ fn run_builtin_action(
                 .all()
                 .iter()
                 .map(|c| match c.source.badge() {
-                    Some(b) => format!("· /{:<14} {} ({b})", c.name, c.description),
-                    None => format!("· /{:<14} {}", c.name, c.description),
+                    Some(b) => format!("/{:<14} {} ({b})", c.name, c.description),
+                    None => format!("/{:<14} {}", c.name, c.description),
                 })
                 .collect();
             for line in lines {
-                app.push_line(line);
+                app.push_system_note(line);
             }
+            app.push_system_note("shortcuts: ctrl+o expand/collapse · tab mode · esc quit");
         }
         BuiltinAction::Mode => run_mode_command(args, agent, app)?,
         BuiltinAction::Compact => {
@@ -262,23 +318,81 @@ fn run_builtin_action(
         BuiltinAction::Memory => run_memory_command(args, agent, app)?,
         BuiltinAction::Commands => {
             if app.configured_commands().is_empty() {
-                app.push_line("· commands.json allowlist: (none)");
+                app.push_system_note("commands.json allowlist: (none)");
             } else {
-                app.push_line(format!(
-                    "· commands.json allowlist: {}",
+                app.push_system_note(format!(
+                    "commands.json allowlist: {}",
                     app.configured_commands().join(", ")
                 ));
             }
         }
         BuiltinAction::Mcp => run_mcp_command(agent, app),
         BuiltinAction::Login => return run_login_background(provider, config, paths, app, guard),
+        BuiltinAction::Model => {
+            return run_model_command(args, provider, config, paths, app, guard);
+        }
         BuiltinAction::Provider => run_provider_command(args, provider, config, paths, app)?,
         BuiltinAction::Resume => {
-            let lines = agent.hydrate_from_log()?;
+            let items = agent.hydrate_structured()?;
             app.clear_transcript();
-            app.extend_transcript(lines);
+            app.extend_hydrated(items);
             app.set_active_profile(agent.active_profile().clone());
         }
+    }
+    Ok(false)
+}
+
+fn run_model_command(
+    args: &str,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+    guard: &mut TerminalGuard,
+) -> Result<bool> {
+    let trimmed = args.trim();
+    let target_kind = if trimmed.is_empty() {
+        Some(config.resolved_provider())
+    } else {
+        ProviderKind::parse(trimmed)
+    };
+
+    if let Some(kind) = target_kind {
+        app.set_busy_status("Fetching models…");
+        app.set_busy(true);
+        guard.terminal.draw(|f| render_frame(app, f))?;
+        let fetched = if kind == config.resolved_provider() {
+            provider.list_models()
+        } else {
+            let (mut probe, _) = build_provider(kind, config);
+            probe.list_models()
+        };
+        app.set_busy(false);
+
+        match fetched {
+            Ok(models) if !models.is_empty() => {
+                if kind == config.resolved_provider() {
+                    app.set_model_quota(provider.active_model_quota());
+                }
+                let current_model = app.model_name().to_owned();
+                app.open_model_picker(models, kind, &current_model);
+            }
+            Ok(_) => {
+                app.push_system_note("server returned no models; pass `/model <id>` directly");
+            }
+            Err(err) => {
+                app.push_error_note(format!("failed to fetch models from server: {err}"));
+            }
+        }
+        return Ok(false);
+    }
+
+    let (kind, model_id) = resolve_model_target(config, trimmed);
+    switch_and_persist_provider(provider, config, paths, app, kind, Some(&model_id), None);
+    if let Ok(models) = provider.list_models()
+        && let Some(matched) = models.iter().find(|m| m.id == model_id)
+    {
+        app.set_model_quota(matched.quota_percent);
     }
     Ok(false)
 }
@@ -292,21 +406,34 @@ fn run_provider_command(
 ) -> Result<()> {
     let mut parts = args.split_whitespace();
     let Some(first) = parts.next() else {
-        app.push_line(format!("· provider: {}", app.model_name()));
+        app.push_system_note(format!("provider: {}", app.model_name()));
         return Ok(());
     };
     let explicit_model = parts.next();
     let Some(kind) = ProviderKind::parse(first) else {
-        app.push_line("! usage: /provider [anthropic|antigravity] [model]");
+        app.push_error_note("usage: /provider [anthropic|antigravity] [model]");
         return Ok(());
     };
+    switch_and_persist_provider(provider, config, paths, app, kind, explicit_model, None);
+    Ok(())
+}
+
+fn switch_and_persist_provider(
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+    kind: ProviderKind,
+    explicit_model: Option<&str>,
+    quota: Option<u8>,
+) {
     apply_provider_switch(config, kind, explicit_model);
     let (next_provider, label) = build_provider(kind, config);
     *provider = next_provider;
     app.set_model_name(&label);
+    app.set_model_quota(quota);
     let _ = save_provider_selection(&paths.global_config, kind, config.model.as_deref());
-    app.push_line(format!("· switched provider: {label}"));
-    Ok(())
+    app.push_system_note(format!("switched model: {label}"));
 }
 
 fn run_login_background(
@@ -320,7 +447,8 @@ fn run_login_background(
         .antigravity_token_path
         .clone()
         .unwrap_or_else(|| paths.global_dir.join("antigravity-oauth.json"));
-    app.push_line("· launching Google Antigravity OAuth login in browser…");
+    app.push_system_note("launching Google Antigravity OAuth login in browser…");
+    app.set_busy_status("Waiting for OAuth login…");
     app.set_busy(true);
     guard.terminal.draw(|f| render_frame(app, f))?;
 
@@ -328,6 +456,7 @@ fn run_login_background(
     let cancel = AtomicBool::new(false);
     let login_ok = AtomicBool::new(false);
     let mut should_quit = false;
+    let mut last_spin = Instant::now();
 
     std::thread::scope(|scope| {
         let cancel_ref = &cancel;
@@ -339,7 +468,7 @@ fn run_login_background(
                 token_path_ref,
                 |url| {
                     let _ = ev_tx_worker.send(WorkerEvent::Note(format!(
-                        "· open URL if browser did not open: {url}"
+                        "open URL if browser did not open: {url}"
                     )));
                 },
                 cancel_ref,
@@ -348,7 +477,7 @@ fn run_login_background(
                 Ok(info) => {
                     let who = info.email.as_deref().unwrap_or("authenticated account");
                     let _ = ev_tx_worker.send(WorkerEvent::Note(format!(
-                        "· signed in as {who} (saved {})",
+                        "signed in as {who} (saved {})",
                         info.token_path.display()
                     )));
                     Ok(true)
@@ -368,19 +497,23 @@ fn run_login_background(
 
         while app.is_busy() {
             drain_worker_events(&ev_rx, app);
+            tick_spinner(&mut last_spin, app);
             let _ = guard.terminal.draw(|f| render_frame(app, f));
             if !app.is_busy() {
                 break;
             }
             if event::poll(Duration::from_millis(25)).unwrap_or(false)
                 && let Ok(Event::Key(key)) = event::read()
-                && is_quit_key(key)
             {
-                cancel.store(true, Ordering::Relaxed);
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    should_quit = true;
+                if is_ctrl_o(key) {
+                    let _ = app.toggle_expand_outputs();
+                } else if is_quit_key(key) {
+                    cancel.store(true, Ordering::Relaxed);
+                    if is_ctrl_c(key) {
+                        should_quit = true;
+                    }
+                    break;
                 }
-                break;
             }
         }
     });
@@ -388,11 +521,14 @@ fn run_login_background(
     app.set_busy(false);
     if login_ok.load(Ordering::Relaxed) {
         apply_provider_switch(config, ProviderKind::Antigravity, None);
-        let (next_provider, label) = build_provider(ProviderKind::Antigravity, config);
+        let (mut next_provider, label) = build_provider(ProviderKind::Antigravity, config);
+        let _ = next_provider.list_models();
+        let quota = next_provider.active_model_quota();
         *provider = next_provider;
         app.set_model_name(&label);
+        app.set_model_quota(quota);
         let _ = save_provider_selection(&paths.global_config, ProviderKind::Antigravity, None);
-        app.push_line(format!("· active provider: {label}"));
+        app.push_system_note(format!("active provider: {label}"));
     }
     Ok(should_quit)
 }
@@ -403,12 +539,12 @@ fn run_mode_command(args: &str, agent: &mut AgentLoop, app: &mut AppState) -> Re
         "coding" | "code" => agent.set_mode(ModeId::Coding)?,
         "personal" => agent.set_mode(ModeId::Personal)?,
         other => {
-            app.push_line(format!("! unknown mode '{other}' (use coding or personal)"));
+            app.push_error_note(format!("unknown mode '{other}' (use coding or personal)"));
             return Ok(());
         }
     };
     app.set_active_profile(agent.active_profile().clone());
-    app.push_line(format!("· mode: {mode:?}"));
+    app.push_system_note(format!("mode: {mode:?}"));
     Ok(())
 }
 
@@ -428,30 +564,30 @@ fn run_memory_command(args: &str, agent: &AgentLoop, app: &mut AppState) -> Resu
     for scope in scopes {
         for rec in agent.query_memory(scope, query)? {
             found += 1;
-            app.push_line(format!("· [{:?}] {}: {}", rec.scope, rec.key, rec.value));
+            app.push_system_note(format!("[{:?}] {}: {}", rec.scope, rec.key, rec.value));
         }
     }
     if found == 0 {
-        app.push_line("· memory: (no matching records)");
+        app.push_system_note("memory: (no matching records)");
     }
     Ok(())
 }
 
 fn run_mcp_command(agent: &AgentLoop, app: &mut AppState) {
     if app.mcp_servers().is_empty() {
-        app.push_line("· mcp servers: (none configured)");
+        app.push_system_note("mcp servers: (none configured)");
     } else {
         let server_lines: Vec<String> = app
             .mcp_servers()
             .iter()
-            .map(|srv| format!("· mcp {}: {} {}", srv.name, srv.command, srv.args.join(" ")))
+            .map(|srv| format!("mcp {}: {} {}", srv.name, srv.command, srv.args.join(" ")))
             .collect();
         for line in server_lines {
-            app.push_line(line);
+            app.push_system_note(line);
         }
     }
-    app.push_line(format!(
-        "· active tools: {}",
+    app.push_system_note(format!(
+        "active tools: {}",
         agent.active_profile().allowed_tools.join(", ")
     ));
 }
@@ -464,18 +600,20 @@ fn compact_background(
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
     let focus = (!args.trim().is_empty()).then(|| args.trim().to_owned());
-    app.push_line("· compacting conversation via provider…");
+    app.push_system_note("compacting conversation via provider…");
+    app.set_busy_status("Compacting…");
     app.set_busy(true);
     guard.terminal.draw(|f| render_frame(app, f))?;
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
     let mut should_quit = false;
+    let mut last_spin = Instant::now();
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let outcome = match agent.compact_with_provider(focus.as_deref(), provider) {
                 Ok(msg) => {
-                    let _ = ev_tx.send(WorkerEvent::Note(format!("· {msg}")));
+                    let _ = ev_tx.send(WorkerEvent::Note(msg));
                     Ok(())
                 }
                 Err(err) => Err(err),
@@ -485,16 +623,20 @@ fn compact_background(
 
         while app.is_busy() {
             drain_worker_events(&ev_rx, app);
+            tick_spinner(&mut last_spin, app);
             let _ = guard.terminal.draw(|f| render_frame(app, f));
             if !app.is_busy() {
                 break;
             }
             if event::poll(Duration::from_millis(16)).unwrap_or(false)
                 && let Ok(Event::Key(key)) = event::read()
-                && is_quit_key(key)
             {
-                should_quit = true;
-                break;
+                if is_ctrl_o(key) {
+                    let _ = app.toggle_expand_outputs();
+                } else if is_quit_key(key) {
+                    should_quit = true;
+                    break;
+                }
             }
         }
     });
@@ -511,13 +653,15 @@ fn stream_prompt_background(
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
-    app.push_line(format!("❯ {display_label}"));
+    app.push_user_turn(display_label);
+    app.set_busy_status("Thinking…");
     app.set_busy(true);
     guard.terminal.draw(|f| render_frame(app, f))?;
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
     let mut should_quit = false;
+    let mut last_spin = Instant::now();
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -528,11 +672,15 @@ fn stream_prompt_background(
             let res = agent
                 .run_user_prompt(&prompt_for_model, provider, &mut prompter)
                 .map(|_| ());
+            if let Some(quota) = provider.active_model_quota() {
+                let _ = ev_tx.send(WorkerEvent::Quota(quota));
+            }
             let _ = ev_tx.send(WorkerEvent::Finished(res));
         });
 
         while app.is_busy() {
             drain_worker_events(&ev_rx, app);
+            tick_spinner(&mut last_spin, app);
             let _ = guard.terminal.draw(|f| render_frame(app, f));
             if !app.is_busy() {
                 break;
@@ -556,16 +704,26 @@ fn stream_prompt_background(
     Ok(should_quit)
 }
 
+fn tick_spinner(last_spin: &mut Instant, app: &mut AppState) {
+    if last_spin.elapsed() >= Duration::from_millis(110) {
+        app.advance_spinner();
+        *last_spin = Instant::now();
+    }
+}
+
 fn drain_worker_events(ev_rx: &Receiver<WorkerEvent>, app: &mut AppState) {
     while let Ok(ev) = ev_rx.try_recv() {
         match ev {
             WorkerEvent::Delta(delta) => app.append_stream_delta(&delta),
-            WorkerEvent::ToolStatus(status) => app.push_line(status),
+            WorkerEvent::ToolStart(call) => app.push_tool_running(&call),
+            WorkerEvent::ToolFinish(call, output) => app.finish_tool_entry(&call, &output),
+            WorkerEvent::Usage(usage) => app.record_usage(usage),
+            WorkerEvent::Quota(quota) => app.set_model_quota(Some(quota)),
             WorkerEvent::AskConfirm(req) => app.set_pending_approval(Some(req)),
-            WorkerEvent::Note(note) => app.push_line(note),
+            WorkerEvent::Note(note) => app.push_system_note(note),
             WorkerEvent::Finished(res) => {
                 if let Err(err) = res {
-                    app.push_line(format!("! {err}"));
+                    app.push_error_note(err.to_string());
                 }
                 app.set_busy(false);
             }
@@ -579,9 +737,12 @@ fn handle_streaming_key(
     guard: &mut TerminalGuard,
     ans_tx: &Sender<ApprovalDecision>,
 ) -> bool {
-    let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-    if ctrl_c {
+    if is_ctrl_c(key) {
         return true;
+    }
+    if is_ctrl_o(key) {
+        let _ = app.toggle_expand_outputs();
+        return false;
     }
 
     if let Some(pending) = app.pending_approval() {
@@ -638,7 +799,7 @@ fn handle_streaming_key(
         return false;
     }
 
-    if is_quit_key(key) {
+    if key.code == KeyCode::Esc {
         return true;
     }
     match key.code {
@@ -647,6 +808,12 @@ fn handle_streaming_key(
         }
         KeyCode::Down => {
             let _ = scroll_app(app, guard, 1);
+        }
+        KeyCode::PageUp => {
+            let _ = scroll_app(app, guard, -8);
+        }
+        KeyCode::PageDown => {
+            let _ = scroll_app(app, guard, 8);
         }
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
@@ -658,13 +825,20 @@ fn handle_streaming_key(
 fn scroll_app(app: &mut AppState, guard: &TerminalGuard, delta: i16) -> Result<()> {
     let size = guard.terminal.size()?;
     let hdr_rows = header_height(app, size.height);
-    let transcript_height = size.height.saturating_sub(hdr_rows + 4);
-    let max_scroll = compute_max_scroll(app.transcript(), size.width, transcript_height);
+    let transcript_height = size.height.saturating_sub(hdr_rows + 5);
+    let max_scroll = compute_max_scroll(app, size.width, transcript_height);
     app.scroll_by(delta, max_scroll);
     Ok(())
 }
 
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_o(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn is_quit_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    key.code == KeyCode::Esc || is_ctrl_c(key)
 }

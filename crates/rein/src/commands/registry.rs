@@ -46,6 +46,8 @@ pub enum BuiltinAction {
     Mcp,
     /// Authenticates directly with Antigravity via browser OAuth 2.0.
     Login,
+    /// Displays interactive model picker or switches model (`[provider/model|model]`).
+    Model,
     /// Displays or switches the active model provider (`[anthropic|antigravity] [model]`).
     Provider,
     /// Hydrates `.rein/session.jsonl` into the current session.
@@ -174,6 +176,11 @@ impl SlashRegistry {
                 BuiltinAction::Login,
             ),
             builtin(
+                "model",
+                "Select or switch active model ([model|provider/model])",
+                BuiltinAction::Model,
+            ),
+            builtin(
                 "provider",
                 "Show or switch provider/model ([anthropic|antigravity] [model])",
                 BuiltinAction::Provider,
@@ -277,7 +284,9 @@ mod tests {
             .collect();
         assert_eq!(
             m_hits,
-            vec!["mode", "memory", "mcp", "compact", "commands", "resume"]
+            vec![
+                "mode", "memory", "mcp", "model", "compact", "commands", "resume"
+            ]
         );
         assert!(reg.matching("/mode coding").is_empty());
 

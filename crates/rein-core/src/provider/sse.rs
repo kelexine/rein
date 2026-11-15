@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::event::CoreError;
 use crate::message::ToolCall;
-use crate::provider::ProviderStreamEvent;
+use crate::provider::{ProviderStreamEvent, UsageStats};
 
 #[derive(Debug, Clone)]
 struct PendingToolBlock {
@@ -22,6 +22,7 @@ struct PendingToolBlock {
 #[derive(Debug, Default)]
 pub struct SseEventAccumulator {
     pending_tools: BTreeMap<usize, PendingToolBlock>,
+    pending_input_tokens: u64,
 }
 
 impl SseEventAccumulator {
@@ -60,12 +61,39 @@ impl SseEventAccumulator {
         let val: Value = serde_json::from_str(json_payload)?;
         let kind = val.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
+            "message_start" => {
+                if let Some(input) = val
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.pending_input_tokens = input;
+                }
+                Ok(Vec::new())
+            }
             "content_block_start" => {
                 self.handle_block_start(&val);
                 Ok(Vec::new())
             }
             "content_block_delta" => Ok(self.handle_block_delta(&val)),
             "content_block_stop" => self.handle_block_stop(&val),
+            "message_delta" => {
+                let Some(usage) = val.get("usage") else {
+                    return Ok(Vec::new());
+                };
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.pending_input_tokens);
+                let output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                Ok(vec![ProviderStreamEvent::Usage(UsageStats {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens.saturating_add(output_tokens),
+                })])
+            }
             "message_stop" => Ok(vec![ProviderStreamEvent::Done]),
             "error" => {
                 let msg = val

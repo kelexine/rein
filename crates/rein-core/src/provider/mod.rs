@@ -29,4 +29,4 @@ pub use antigravity_auth::{
 };
 pub use replay::ReplayProvider;
 pub use sse::SseEventAccumulator;
-pub use traits::{Provider, ProviderStreamEvent, ToolSpec};
+pub use traits::{AvailableModel, Provider, ProviderStreamEvent, ToolSpec, UsageStats};
