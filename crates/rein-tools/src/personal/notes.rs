@@ -85,7 +85,7 @@ impl Tool for NotesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "notes".to_owned(),
-            description: "List, search, or append personal notes in JSONL format".to_owned(),
+            description: "List, search, or append personal notes in JSONL format (action='add' takes title, body, and optional tags).".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["action"],

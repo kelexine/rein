@@ -140,7 +140,7 @@ impl Tool for EmailTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "email".to_owned(),
-            description: "Read inbox, stage a draft, or send email behind explicit user permission"
+            description: "Read inbox, stage a draft, or send email behind explicit user permission. Always obtain explicit confirmation before calling action='send'."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",

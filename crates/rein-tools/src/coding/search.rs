@@ -34,7 +34,7 @@ impl Tool for GlobTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "glob".to_owned(),
-            description: "List workspace files matching a filename/extension pattern (e.g. '*.rs', 'Cargo.toml')".to_owned(),
+            description: "List workspace files matching a filename/extension pattern (e.g. '*.rs', 'Cargo.toml'). Prefer this over bash find/ls.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],
@@ -87,7 +87,7 @@ impl Tool for GrepTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "grep".to_owned(),
-            description: "Search UTF-8 workspace files for lines containing a query string"
+            description: "Search UTF-8 workspace files for lines containing a literal query string. Prefer this over bash grep/rg for fast workspace text lookup."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",

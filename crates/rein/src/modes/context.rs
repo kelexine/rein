@@ -6,7 +6,7 @@ use rein_core::{MemoryScope, Message, Role};
 use rein_tools::{JsonlMemoryStore, ToolError, ToolRegistry, ToolSchema};
 use serde::{Deserialize, Serialize};
 
-use crate::modes::Profile;
+use crate::modes::{Profile, RuntimeContext, prompts};
 
 /// Marker appended when a tool output is truncated to fit the context budget.
 pub const TRUNCATION_MARKER: &str = "\n…[truncated by rein context strategy]";
@@ -70,13 +70,25 @@ pub struct AssembledContext {
 pub struct ContextBuilder<'a> {
     profile: &'a Profile,
     memory: &'a JsonlMemoryStore,
+    runtime: Option<&'a RuntimeContext>,
 }
 
 impl<'a> ContextBuilder<'a> {
     /// Creates a [`ContextBuilder`] for `profile` reading memory from `memory`.
     #[must_use]
     pub fn new(profile: &'a Profile, memory: &'a JsonlMemoryStore) -> Self {
-        Self { profile, memory }
+        Self {
+            profile,
+            memory,
+            runtime: None,
+        }
+    }
+
+    /// Attaches dynamic runtime metadata (workspace, sandbox, date, skills) to the system prompt.
+    #[must_use]
+    pub fn with_runtime_context(mut self, runtime: &'a RuntimeContext) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// Assembles the system prompt, windowed history, and profile-scoped tool schemas.
@@ -86,11 +98,14 @@ impl<'a> ContextBuilder<'a> {
         registry: &ToolRegistry,
     ) -> Result<AssembledContext, ToolError> {
         let strategy = &self.profile.context_strategy;
-        let system_prompt = if strategy.inject_scoped_memory {
-            self.system_prompt_with_memory()?
-        } else {
-            self.profile.system_prompt.clone()
-        };
+        let mut system_prompt = self.profile.system_prompt.clone();
+        if let Some(runtime) = self.runtime {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&prompts::format_runtime_context(self.profile, runtime));
+        }
+        if strategy.inject_scoped_memory {
+            self.append_scoped_memory(&mut system_prompt)?;
+        }
         Ok(AssembledContext {
             system_prompt,
             messages: window_history(history, strategy),
@@ -98,14 +113,16 @@ impl<'a> ContextBuilder<'a> {
         })
     }
 
-    fn system_prompt_with_memory(&self) -> Result<String, ToolError> {
-        let mut prompt = self.profile.system_prompt.clone();
+    fn append_scoped_memory(&self, prompt: &mut String) -> Result<(), ToolError> {
         for scope in &self.profile.readable_memory_scopes {
             let records = self.memory.query(*scope, "")?;
             if records.is_empty() {
                 continue;
             }
-            prompt.push_str(&format!("\n\n## {} memory\n", scope_label(*scope)));
+            prompt.push_str(&format!(
+                "\n\n## {} memory (recalled background context)\n",
+                scope_label(*scope)
+            ));
             let skip = records
                 .len()
                 .saturating_sub(self.profile.context_strategy.max_memory_records);
@@ -113,7 +130,7 @@ impl<'a> ContextBuilder<'a> {
                 prompt.push_str(&format!("- {}: {}\n", record.key, record.value));
             }
         }
-        Ok(prompt)
+        Ok(())
     }
 }
 
@@ -276,5 +293,45 @@ mod tests {
         assert!(!plan.allows_tool("notes"));
         assert!(!plan.allows_tool("calendar"));
         assert!(!plan.allows_tool("email"));
+    }
+
+    #[test]
+    fn context_builder_appends_runtime_environment_and_labels_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_context_runtime_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let memory = JsonlMemoryStore::new(dir.join("memory.jsonl"));
+        memory.append(&MemoryRecord {
+            scope: MemoryScope::Project,
+            key: "crate".to_owned(),
+            value: "rein".to_owned(),
+        })?;
+        let registry = ToolRegistry::new();
+        let coding = Profile::coding();
+        let runtime = RuntimeContext::new()
+            .with_workspace_label("~/dev/rein")
+            .with_sandbox_label("landlock v11")
+            .with_current_date("2026-11-15")
+            .with_skill_names(vec!["rust-audit".to_owned()]);
+
+        let ctx = ContextBuilder::new(&coding, &memory)
+            .with_runtime_context(&runtime)
+            .build(&[], &registry)?;
+
+        assert!(ctx.system_prompt.contains("## Runtime Environment"));
+        assert!(ctx.system_prompt.contains("- Workspace: ~/dev/rein"));
+        assert!(ctx.system_prompt.contains("- Sandbox: landlock v11"));
+        assert!(ctx.system_prompt.contains("- Date (UTC): 2026-11-15"));
+        assert!(ctx.system_prompt.contains("/rust-audit"));
+        assert!(
+            ctx.system_prompt
+                .contains("## Project memory (recalled background context)")
+        );
+        assert!(ctx.system_prompt.contains("crate: rein"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

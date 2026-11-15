@@ -42,7 +42,7 @@ impl Tool for BashTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "bash".to_owned(),
-            description: "Execute a bash command inside the Linux Landlock sandbox (accepts either 'command' string run via bash -c or 'program' + 'args', streams full output to a log file, no timeouts)".to_owned(),
+            description: "Execute a bash command inside the Linux Landlock sandbox (accepts either 'command' via bash -c or 'program' + 'args', streams output with no fixed timeout). Use read/glob/grep for file inspection and bash for builds, tests, and git.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

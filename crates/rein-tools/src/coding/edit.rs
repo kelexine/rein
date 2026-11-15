@@ -28,7 +28,7 @@ impl Tool for EditTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "edit".to_owned(),
-            description: "Replace an exact string occurrence inside a workspace file".to_owned(),
+            description: "Replace an exact unique string occurrence inside an existing workspace file. Inspect the file with read first so old_text matches verbatim.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "old_text", "new_text"],

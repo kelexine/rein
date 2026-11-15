@@ -34,12 +34,13 @@ use rein_tools::{
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
 };
+use crate::commands::SlashKind;
 use crate::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
     generate_session_uid, list_sessions, provider_startup_notice, resolve_resume_session,
     save_provider_selection, write_latest_session_uid,
 };
-use crate::modes::Profile;
+use crate::modes::{Profile, RuntimeContext, utc_today_iso};
 use crate::ui::{AppState, run_tui};
 
 struct HeadlessDenier;
@@ -213,15 +214,28 @@ fn run_interactive(
     }
 
     let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
+    let skill_names: Vec<String> = slash_registry
+        .all()
+        .iter()
+        .filter(|entry| matches!(entry.kind, SlashKind::Skill { .. }))
+        .map(|entry| entry.name.clone())
+        .collect();
+    let workspace_label = collapse_home_path(workspace_root);
+    let runtime_context = RuntimeContext::new()
+        .with_workspace_label(&workspace_label)
+        .with_sandbox_label(&sandbox_label)
+        .with_current_date(utc_today_iso())
+        .with_skill_names(skill_names);
     let event_log = EventLog::new(&event_log_path);
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)
         .with_full_transcript_path(&full_transcript_path)
         .with_command_allowlist_paths(&loaded.paths.repo_commands, &loaded.paths.global_commands)
         .with_allowed_commands(loaded.allowed_commands.clone())
-        .with_extra_tools(mcp_tools);
+        .with_extra_tools(mcp_tools)
+        .with_runtime_context(runtime_context);
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
-        .with_workspace_label(collapse_home_path(workspace_root))
+        .with_workspace_label(workspace_label)
         .with_session_id(&session_uid)
         .with_startup_notices(notices)
         .with_slash_registry(slash_registry)

@@ -28,7 +28,7 @@ impl Tool for WriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "write".to_owned(),
-            description: "Write a file inside the workspace sandbox (rejects protected .git/.vscode/.rein paths)".to_owned(),
+            description: "Create or overwrite a file inside the workspace sandbox (rejects protected .git/.vscode/.rein paths). Prefer edit for modifying existing files.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "content"],

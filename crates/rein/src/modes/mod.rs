@@ -6,9 +6,12 @@
 pub mod context;
 /// Coding and personal profile definitions.
 pub mod profile;
+/// Composable system prompt builders and runtime environment formatting.
+pub mod prompts;
 /// Runtime mode switcher synchronizing policy rules and event logs.
 pub mod switcher;
 
 pub use context::{AssembledContext, ContextBuilder, ContextStrategy};
 pub use profile::Profile;
+pub use prompts::{RuntimeContext, utc_today_iso};
 pub use switcher::ModeManager;

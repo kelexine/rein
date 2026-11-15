@@ -30,9 +30,7 @@ impl Tool for ReadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read".to_owned(),
-            description:
-                "Read a UTF-8 file inside the workspace sandbox with optional 1-based line bounds"
-                    .to_owned(),
+            description: "Read a UTF-8 file inside the workspace sandbox with optional 1-based line bounds. Prefer this over bash cat/head/tail for inspecting files.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],

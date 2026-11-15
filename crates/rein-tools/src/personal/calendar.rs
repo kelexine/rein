@@ -152,7 +152,7 @@ impl Tool for CalendarTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "calendar".to_owned(),
-            description: "List, export RFC 5545 .ics, sync external .ics directory, or schedule calendar events".to_owned(),
+            description: "List, export RFC 5545 .ics, sync external .ics directory, or schedule calendar events. Confirm with the user before action='schedule' or 'sync_ics'.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["action"],

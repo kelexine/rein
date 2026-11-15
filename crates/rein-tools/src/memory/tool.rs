@@ -27,7 +27,7 @@ impl Tool for MemoryTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "memory".to_owned(),
-            description: "Read or write scoped JSONL memory (personal or project)".to_owned(),
+            description: "Read or write persistent scoped JSONL memory ('personal' across workspaces or 'project' for this repo). Store durable facts/conventions rather than transient checklists.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["action", "scope", "key"],

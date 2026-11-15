@@ -14,7 +14,7 @@ use rein_policy::{PolicyDecision, PolicyEngine, WorkspaceSandbox, suggest_comman
 use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema, parse_mode_id};
 
 use crate::config::append_allowed_command;
-use crate::modes::{ContextBuilder, ModeManager, Profile};
+use crate::modes::{ContextBuilder, ModeManager, Profile, RuntimeContext};
 
 /// Maximum consecutive tool-execution rounds permitted in a single user turn.
 pub const MAX_TOOL_ROUNDS: usize = 16;
@@ -110,6 +110,7 @@ pub struct AgentLoop {
     history: Vec<Message>,
     allowed_commands: Vec<String>,
     extra_tools: Vec<String>,
+    runtime_context: RuntimeContext,
 }
 
 impl AgentLoop {
@@ -135,7 +136,15 @@ impl AgentLoop {
             history: Vec::new(),
             allowed_commands,
             extra_tools: Vec::new(),
+            runtime_context: RuntimeContext::new(),
         }
+    }
+
+    /// Attaches dynamic runtime metadata injected into assembled turn system prompts.
+    #[must_use]
+    pub fn with_runtime_context(mut self, runtime_context: RuntimeContext) -> Self {
+        self.runtime_context = runtime_context;
+        self
     }
 
     /// Configures persistent CWD (`<workspace>/.rein/commands.json`) and Global (`~/.rein/commands.json`) paths.
@@ -432,6 +441,7 @@ impl AgentLoop {
                 return Err(CoreError::Cancelled.into());
             }
             let assembled = ContextBuilder::new(self.modes.active(), &self.memory)
+                .with_runtime_context(&self.runtime_context)
                 .build(&self.history, &self.registry)
                 .context("failed to assemble turn context")?;
             let specs: Vec<ToolSpec> = assembled.tools.iter().map(schema_to_spec).collect();

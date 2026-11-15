@@ -6,7 +6,7 @@ use rein_core::{MemoryScope, ModeId};
 use rein_policy::PolicyRuleSet;
 use serde::{Deserialize, Serialize};
 
-use crate::modes::ContextStrategy;
+use crate::modes::{ContextStrategy, prompts};
 
 /// Tool names enabled in the Coding profile.
 pub const CODING_TOOLS: &[&str] = &[
@@ -70,12 +70,7 @@ impl Profile {
     pub fn coding() -> Self {
         Self {
             mode: ModeId::Coding,
-            system_prompt:
-                "You are Rein in Coding mode. Work inside the workspace sandbox, prefer \
-                 read-only inspection before edits, use todo_write to track multi-step tasks, \
-                 and keep changes minimal and verified. Only call tools declared in the active \
-                 mode; call switch_mode to transition to `plan` or `personal` mode when needed."
-                    .to_owned(),
+            system_prompt: prompts::build_system_prompt(ModeId::Coding),
             allowed_tools: to_owned_list(CODING_TOOLS),
             policy_rules: PolicyRuleSet::coding_default(),
             readable_memory_scopes: vec![MemoryScope::Project, MemoryScope::Personal],
@@ -89,13 +84,7 @@ impl Profile {
     pub fn plan() -> Self {
         Self {
             mode: ModeId::Plan,
-            system_prompt:
-                "You are Rein in Plan mode. Explore the workspace read-only (`read`, `glob`, \
-                 `grep`, read-only `bash`), analyze architecture and edge cases, use `todo_write` \
-                 to organize tasks, and produce concrete step-by-step plans without modifying \
-                 files. Only call tools declared in the active mode; call `switch_mode` to \
-                 enter `coding` or `personal` mode when ready to make changes."
-                    .to_owned(),
+            system_prompt: prompts::build_system_prompt(ModeId::Plan),
             allowed_tools: to_owned_list(PLAN_TOOLS),
             policy_rules: PolicyRuleSet::plan_default(),
             readable_memory_scopes: vec![MemoryScope::Project, MemoryScope::Personal],
@@ -109,11 +98,7 @@ impl Profile {
     pub fn personal() -> Self {
         Self {
             mode: ModeId::Personal,
-            system_prompt: "You are Rein in Personal mode. Help with notes, calendar, and email. \
-                            Always confirm before sending email or changing calendar events. \
-                            Only call tools declared in the active mode; call `switch_mode` if \
-                            you need `coding` or `plan` mode."
-                .to_owned(),
+            system_prompt: prompts::build_system_prompt(ModeId::Personal),
             allowed_tools: to_owned_list(PERSONAL_TOOLS),
             policy_rules: PolicyRuleSet::personal_default(),
             readable_memory_scopes: vec![MemoryScope::Personal],
