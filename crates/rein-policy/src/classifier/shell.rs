@@ -116,3 +116,36 @@ fn classify_redirection(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_redirections_bash_c_empty_and_unparseable_scripts() {
+        let dev_null = ShellClassifier::classify_script("cargo check 2>/dev/null");
+        assert!(dev_null.is_read_only() || dev_null.effect == EffectLevel::Exec);
+
+        let ls_null = ShellClassifier::classify_script("ls -la > /dev/null");
+        assert_eq!(ls_null.effect, EffectLevel::ReadOnly);
+
+        let dev_tcp = ShellClassifier::classify_script("cat < /dev/null > /dev/tcp/127.0.0.1/80");
+        assert_eq!(dev_tcp.effect, EffectLevel::Network);
+
+        let via_bash = ShellClassifier::classify(
+            "/bin/bash",
+            &["-c".to_owned(), "git status && rg TODO src".to_owned()],
+        );
+        assert_eq!(via_bash.effect, EffectLevel::ReadOnly);
+        assert_eq!(via_bash.target, TargetScope::Workspace);
+
+        let empty = ShellClassifier::classify_script("   ");
+        assert_eq!(empty.effect, EffectLevel::Unknown);
+
+        let unclosed = ShellClassifier::classify_script("echo 'unterminated");
+        assert_eq!(unclosed.effect, EffectLevel::Unknown);
+
+        let dyn_sub = ShellClassifier::classify_script("$(echo ls)");
+        assert_eq!(dyn_sub.effect, EffectLevel::Unknown);
+    }
+}

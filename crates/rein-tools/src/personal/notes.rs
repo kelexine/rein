@@ -198,4 +198,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
+
+    #[test]
+    fn handles_missing_store_default_title_and_invalid_actions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join("rein_notes_tool_edges_test.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let tool = NotesTool::new(&path);
+
+        let empty: Vec<NoteEntry> =
+            serde_json::from_str(&tool.execute(&json!({"action": "list"}))?)?;
+        assert!(empty.is_empty());
+
+        let added: NoteEntry =
+            serde_json::from_str(&tool.execute(&json!({"action": "add", "body": "quick memo"}))?)?;
+        assert_eq!(added.title, "Untitled");
+        assert_eq!(added.body, "quick memo");
+
+        assert!(tool.execute(&json!({"action": "delete"})).is_err());
+        assert!(
+            tool.required_capability(&json!({"action": "unknown"}))
+                .is_err()
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
 }

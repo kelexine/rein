@@ -61,3 +61,57 @@ impl AuditLog {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::capability::AccessMode;
+
+    #[test]
+    fn audit_log_appends_and_deserializes_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_policy_audit_log_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("audit.jsonl");
+        let log = AuditLog::new(&path);
+        assert_eq!(log.path(), path);
+
+        let entry1 = AuditEntry {
+            mode: ModeId::Coding,
+            tool_name: "read".to_owned(),
+            capability: Capability::FileSystem {
+                path: PathBuf::from("Cargo.toml"),
+                mode: AccessMode::Read,
+            },
+            decision: PolicyDecision::Allow {
+                reason: "within workspace".to_owned(),
+            },
+        };
+        let entry2 = AuditEntry {
+            mode: ModeId::Plan,
+            tool_name: "write".to_owned(),
+            capability: Capability::FileSystem {
+                path: PathBuf::from("src/lib.rs"),
+                mode: AccessMode::Write,
+            },
+            decision: PolicyDecision::Deny {
+                reason: "plan mode is read-only".to_owned(),
+            },
+        };
+
+        log.record(&entry1)?;
+        log.record(&entry2)?;
+
+        let raw = std::fs::read_to_string(&path)?;
+        let lines: Vec<AuditEntry> = raw
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines, vec![entry1, entry2]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

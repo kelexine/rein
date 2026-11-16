@@ -480,4 +480,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn vault_supports_read_delete_grep_docs_and_memory_crud()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_dream_vault_crud_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions"))?;
+        std::fs::write(dir.join("README.md"), "# Rein Workspace\n")?;
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(
+            dir.join("sessions/s1.jsonl"),
+            "{\"msg\":\"hit alpha\"}\n{\"msg\":\"miss\"}\n{\"msg\":\"HIT BETA\"}\n",
+        )?;
+
+        let store = JsonlMemoryStore::dual(dir.join("proj.jsonl"), dir.join("pers.jsonl"));
+        let vault = DreamVault::new(
+            dir.join("proj_mem"),
+            dir.join("pers_mem"),
+            dir.join("sessions"),
+            dir.clone(),
+            store,
+        );
+
+        let write_ok = vault.execute(&ToolCall {
+            id: "w1".to_owned(),
+            name: "write_vault".to_owned(),
+            arguments: json!({"scope": "project", "topic": "arch", "content": "typestate"}),
+        });
+        assert!(!write_ok.1);
+
+        let read_ok = vault.execute(&ToolCall {
+            id: "r1".to_owned(),
+            name: "read_vault".to_owned(),
+            arguments: json!({"scope": "project", "topic": "arch"}),
+        });
+        assert!(!read_ok.1);
+        assert_eq!(read_ok.0, "typestate");
+
+        let list_ok = vault.execute(&ToolCall {
+            id: "l1".to_owned(),
+            name: "list_vault".to_owned(),
+            arguments: json!({"scope": "project"}),
+        });
+        assert!(!list_ok.1);
+        assert!(list_ok.0.contains("arch.md"));
+
+        let del_ok = vault.execute(&ToolCall {
+            id: "d1".to_owned(),
+            name: "delete_vault".to_owned(),
+            arguments: json!({"scope": "project", "topic": "arch"}),
+        });
+        assert!(!del_ok.1);
+        assert!(del_ok.0.contains("deleted project/arch.md"));
+
+        let readme = vault.execute(&ToolCall {
+            id: "doc1".to_owned(),
+            name: "read_project_doc".to_owned(),
+            arguments: json!({"filename": "README.md"}),
+        });
+        assert!(!readme.1);
+        assert!(readme.0.contains("Rein Workspace"));
+
+        let blocked_doc = vault.execute(&ToolCall {
+            id: "doc2".to_owned(),
+            name: "read_project_doc".to_owned(),
+            arguments: json!({"filename": "Cargo.toml"}),
+        });
+        assert!(blocked_doc.1);
+
+        let grep_hits = vault.execute(&ToolCall {
+            id: "g1".to_owned(),
+            name: "grep_transcripts".to_owned(),
+            arguments: json!({"query": "hit"}),
+        });
+        assert!(!grep_hits.1);
+        let parsed_hits: Vec<Value> = serde_json::from_str(&grep_hits.0)?;
+        assert_eq!(parsed_hits.len(), 2);
+
+        let oversized_idx = "x".repeat(MAX_INDEX_BYTES + 1);
+        let bad_bytes = vault.execute(&ToolCall {
+            id: "i1".to_owned(),
+            name: "update_index".to_owned(),
+            arguments: json!({"scope": "project", "content": oversized_idx}),
+        });
+        assert!(bad_bytes.1);
+
+        let ok_idx = vault.execute(&ToolCall {
+            id: "i2".to_owned(),
+            name: "update_index".to_owned(),
+            arguments: json!({"scope": "project", "content": "- [arch](arch.md)"}),
+        });
+        assert!(!ok_idx.1);
+
+        let upserted = vault.execute(&ToolCall {
+            id: "m1".to_owned(),
+            name: "memory_upsert".to_owned(),
+            arguments: json!({"scope": "personal", "key": "editor", "value": "helix", "kind": "user"}),
+        });
+        assert!(!upserted.1);
+
+        let listed = vault.execute(&ToolCall {
+            id: "m2".to_owned(),
+            name: "memory_list".to_owned(),
+            arguments: json!({"scope": "personal"}),
+        });
+        assert!(!listed.1);
+        assert!(listed.0.contains("helix"));
+
+        let deleted = vault.execute(&ToolCall {
+            id: "m3".to_owned(),
+            name: "memory_delete".to_owned(),
+            arguments: json!({"scope": "personal", "key": "editor"}),
+        });
+        assert!(!deleted.1);
+        assert!(deleted.0.contains("deleted personal:editor"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

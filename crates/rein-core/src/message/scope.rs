@@ -39,3 +39,37 @@ pub enum Role {
     /// Tool execution output returned to the model.
     Tool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_enums_serialize_and_deserialize_in_snake_case()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(serde_json::to_string(&ModeId::Coding)?, "\"coding\"");
+        assert_eq!(serde_json::to_string(&ModeId::Plan)?, "\"plan\"");
+        assert_eq!(serde_json::to_string(&ModeId::Personal)?, "\"personal\"");
+        assert_eq!(
+            serde_json::from_str::<ModeId>("\"personal\"")?,
+            ModeId::Personal
+        );
+
+        assert_eq!(serde_json::to_string(&MemoryScope::Project)?, "\"project\"");
+        assert_eq!(
+            serde_json::to_string(&MemoryScope::Personal)?,
+            "\"personal\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MemoryScope>("\"project\"")?,
+            MemoryScope::Project
+        );
+
+        assert_eq!(serde_json::to_string(&Role::System)?, "\"system\"");
+        assert_eq!(serde_json::to_string(&Role::User)?, "\"user\"");
+        assert_eq!(serde_json::to_string(&Role::Assistant)?, "\"assistant\"");
+        assert_eq!(serde_json::to_string(&Role::Tool)?, "\"tool\"");
+        assert_eq!(serde_json::from_str::<Role>("\"tool\"")?, Role::Tool);
+        Ok(())
+    }
+}

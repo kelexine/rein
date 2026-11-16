@@ -147,4 +147,37 @@ mod tests {
         assert!(tool.required_capability(&json!({})).is_err());
         Ok(())
     }
+
+    #[test]
+    fn rejects_whitespace_only_command_and_defaults_missing_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sandbox = WorkspaceSandbox::new(std::env::temp_dir());
+        let tool = BashTool::new(sandbox);
+
+        assert!(
+            tool.required_capability(&json!({"command": "   \t\n"}))
+                .is_err()
+        );
+        assert!(tool.required_capability(&json!({"program": ""})).is_err());
+
+        let cap = tool.required_capability(&json!({"program": "pwd"}))?;
+        assert_eq!(
+            cap,
+            Capability::Shell {
+                program: "pwd".to_owned(),
+                args: Vec::new(),
+            }
+        );
+
+        let mixed =
+            tool.required_capability(&json!({"program": "ls", "args": ["-la", 42, "src"]}))?;
+        assert_eq!(
+            mixed,
+            Capability::Shell {
+                program: "ls".to_owned(),
+                args: vec!["-la".to_owned(), "src".to_owned()],
+            }
+        );
+        Ok(())
+    }
 }

@@ -251,4 +251,48 @@ mod tests {
         assert_eq!(events[2], ProviderStreamEvent::Done);
         Ok(())
     }
+
+    #[test]
+    fn handles_crlf_frames_empty_tool_args_and_rejects_bad_tool_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sse = concat!(
+            "event: content_block_start\r\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"todo_read\"}}\r\n\r\n",
+            "event: content_block_stop\r\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\r\n\r\n",
+            "event: ping\r\n",
+            "data: {\"type\":\"ping\"}\r\n\r\n",
+            "event: message_stop\r\n",
+            "data: {\"type\":\"message_stop\"}\r\n\r\n",
+        );
+        let mut acc = SseEventAccumulator::new();
+        let events = acc.read_stream(Cursor::new(sse.as_bytes()), &mut |_| {})?;
+        assert_eq!(
+            events,
+            vec![
+                ProviderStreamEvent::ToolUse(ToolCall {
+                    id: "t1".to_owned(),
+                    name: "todo_read".to_owned(),
+                    arguments: serde_json::json!({}),
+                }),
+                ProviderStreamEvent::Done,
+            ]
+        );
+
+        let bad_sse = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"read\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not-json\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        let mut bad_acc = SseEventAccumulator::new();
+        assert!(
+            bad_acc
+                .read_stream(Cursor::new(bad_sse.as_bytes()), &mut |_| {})
+                .is_err()
+        );
+        Ok(())
+    }
 }

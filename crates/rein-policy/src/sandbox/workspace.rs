@@ -98,4 +98,37 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_for_existing_and_nonexistent_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join("rein_workspace_symlink_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(ws.join("sub"))?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(ws.join("sub/inside.txt"), "safe")?;
+        std::fs::write(outside.join("secret.txt"), "secret")?;
+
+        symlink(&outside, ws.join("escape_link"))?;
+        symlink(ws.join("sub/inside.txt"), ws.join("safe_link.txt"))?;
+
+        let sandbox = WorkspaceSandbox::new(&ws);
+        assert!(matches!(
+            sandbox.resolve_within(Path::new("escape_link/secret.txt")),
+            Err(PolicyError::SandboxEscape { .. })
+        ));
+        assert!(matches!(
+            sandbox.resolve_within(Path::new("escape_link/new_dir/created.txt")),
+            Err(PolicyError::SandboxEscape { .. })
+        ));
+        assert!(sandbox.resolve_within(Path::new("safe_link.txt")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 }

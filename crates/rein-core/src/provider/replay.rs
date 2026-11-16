@@ -123,9 +123,66 @@ mod tests {
 
         let events = log.read_all()?;
         let mut replay = ReplayProvider::from_events(&events);
+        assert_eq!(replay.name(), "replay");
         let replayed = replay.stream_turn("system", &[], &[])?;
         assert_eq!(replayed.len(), 2);
         let _ = std::fs::remove_file(&temp_path);
         Ok(())
+    }
+
+    #[test]
+    fn replays_multi_turn_stream_deltas_and_errors_when_exhausted() {
+        let events = vec![
+            SessionEvent::StreamDelta {
+                delta: "Hel".to_owned(),
+            },
+            SessionEvent::StreamDelta {
+                delta: "lo".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "Hello"),
+            },
+            SessionEvent::MessageRecorded {
+                message: Message::new(Role::Assistant, "Second turn"),
+            },
+        ];
+        let mut replay = ReplayProvider::from_events(&events);
+
+        let first = replay
+            .stream_turn("sys", &[], &[])
+            .expect("first turn available");
+        assert_eq!(
+            first,
+            vec![
+                ProviderStreamEvent::TextDelta("Hel".to_owned()),
+                ProviderStreamEvent::TextDelta("lo".to_owned()),
+                ProviderStreamEvent::Done,
+            ]
+        );
+
+        let second = replay
+            .stream_turn("sys", &[], &[])
+            .expect("second turn available");
+        assert_eq!(
+            second,
+            vec![
+                ProviderStreamEvent::TextDelta("Second turn".to_owned()),
+                ProviderStreamEvent::Done,
+            ]
+        );
+
+        let err = replay
+            .stream_turn("sys", &[], &[])
+            .expect_err("no more turns");
+        assert!(matches!(err, CoreError::ReplayExhausted { seq: 2 }));
+    }
+
+    #[test]
+    fn empty_event_log_immediately_exhausts_replay() {
+        let mut replay = ReplayProvider::from_events(&[]);
+        let err = replay
+            .stream_turn("sys", &[], &[])
+            .expect_err("empty replay");
+        assert!(matches!(err, CoreError::ReplayExhausted { seq: 0 }));
     }
 }

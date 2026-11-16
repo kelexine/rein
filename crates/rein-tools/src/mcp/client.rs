@@ -215,4 +215,21 @@ mod tests {
         assert_eq!(schemas[0].description, "echoes text");
         Ok(())
     }
+
+    #[test]
+    fn reports_errors_for_malformed_json_or_missing_binary() {
+        let bad_json_client = McpClient::new(McpServerConfig {
+            name: "bad-json".to_owned(),
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "printf 'not-json\\n'".to_owned()],
+        });
+        assert!(bad_json_client.list_tools().is_err());
+
+        let missing_bin_client = McpClient::new(McpServerConfig {
+            name: "missing".to_owned(),
+            command: "rein_nonexistent_mcp_binary_xyz".to_owned(),
+            args: Vec::new(),
+        });
+        assert!(missing_bin_client.list_tools().is_err());
+    }
 }

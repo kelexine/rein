@@ -373,3 +373,63 @@ fn push_buf(buf: &mut String, tokens: &mut Vec<String>) {
         tokens.push(std::mem::take(buf));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pipelines_env_vars_redirections_and_flags() {
+        let pipe = ShellPipeline::parse(
+            "RUST_LOG=debug cargo test --release -- --nocapture 2>&1 > out.log",
+        )
+        .expect("valid pipeline");
+        assert!(!pipe.dynamic_command);
+        assert_eq!(pipe.stages.len(), 1);
+        let stage = &pipe.stages[0];
+        assert_eq!(stage.binary, "cargo");
+        assert_eq!(
+            stage.env_vars,
+            vec![("RUST_LOG".to_owned(), "debug".to_owned())]
+        );
+        assert!(stage.has_long_prefix("rel"));
+        assert_eq!(stage.positionals, vec!["test", "--nocapture"]);
+        assert_eq!(
+            pipe.redirections,
+            vec![Redirection {
+                kind: RedirectKind::Output,
+                target: "out.log".to_owned(),
+            }]
+        );
+
+        let multi =
+            ShellPipeline::parse("x=src/lib.rs && cat $x | wc -l <<< 'hi'").expect("multi stage");
+        assert_eq!(multi.stages.len(), 3);
+        assert_eq!(multi.stages[1].positionals, vec!["src/lib.rs"]);
+        assert_eq!(multi.stages[2].binary, "wc");
+        assert!(multi.stages[2].has_short('l'));
+        assert_eq!(multi.redirections[0].kind, RedirectKind::HereString);
+    }
+
+    #[test]
+    fn handles_short_flag_clusters_and_negative_numbers() {
+        let cmd = ParsedCommand::from_words(
+            "/usr/bin/head".to_owned(),
+            vec![
+                "-n".to_owned(),
+                "10".to_owned(),
+                "-5".to_owned(),
+                "-qv".to_owned(),
+                "--in-place=.bak".to_owned(),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(cmd.binary, "head");
+        assert!(cmd.has_short('n'));
+        assert!(cmd.has_short('q'));
+        assert!(cmd.has_short('v'));
+        assert!(cmd.has_long_prefix("in-place"));
+        assert!(cmd.has_long_prefix("in-pl"));
+        assert_eq!(cmd.positionals, vec!["10", "-5"]);
+    }
+}

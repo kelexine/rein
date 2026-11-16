@@ -134,3 +134,109 @@ impl<'a> Turn<'a, Executing> {
         Ok(Turn::new(self.log))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::message::Role;
+
+    #[test]
+    fn turn_text_flow_records_user_deltas_and_assistant_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_core_turn_text_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let log_path = dir.join("session.jsonl");
+        let log = EventLog::new(&log_path);
+
+        let mut streaming = Turn::new(&log).begin_user_turn("hello rein")?;
+        streaming.push_delta("hi ")?;
+        streaming.push_delta("there")?;
+        let (_idle, reply) = streaming.finish_response()?;
+
+        assert_eq!(reply.role, Role::Assistant);
+        assert_eq!(reply.content, "hi there");
+
+        let events = log.read_all()?;
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[0],
+            SessionEvent::MessageRecorded { message }
+                if message.role == Role::User && message.content == "hello rein"
+        ));
+        assert!(matches!(
+            &events[1],
+            SessionEvent::StreamDelta { delta } if delta == "hi "
+        ));
+        assert!(matches!(
+            &events[2],
+            SessionEvent::StreamDelta { delta } if delta == "there"
+        ));
+        assert!(matches!(
+            &events[3],
+            SessionEvent::MessageRecorded { message }
+                if message.role == Role::Assistant && message.content == "hi there"
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn turn_tool_approve_and_deny_paths_record_policy_and_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_core_turn_tool_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let log_path = dir.join("session.jsonl");
+        let log = EventLog::new(&log_path);
+
+        let streaming = Turn::new(&log).begin_user_turn("run check")?;
+        let call_allow = ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "Cargo.toml"}),
+        };
+        let awaiting = streaming.request_tool(call_allow)?;
+        assert_eq!(awaiting.pending_call().id, "call_1");
+
+        let executing = awaiting.approve("read-only workspace file")?;
+        assert_eq!(executing.approved_call().name, "read");
+        let idle = executing.complete(ToolOutput {
+            call_id: "call_1".to_owned(),
+            content: "ok".to_owned(),
+            is_error: false,
+        })?;
+
+        let call_deny = ToolCall {
+            id: "call_2".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": "rm -rf /"}),
+        };
+        let (_idle2, denied_out) = idle
+            .request_tool(call_deny)?
+            .deny("protected mutation blocked")?;
+        assert!(denied_out.is_error);
+        assert_eq!(denied_out.call_id, "call_2");
+        assert!(denied_out.content.contains("protected mutation blocked"));
+
+        let events = log.read_all()?;
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            SessionEvent::PolicyEvaluated { call_id, allowed: true, .. } if call_id == "call_1"
+        )));
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            SessionEvent::PolicyEvaluated { call_id, allowed: false, .. } if call_id == "call_2"
+        )));
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            SessionEvent::ToolCompleted { output } if output.call_id == "call_2" && output.is_error
+        )));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

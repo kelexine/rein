@@ -560,4 +560,36 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
     }
+
+    #[test]
+    fn todo_write_rejects_invalid_statuses_and_missing_content() {
+        let temp_dir = std::env::temp_dir().join("rein_tools_todo_validation_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let store = TodoStore::for_session(&temp_dir, "validation");
+        let writer = TodoWriteTool::with_store(store);
+
+        assert!(writer.execute(&json!({})).is_err());
+        assert!(
+            writer
+                .execute(&json!({
+                    "todos": [{ "content": "Bad status", "status": "blocked" }]
+                }))
+                .is_err()
+        );
+        assert!(
+            writer
+                .execute(&json!({
+                    "todos": [{ "status": "pending" }]
+                }))
+                .is_err()
+        );
+        assert!(
+            writer
+                .execute(&json!({
+                    "todos": [{ "content": "   ", "status": "pending" }]
+                }))
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -67,3 +67,47 @@ impl EventLog {
         Ok(events)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::message::{Message, Role};
+
+    #[test]
+    fn event_log_returns_empty_when_missing_and_ignores_blank_lines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_core_event_log_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("events.jsonl");
+        let log = EventLog::new(&path);
+
+        assert_eq!(log.path(), path);
+        assert!(log.read_all()?.is_empty());
+
+        log.append(&SessionEvent::MessageRecorded {
+            message: Message::new(Role::User, "first"),
+        })?;
+        let mut f = OpenOptions::new().append(true).open(&path)?;
+        writeln!(f, "   ")?;
+        log.append(&SessionEvent::StreamDelta {
+            delta: "second".to_owned(),
+        })?;
+
+        let read_back = log.read_all()?;
+        assert_eq!(read_back.len(), 2);
+        assert!(matches!(
+            &read_back[0],
+            SessionEvent::MessageRecorded { message } if message.content == "first"
+        ));
+        assert!(matches!(
+            &read_back[1],
+            SessionEvent::StreamDelta { delta } if delta == "second"
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

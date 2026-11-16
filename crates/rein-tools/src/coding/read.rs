@@ -97,3 +97,39 @@ pub(crate) fn extract_str<'a>(
             reason: format!("missing string field '{field}'"),
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_slices_1_based_lines_and_rejects_escape() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_read_tool_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("notes.txt"), "alpha\nbeta\ngamma\ndelta\n")?;
+
+        let tool = ReadTool::new(WorkspaceSandbox::new(&dir));
+        let cap = tool.required_capability(&json!({"path": "notes.txt"}))?;
+        assert!(matches!(
+            cap,
+            Capability::FileSystem {
+                mode: AccessMode::Read,
+                ..
+            }
+        ));
+
+        let full = tool.execute(&json!({"path": "notes.txt"}))?;
+        assert_eq!(full, "   1: alpha\n   2: beta\n   3: gamma\n   4: delta");
+
+        let slice = tool.execute(&json!({"path": "notes.txt", "start_line": 2, "end_line": 3}))?;
+        assert_eq!(slice, "   2: beta\n   3: gamma");
+
+        assert!(tool.execute(&json!({"path": "missing.txt"})).is_err());
+        assert!(tool.execute(&json!({"path": "../outside.txt"})).is_err());
+        assert!(tool.execute(&json!({})).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

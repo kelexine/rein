@@ -145,3 +145,72 @@ impl Profile {
 fn to_owned_list(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_enforce_distinct_tool_and_memory_boundaries() {
+        let coding = Profile::for_mode(ModeId::Coding);
+        assert!(coding.allows_tool("read"));
+        assert!(coding.allows_tool("write"));
+        assert!(coding.allows_tool("edit"));
+        assert!(coding.allows_tool("bash"));
+        assert!(!coding.allows_tool("notes"));
+        assert_eq!(
+            coding.readable_memory_scopes,
+            vec![MemoryScope::Project, MemoryScope::Personal]
+        );
+        assert_eq!(coding.writable_memory_scopes, vec![MemoryScope::Project]);
+
+        let plan = Profile::for_mode(ModeId::Plan);
+        assert!(plan.allows_tool("read"));
+        assert!(plan.allows_tool("grep"));
+        assert!(plan.allows_tool("bash"));
+        assert!(!plan.allows_tool("write"));
+        assert!(!plan.allows_tool("edit"));
+        assert_eq!(
+            plan.readable_memory_scopes,
+            vec![MemoryScope::Project, MemoryScope::Personal]
+        );
+
+        let personal = Profile::for_mode(ModeId::Personal);
+        assert!(personal.allows_tool("memory"));
+        assert!(personal.allows_tool("notes"));
+        assert!(personal.allows_tool("calendar"));
+        assert!(personal.allows_tool("email"));
+        assert!(!personal.allows_tool("bash"));
+        assert!(!personal.allows_tool("read"));
+        assert_eq!(personal.readable_memory_scopes, vec![MemoryScope::Personal]);
+        assert_eq!(personal.writable_memory_scopes, vec![MemoryScope::Personal]);
+    }
+
+    #[test]
+    fn with_extra_tools_deduplicates_and_with_allowed_commands_sets_rules() {
+        let profile = Profile::coding()
+            .with_extra_tools(&[
+                "read".to_owned(),
+                "mcp__github__search".to_owned(),
+                "mcp__github__search".to_owned(),
+            ])
+            .with_allowed_commands(vec!["cargo test".to_owned()]);
+
+        let read_count = profile
+            .allowed_tools
+            .iter()
+            .filter(|t| t.as_str() == "read")
+            .count();
+        let mcp_count = profile
+            .allowed_tools
+            .iter()
+            .filter(|t| t.as_str() == "mcp__github__search")
+            .count();
+        assert_eq!(read_count, 1);
+        assert_eq!(mcp_count, 1);
+        assert_eq!(
+            profile.policy_rules.allowed_commands,
+            vec!["cargo test".to_owned()]
+        );
+    }
+}

@@ -212,4 +212,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn glob_and_grep_handle_empty_results_limits_and_missing_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_search_tool_edges_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub"))?;
+
+        let mut lines = String::new();
+        for i in 0..(MAX_SEARCH_RESULTS + 20) {
+            lines.push_str(&format!("hit line {i}\n"));
+        }
+        std::fs::write(dir.join("sub/many.txt"), lines)?;
+        let sandbox = WorkspaceSandbox::new(&dir);
+
+        let none = GlobTool::new(sandbox.clone()).execute(&json!({"pattern": "*.py"}))?;
+        assert!(none.is_empty());
+
+        let sub_glob =
+            GlobTool::new(sandbox.clone()).execute(&json!({"pattern": "*.txt", "path": "sub"}))?;
+        assert_eq!(sub_glob, "sub/many.txt");
+
+        let capped = GrepTool::new(sandbox.clone()).execute(&json!({"query": "hit"}))?;
+        assert_eq!(capped.lines().count(), MAX_SEARCH_RESULTS);
+
+        let zero_hits =
+            GrepTool::new(sandbox.clone()).execute(&json!({"query": "NO_SUCH_TEXT"}))?;
+        assert!(zero_hits.is_empty());
+
+        assert!(GlobTool::new(sandbox.clone()).execute(&json!({})).is_err());
+        assert!(GrepTool::new(sandbox).execute(&json!({})).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

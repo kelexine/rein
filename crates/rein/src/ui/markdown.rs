@@ -508,4 +508,40 @@ let x = 1;
                 .any(|s| s.content == "let" && s.style.fg == Some(Color::Magenta))
         }));
     }
+
+    #[test]
+    fn renders_links_lists_blockquotes_and_clamps_rules_to_narrow_width() {
+        let md = "\
+> Important security note
+
+---
+
+- First item with [docs](https://example.com)
+1. Ordered step";
+        let lines = render_assistant_markdown(md, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains("│ Important security note"));
+        assert!(joined.contains("• First item with docs (https://example.com)"));
+        assert!(!joined.contains("[docs]("));
+        assert!(joined.contains("1. Ordered step"));
+        let rule_line = rendered
+            .iter()
+            .find(|l| l.contains('─'))
+            .expect("horizontal rule rendered");
+        assert!(rule_line.chars().count() <= 40);
+        let link_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "docs"))
+            .expect("link line rendered");
+        assert!(link_line.spans.iter().any(|s| {
+            s.content == "docs"
+                && s.style.fg == Some(Color::LightBlue)
+                && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+    }
 }

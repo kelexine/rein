@@ -77,4 +77,66 @@ mod tests {
         let _ = std::fs::remove_file(&audit_path);
         Ok(())
     }
+
+    #[test]
+    fn cycles_coding_plan_personal_and_records_mode_switched_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join("rein_mode_cycle_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+        let event_path = temp_dir.join("events.jsonl");
+        let audit_path = temp_dir.join("audit.jsonl");
+
+        let log = EventLog::new(&event_path);
+        let coding = Profile::coding();
+        let mut policy = PolicyEngine::new(
+            coding.policy_rules.clone(),
+            WorkspaceSandbox::new(&temp_dir),
+            AuditLog::new(&audit_path),
+        );
+        let mut manager = ModeManager::new(coding);
+        assert_eq!(manager.active().mode, ModeId::Coding);
+
+        assert_eq!(
+            manager.switch_to(Profile::plan(), &mut policy, &log)?,
+            ModeId::Plan
+        );
+        assert_eq!(manager.active().mode, ModeId::Plan);
+        assert!(!policy.rules().allow_workspace_write);
+
+        assert_eq!(
+            manager.switch_to(Profile::personal(), &mut policy, &log)?,
+            ModeId::Personal
+        );
+        assert!(policy.rules().allow_personal_memory_write);
+
+        assert_eq!(
+            manager.switch_to(Profile::coding(), &mut policy, &log)?,
+            ModeId::Coding
+        );
+        assert!(policy.rules().allow_workspace_write);
+        assert!(!policy.rules().allow_personal_memory_write);
+
+        let events = log.read_all()?;
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            SessionEvent::ModeSwitched { mode: ModeId::Plan }
+        ));
+        assert!(matches!(
+            events[1],
+            SessionEvent::ModeSwitched {
+                mode: ModeId::Personal
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            SessionEvent::ModeSwitched {
+                mode: ModeId::Coding
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
 }

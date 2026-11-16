@@ -103,3 +103,83 @@ pub fn looks_like_path(token: &str) -> bool {
         || token.ends_with(".tar")
         || token.ends_with(".json")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_workspace_outside_and_protected_path_tokens() {
+        assert_eq!(classify_path_token("", None), TargetScope::Workspace);
+        assert_eq!(
+            classify_path_token("/dev/null", None),
+            TargetScope::Workspace
+        );
+        assert_eq!(
+            classify_path_token("$PWD/src/main.rs", None),
+            TargetScope::Workspace
+        );
+        assert_eq!(
+            classify_path_token("file://src/lib.rs", None),
+            TargetScope::Workspace
+        );
+
+        assert_eq!(
+            classify_path_token(".git/config", None),
+            TargetScope::Protected
+        );
+        assert_eq!(
+            classify_path_token("./.vscode/settings.json", None),
+            TargetScope::Protected
+        );
+        assert_eq!(
+            classify_path_token("sub/.rein/commands.json", None),
+            TargetScope::Protected
+        );
+
+        assert_eq!(
+            classify_path_token("~/.ssh/id_rsa", None),
+            TargetScope::OutsideWorkspace
+        );
+        assert_eq!(
+            classify_path_token("$HOME/.bashrc", None),
+            TargetScope::OutsideWorkspace
+        );
+        assert_eq!(
+            classify_path_token("../secret.txt", None),
+            TargetScope::OutsideWorkspace
+        );
+        assert_eq!(
+            classify_path_token("/etc/passwd", None),
+            TargetScope::OutsideWorkspace
+        );
+    }
+
+    #[test]
+    fn classifies_args_scope_and_sandbox_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_policy_scope_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}")?;
+        let sandbox = WorkspaceSandbox::new(&dir);
+
+        assert_eq!(
+            classify_args_scope(
+                &["--check".to_owned(), "src/main.rs".to_owned()],
+                Some(&sandbox)
+            ),
+            TargetScope::Workspace
+        );
+        assert_eq!(
+            classify_args_scope(&["--output=../escape.txt".to_owned()], Some(&sandbox)),
+            TargetScope::OutsideWorkspace
+        );
+        assert_eq!(
+            classify_args_scope(&[".git/hooks/pre-commit".to_owned()], Some(&sandbox)),
+            TargetScope::Protected
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

@@ -366,4 +366,26 @@ mod tests {
         assert_eq!(msgs.map(Vec::len), Some(1));
         assert_eq!(body["messages"][0]["content"], "hello");
     }
+
+    #[test]
+    fn includes_model_system_prompt_and_skips_system_role_in_history() {
+        let cfg = AnthropicConfig {
+            model: "claude-test".to_owned(),
+            max_tokens: 1024,
+            ..AnthropicConfig::default()
+        };
+        let provider = AnthropicProvider::new(cfg);
+        assert_eq!(provider.name(), "anthropic");
+
+        let history = vec![
+            Message::new(Role::System, "ignored inline system"),
+            Message::new(Role::User, "hi"),
+        ];
+        let body = provider.build_request_body("top system", &history, &[]);
+        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["system"], "top system");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
 }

@@ -175,4 +175,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
+
+    #[test]
+    fn parses_crlf_quoted_frontmatter_and_falls_back_on_missing_description() -> Result<()> {
+        let root = std::env::temp_dir().join("rein_slash_loader_edges_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ReinPaths::from_dirs(root.join("home/.rein"), root.join("repo/.rein"));
+        std::fs::create_dir_all(paths.repo_skills_dir.join("crlf-skill"))?;
+        std::fs::create_dir_all(paths.repo_skills_dir.join("empty-skill"))?;
+
+        std::fs::write(
+            paths.repo_skills_dir.join("crlf-skill/SKILL.md"),
+            "---\r\nname: \"crlf-skill\"\r\ndescription: 'Quoted CRLF desc'\r\n---\r\nBody",
+        )?;
+        std::fs::write(paths.repo_skills_dir.join("empty-skill/SKILL.md"), "")?;
+
+        let reg = load_slash_registry(&paths)?;
+        let crlf = reg
+            .all()
+            .iter()
+            .find(|c| c.name == "crlf-skill")
+            .context("missing crlf-skill")?;
+        assert_eq!(crlf.description, "Quoted CRLF desc");
+
+        let empty = reg
+            .all()
+            .iter()
+            .find(|c| c.name == "empty-skill")
+            .context("missing empty-skill")?;
+        assert_eq!(empty.description, "Rein skill");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
 }

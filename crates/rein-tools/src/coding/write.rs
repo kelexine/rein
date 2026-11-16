@@ -71,3 +71,60 @@ impl Tool for WriteTool {
         Ok(format!("wrote {} bytes to '{path_str}'", content.len()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_creates_nested_files_and_rejects_protected_or_escape_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_write_tool_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let tool = WriteTool::new(WorkspaceSandbox::new(&dir));
+        let cap = tool.required_capability(&json!({"path": "src/main.rs", "content": ""}))?;
+        assert!(matches!(
+            cap,
+            Capability::FileSystem {
+                mode: AccessMode::Write,
+                ..
+            }
+        ));
+
+        let msg =
+            tool.execute(&json!({"path": "nested/dir/hello.txt", "content": "hello world"}))?;
+        assert!(msg.contains("11 bytes"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nested/dir/hello.txt"))?,
+            "hello world"
+        );
+
+        tool.execute(&json!({"path": "nested/dir/hello.txt", "content": "updated"}))?;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nested/dir/hello.txt"))?,
+            "updated"
+        );
+
+        for protected in [
+            ".git/hooks/pre-commit",
+            ".rein/config.json",
+            ".vscode/settings.json",
+        ] {
+            assert!(
+                tool.execute(&json!({"path": protected, "content": "bad"}))
+                    .is_err(),
+                "expected protected path {protected} to be rejected"
+            );
+        }
+
+        assert!(
+            tool.execute(&json!({"path": "../outside.txt", "content": "bad"}))
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

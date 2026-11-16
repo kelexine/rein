@@ -235,3 +235,47 @@ fn copy_double_quoted(bytes: &[u8], mut i: usize, out: &mut String) -> usize {
     }
     (i + 1).min(bytes.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_substitutions_quotes_and_rejects_unterminated_syntax() {
+        let ok = scan_script("echo $(git status) `pwd` '<(ignore)'").expect("valid script");
+        assert!(!ok.dynamic_command);
+        assert_eq!(ok.substitutions, vec!["git status", "pwd"]);
+
+        let nested = scan_script("echo $(cat $(echo Cargo.toml))").expect("nested");
+        assert_eq!(
+            nested.substitutions,
+            vec!["cat $(echo Cargo.toml)", "echo Cargo.toml"]
+        );
+
+        let dyn_cmd = scan_script("$(which cargo) test").expect("dynamic cmd");
+        assert!(dyn_cmd.dynamic_command);
+
+        let cond_sub = scan_script("[[ -n $(whoami) ]]").expect("cond sub");
+        assert!(cond_sub.dynamic_command);
+
+        assert!(scan_script("echo 'unterminated").is_err());
+        assert!(scan_script("echo \"unterminated").is_err());
+        assert!(scan_script("echo $(unclosed").is_err());
+        assert!(scan_script("echo `unclosed").is_err());
+        assert!(scan_script("echo trailing\\").is_err());
+    }
+
+    #[test]
+    fn normalizes_ifs_braces_and_ansi_c_hex_escapes() {
+        assert_eq!(
+            normalize_and_expand_word("cat${IFS}src/{main,lib}.rs"),
+            vec!["cat", "src/main.rs", "src/lib.rs"]
+        );
+        assert_eq!(
+            normalize_and_expand_word("${HOME}/file"),
+            vec!["${HOME}/file"]
+        );
+        assert_eq!(unquote_word("$'\\x72\\x6d'"), "rm");
+        assert_eq!(unquote_word("\"a\\\"b\"'c d'"), "a\"bc d");
+    }
+}

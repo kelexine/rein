@@ -118,3 +118,96 @@ fn parse_scope(arguments: &Value) -> Result<MemoryScope, ToolError> {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_tool_capabilities_and_crud_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("rein_memory_tool_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let store = JsonlMemoryStore::dual(dir.join("project.jsonl"), dir.join("personal.jsonl"));
+        let tool = MemoryTool::new(store);
+
+        assert_eq!(
+            tool.required_capability(&json!({"action": "read", "scope": "project"}))?,
+            Capability::Memory {
+                scope: MemoryScope::Project,
+                mode: AccessMode::Read
+            }
+        );
+        assert_eq!(
+            tool.required_capability(&json!({"action": "list", "scope": "personal"}))?,
+            Capability::Memory {
+                scope: MemoryScope::Personal,
+                mode: AccessMode::Read
+            }
+        );
+        assert_eq!(
+            tool.required_capability(&json!({"action": "write", "scope": "project"}))?,
+            Capability::Memory {
+                scope: MemoryScope::Project,
+                mode: AccessMode::Write
+            }
+        );
+        assert_eq!(
+            tool.required_capability(&json!({"action": "delete", "scope": "personal"}))?,
+            Capability::Memory {
+                scope: MemoryScope::Personal,
+                mode: AccessMode::Write
+            }
+        );
+        assert!(
+            tool.required_capability(&json!({"action": "purge", "scope": "project"}))
+                .is_err()
+        );
+
+        assert_eq!(
+            tool.execute(&json!({
+                "action": "write",
+                "scope": "project",
+                "key": "test_runner",
+                "value": "cargo test --workspace",
+                "kind": "project"
+            }))?,
+            "memory record saved"
+        );
+
+        let read_out = tool.execute(&json!({
+            "action": "read",
+            "scope": "project",
+            "key": "test_runner"
+        }))?;
+        assert!(read_out.contains("cargo test --workspace"));
+
+        let list_out = tool.execute(&json!({"action": "list", "scope": "project"}))?;
+        assert!(list_out.contains("test_runner"));
+
+        assert_eq!(
+            tool.execute(&json!({
+                "action": "delete",
+                "scope": "project",
+                "key": "test_runner"
+            }))?,
+            "memory record deleted"
+        );
+        assert_eq!(
+            tool.execute(&json!({
+                "action": "delete",
+                "scope": "project",
+                "key": "test_runner"
+            }))?,
+            "memory record not found"
+        );
+        assert!(
+            tool.execute(&json!({"action": "write", "scope": "project", "key": "   "}))
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

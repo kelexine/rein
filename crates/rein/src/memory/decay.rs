@@ -69,4 +69,19 @@ mod tests {
         let s = projected_salience(1.0, 1.0);
         assert!(s > 0.59 && s < 0.62, "unexpected 1h salience: {s}");
     }
+
+    #[test]
+    fn legacy_zero_updated_at_and_future_timestamps_do_not_decay() {
+        let now = 1_700_100_000u64;
+        let mut legacy = MemoryRecord::new(MemoryScope::Personal, "pref", "vim");
+        legacy.updated_at = 0;
+
+        let mut future = MemoryRecord::new(MemoryScope::Project, "future", "value");
+        future.updated_at = now + 3_600;
+
+        let out = decay_records(&[legacy, future], now);
+        assert!((out[0].salience - 1.0).abs() < f32::EPSILON);
+        assert!((out[1].salience - 1.0).abs() < f32::EPSILON);
+        assert!((projected_salience(0.02, 0.0) - FLOOR_SALIENCE).abs() < f32::EPSILON);
+    }
 }

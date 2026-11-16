@@ -84,3 +84,44 @@ impl PolicyRuleSet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_rule_sets_enforce_mode_least_privilege() {
+        let coding = PolicyRuleSet::coding_default();
+        assert_eq!(coding.mode, ModeId::Coding);
+        assert!(coding.allow_personal_memory_read);
+        assert!(!coding.allow_personal_memory_write);
+        assert!(coding.allow_workspace_write);
+        assert!(coding.require_kernel_sandbox);
+
+        let plan = PolicyRuleSet::plan_default();
+        assert_eq!(plan.mode, ModeId::Plan);
+        assert!(plan.allow_personal_memory_read);
+        assert!(!plan.allow_personal_memory_write);
+        assert!(!plan.allow_workspace_write);
+        assert!(plan.require_kernel_sandbox);
+
+        let personal = PolicyRuleSet::personal_default();
+        assert_eq!(personal.mode, ModeId::Personal);
+        assert!(personal.allow_personal_memory_read);
+        assert!(personal.allow_personal_memory_write);
+        assert!(!personal.allow_workspace_write);
+        assert!(personal.require_kernel_sandbox);
+    }
+
+    #[test]
+    fn policy_decision_serializes_with_decision_tag() -> Result<(), Box<dyn std::error::Error>> {
+        let ask = PolicyDecision::Ask {
+            prompt: "Confirm?".to_owned(),
+        };
+        let encoded = serde_json::to_string(&ask)?;
+        assert!(encoded.contains("\"decision\":\"ask\""));
+        let decoded: PolicyDecision = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded, ask);
+        Ok(())
+    }
+}

@@ -361,7 +361,10 @@ fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
         "write" => ("Write".to_owned(), arg_str(args, "path", 68)),
         "edit" => ("Edit".to_owned(), arg_str(args, "path", 68)),
         "glob" => ("Glob".to_owned(), arg_str(args, "pattern", 68)),
-        "grep" => ("Grep".to_owned(), arg_str(args, "pattern", 68)),
+        "grep" => (
+            "Grep".to_owned(),
+            arg_str(args, "query", 68).or_else(|| arg_str(args, "pattern", 68)),
+        ),
         "memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
             let key = args
@@ -710,5 +713,67 @@ mod tests {
         assert!(expanded_text.iter().any(|l| l == "  └  ☑ Done step"));
         assert!(expanded_text.iter().any(|l| l == "     ☐ Active step"));
         assert!(expanded_text.iter().any(|l| l == "     ☐ Next step"));
+    }
+
+    #[test]
+    fn summarizes_file_and_search_tool_headers_and_marks_errors() {
+        let cases = [
+            ("read", json!({"path": "Cargo.toml"}), "● Read(Cargo.toml)"),
+            (
+                "write",
+                json!({"path": "src/lib.rs", "content": "x"}),
+                "● Write(src/lib.rs)",
+            ),
+            (
+                "edit",
+                json!({"path": "src/main.rs", "old_text": "a", "new_text": "b"}),
+                "● Edit(src/main.rs)",
+            ),
+            (
+                "grep",
+                json!({"query": "PolicyEngine"}),
+                "● Grep(PolicyEngine)",
+            ),
+            ("glob", json!({"pattern": "*.rs"}), "● Glob(*.rs)"),
+        ];
+        for (name, arguments, expected_header) in cases {
+            let call = ToolCall {
+                id: format!("id_{name}"),
+                name: name.to_owned(),
+                arguments,
+            };
+            let entry = TranscriptEntry::tool_completed(
+                &call,
+                &ToolOutput {
+                    call_id: call.id.clone(),
+                    content: "ok".to_owned(),
+                    is_error: false,
+                },
+            );
+            let lines = render_transcript_lines(&[entry], 90, false);
+            let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(header, format!("{expected_header} (ctrl+o to expand)"));
+        }
+
+        let err_call = ToolCall {
+            id: "err_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "missing.rs"}),
+        };
+        let err_entry = TranscriptEntry::tool_completed(
+            &err_call,
+            &ToolOutput {
+                call_id: "err_1".to_owned(),
+                content: "file not found".to_owned(),
+                is_error: true,
+            },
+        );
+        let err_lines = render_transcript_lines(&[err_entry], 90, true);
+        let err_text: Vec<String> = err_lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(err_text.iter().any(|l| l.contains("file not found")));
+        assert_eq!(err_lines[0].spans[0].style.fg, Some(Color::LightRed));
     }
 }

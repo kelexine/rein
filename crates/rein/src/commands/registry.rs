@@ -293,4 +293,70 @@ mod tests {
         assert!(prompt.contains("read"));
         assert!(prompt.contains("Task: hotspot"));
     }
+
+    #[test]
+    fn resolves_builtin_commands_quit_alias_and_unknown_commands() {
+        let reg = SlashRegistry::with_builtins();
+
+        assert_eq!(CommandSource::Builtin.badge(), None);
+        assert_eq!(CommandSource::User.badge(), Some("user"));
+        assert_eq!(CommandSource::Repo.badge(), Some("repo"));
+        assert!(reg.matching("plain text").is_empty());
+        assert!(!reg.matching("/").is_empty());
+
+        assert!(matches!(
+            reg.resolve("/quit"),
+            SlashResolution::Matched {
+                command: SlashCommand {
+                    kind: SlashKind::Builtin(BuiltinAction::Quit),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            reg.resolve("/exit"),
+            SlashResolution::Matched {
+                command: SlashCommand {
+                    kind: SlashKind::Builtin(BuiltinAction::Quit),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            reg.resolve("/provider antigravity"),
+            SlashResolution::Matched {
+                command: SlashCommand {
+                    kind: SlashKind::Builtin(BuiltinAction::Provider),
+                    ..
+                },
+                ref args,
+            } if args == "antigravity"
+        ));
+        assert!(matches!(
+            reg.resolve("/compact"),
+            SlashResolution::Matched {
+                command: SlashCommand {
+                    kind: SlashKind::Builtin(BuiltinAction::Compact),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            reg.resolve("/resume"),
+            SlashResolution::Matched {
+                command: SlashCommand {
+                    kind: SlashKind::Builtin(BuiltinAction::Resume),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            reg.resolve("/nonexistent arg"),
+            SlashResolution::Unknown(ref name) if name == "nonexistent"
+        ));
+    }
 }
