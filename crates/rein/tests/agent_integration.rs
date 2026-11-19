@@ -337,3 +337,178 @@ fn agent_loop_rewind_restores_messages_and_code_from_turns()
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[test]
+fn parallel_subagents_execute_concurrently_and_confine_to_parent_mode()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use rein::agent::{AgentTool, SubagentEnv, SubagentSessionState, SubagentTracker};
+    use rein::modes::RuntimeContext;
+    use rein_core::Provider;
+
+    let dir = fresh_temp_dir("subagents")?;
+    let workspace = dir.join("workspace");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(workspace.join("a.rs"), "pub fn a() {}\n")?;
+
+    let loaded = ensure_dirs_and_load_in(&workspace, &home)?;
+    let sandbox = WorkspaceSandbox::new(&workspace);
+
+    let child_reports = Arc::new(Mutex::new(std::collections::VecDeque::from([
+        vec![
+            SessionEvent::StreamDelta {
+                delta: "Audit A complete.".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: rein_core::Message::new(Role::Assistant, "Audit A complete."),
+            },
+        ],
+        vec![
+            SessionEvent::StreamDelta {
+                delta: "Audit B complete.".to_owned(),
+            },
+            SessionEvent::MessageRecorded {
+                message: rein_core::Message::new(Role::Assistant, "Audit B complete."),
+            },
+        ],
+    ])));
+    let factory_reports = Arc::clone(&child_reports);
+    let provider_factory: rein::agent::ProviderFactory = Arc::new(move |_| {
+        let events = factory_reports
+            .lock()
+            .ok()
+            .and_then(|mut q| q.pop_front())
+            .unwrap_or_default();
+        let prov: Box<dyn Provider> = Box::new(ReplayProvider::from_events(&events));
+        (prov, "replay/test".to_owned())
+    });
+
+    let subagent_state = Arc::new(RwLock::new(SubagentSessionState::default()));
+    let subagent_cancel = Arc::new(AtomicBool::new(false));
+    let tracker = SubagentTracker::new();
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadTool::new(sandbox.clone())));
+    registry.register(Box::new(AgentTool::new(SubagentEnv {
+        sandbox: sandbox.clone(),
+        audit_log_path: loaded.paths.audit_log.clone(),
+        sessions_dir: loaded.paths.sessions_dir.clone(),
+        bash_outputs_dir: loaded.paths.repo_dir.join("bash-outputs"),
+        notes_file: loaded.paths.notes.clone(),
+        calendar_file: loaded.paths.calendar.clone(),
+        calendar_ics_dir: loaded.paths.global_dir.join("calendar"),
+        email_file: loaded.paths.email.clone(),
+        maildir_path: loaded.paths.global_dir.join("maildir"),
+        memory: JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory),
+        todo_store: rein_tools::TodoStore::for_session(&loaded.paths.todos_dir, "sub"),
+        runtime_context: RuntimeContext::new(),
+        session_state: Arc::clone(&subagent_state),
+        tracker,
+        cancel: Arc::clone(&subagent_cancel),
+        provider_factory,
+    })));
+
+    // Start parent in Plan mode: two `research` subagents must succeed in parallel,
+    // while a `coder` subagent must be denied by Plan mode confinement.
+    let profile = Profile::plan();
+    let policy = PolicyEngine::new(
+        profile.policy_rules.clone(),
+        sandbox,
+        AuditLog::new(&loaded.paths.audit_log),
+    );
+    let memory = JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory);
+    let session_path = loaded.paths.sessions_dir.join("parent-subagents.jsonl");
+    let mut agent = AgentLoop::new(
+        EventLog::new(&session_path),
+        policy,
+        registry,
+        memory,
+        profile,
+    )
+    .with_subagent_handles(subagent_state, subagent_cancel);
+
+    let recorded = vec![
+        SessionEvent::ToolRequested {
+            call: ToolCall {
+                id: "sub_1".to_owned(),
+                name: "agent".to_owned(),
+                arguments: json!({
+                    "type": "research",
+                    "role": "Auditor A",
+                    "prompt": "Inspect module A"
+                }),
+            },
+        },
+        SessionEvent::ToolRequested {
+            call: ToolCall {
+                id: "sub_2".to_owned(),
+                name: "agent".to_owned(),
+                arguments: json!({
+                    "type": "research",
+                    "role": "Auditor B",
+                    "prompt": "Inspect module B"
+                }),
+            },
+        },
+        SessionEvent::ToolRequested {
+            call: ToolCall {
+                id: "sub_denied".to_owned(),
+                name: "agent".to_owned(),
+                arguments: json!({
+                    "type": "coder",
+                    "role": "Unauthorized Coder",
+                    "prompt": "Edit a.rs"
+                }),
+            },
+        },
+        SessionEvent::ToolCompleted {
+            output: rein_core::ToolOutput {
+                call_id: "sub_1".to_owned(),
+                content: "ok".to_owned(),
+                is_error: false,
+            },
+        },
+        SessionEvent::StreamDelta {
+            delta: "All reports collected.".to_owned(),
+        },
+    ];
+
+    let mut provider = ReplayProvider::from_events(&recorded);
+    let mut prompter = AutoDenyPrompter;
+    let answer = agent.run_user_prompt("run audits", &mut provider, &mut prompter)?;
+    assert_eq!(answer, "All reports collected.");
+
+    let events = EventLog::new(&session_path).read_all()?;
+    let completed: Vec<&rein_core::ToolOutput> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            SessionEvent::ToolCompleted { output } => Some(output),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed.len(), 3);
+    assert!(!completed[0].is_error);
+    assert!(!completed[1].is_error);
+    assert!(completed[2].is_error);
+    assert!(
+        completed[2]
+            .content
+            .contains("plan mode confines subagents")
+    );
+
+    let subagent_logs: Vec<_> = std::fs::read_dir(&loaded.paths.sessions_dir)?
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("subagent-") && !name.ends_with(".checkpoints.jsonl")
+        })
+        .collect();
+    assert_eq!(subagent_logs.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

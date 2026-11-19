@@ -79,4 +79,13 @@ pub enum Capability {
         /// Read or write access mode.
         mode: AccessMode,
     },
+    /// Delegated sub-agent execution confined to the spawning session's mode and policy.
+    Subagent {
+        /// Sub-agent type (`research`, `plan`, `coder`, `personal`).
+        agent_type: String,
+        /// Short 2–5 word sub-agent role title.
+        role: String,
+        /// Target operating mode required by this sub-agent.
+        target_mode: ModeId,
+    },
 }

@@ -344,13 +344,14 @@ impl AntigravityProvider {
                 "pluginType": "GEMINI"
             }
         });
-        if let Ok(resp) = self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .set("Content-Type", "application/json")
-            .set("User-Agent", ANTIGRAVITY_USER_AGENT)
-            .send_string(&payload.to_string())
+        if validate_antigravity_url(&url).is_ok()
+            && let Ok(resp) = self
+                .agent
+                .post(&url)
+                .set("Authorization", &format!("Bearer {access_token}"))
+                .set("Content-Type", "application/json")
+                .set("User-Agent", ANTIGRAVITY_USER_AGENT)
+                .send_string(&payload.to_string())
             && let Ok(body) = resp.into_string()
             && let Ok(parsed) = serde_json::from_str::<Value>(&body)
         {
@@ -419,6 +420,9 @@ impl AntigravityProvider {
         access_token: &mut String,
         payload: &str,
     ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
+        if let Err(err) = validate_antigravity_url(url) {
+            return Err((None, false, err));
+        }
         match self.post_stream(url, access_token, payload) {
             Ok(resp) => Ok(resp),
             Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
@@ -441,6 +445,9 @@ impl AntigravityProvider {
         }
         let aicode_base = self.resolve_aicode_base_url()?;
         let url = format!("{aicode_base}/v1alpha:fetchConfig");
+        if validate_antigravity_url(&url).is_err() {
+            return None;
+        }
         let resp = match self.send_get(&url, access_token) {
             Ok(r) => r,
             Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
@@ -1309,6 +1316,38 @@ fn sanitize_gemini_schema(schema: &Value) -> Value {
     }
 }
 
+fn validate_antigravity_url(url: &str) -> Result<(), CoreError> {
+    let rest = url.strip_prefix("https://").ok_or_else(|| {
+        CoreError::Provider(format!("refusing non-HTTPS Antigravity request URL: {url}"))
+    })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(CoreError::Provider(format!(
+            "refusing Antigravity URL with invalid authority: {url}"
+        )));
+    }
+    let host_raw = if let Some((h, port)) = authority.rsplit_once(':') {
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return Err(CoreError::Provider(format!(
+                "refusing Antigravity URL with invalid port: {url}"
+            )));
+        }
+        h
+    } else {
+        authority
+    };
+    let host = host_raw.to_ascii_lowercase();
+    let allowed = host == "accounts.google.com"
+        || host == "oauth2.googleapis.com"
+        || (host.ends_with(".googleapis.com") && host.len() > ".googleapis.com".len());
+    if !allowed {
+        return Err(CoreError::Provider(format!(
+            "refusing Antigravity request to untrusted host '{host}'"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,5 +1656,29 @@ mod tests {
         assert!(model_parts.iter().any(|p| p.get("functionCall").is_some()));
         assert_eq!(contents[2]["role"], "user");
         assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "glob");
+    }
+
+    #[test]
+    fn validates_antigravity_urls_against_google_https_allowlist() {
+        assert!(
+            validate_antigravity_url(
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+            )
+            .is_ok()
+        );
+        assert!(validate_antigravity_url("https://oauth2.googleapis.com/token").is_ok());
+        assert!(validate_antigravity_url("https://accounts.google.com/o/oauth2/v2/auth").is_ok());
+
+        assert!(
+            validate_antigravity_url("http://daily-cloudcode-pa.googleapis.com/v1internal:foo")
+                .is_err()
+        );
+        assert!(validate_antigravity_url("http://127.0.0.1:8080/exfil").is_err());
+        assert!(validate_antigravity_url("https://evil.example.com/steal").is_err());
+        assert!(
+            validate_antigravity_url("https://daily-cloudcode-pa.googleapis.com@evil.example.com/")
+                .is_err()
+        );
+        assert!(validate_antigravity_url("https://googleapis.com/v1").is_err());
     }
 }

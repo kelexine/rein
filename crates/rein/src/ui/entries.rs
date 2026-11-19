@@ -285,21 +285,26 @@ fn render_tool_entry(
         ToolRunState::Done => Color::Rgb(115, 210, 125),
         ToolRunState::Error => Color::LightRed,
     };
-    let (title, arg_label) = format_tool_header(&tool.name, &tool.arguments);
-    let mut header_spans = vec![
-        Span::styled("● ", Style::default().fg(dot_color)),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(arg) = arg_label {
-        header_spans.push(Span::styled("(", Style::default().fg(Color::DarkGray)));
-        header_spans.push(Span::styled(arg, Style::default().fg(Color::Gray)));
-        header_spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
-    }
+    let mut header_spans = if tool.name == "agent" {
+        build_agent_header_spans(dot_color, &tool.arguments)
+    } else {
+        let (title, arg_label) = format_tool_header(&tool.name, &tool.arguments);
+        let mut spans = vec![
+            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(arg) = arg_label {
+            spans.push(Span::styled("(", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(arg, Style::default().fg(Color::Gray)));
+            spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+        }
+        spans
+    };
 
     if tool.state == ToolRunState::Running {
         header_spans.push(Span::styled(
@@ -357,6 +362,35 @@ fn render_tool_entry(
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
     )));
+}
+
+fn build_agent_header_spans(dot_color: Color, args: &Value) -> Vec<Span<'static>> {
+    let kind = args
+        .get("type")
+        .or_else(|| args.get("subagent_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("research");
+    let role = args
+        .get("role")
+        .or_else(|| args.get("description"))
+        .and_then(Value::as_str)
+        .map(|s| clip_single_line(s, 48))
+        .unwrap_or_else(|| "Subagent".to_owned());
+    let mut spans = vec![
+        Span::styled("● ", Style::default().fg(dot_color)),
+        Span::styled(
+            format!("Agent({kind}: {role})"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(prompt) = arg_str(args, "prompt", 110) {
+        spans.push(Span::styled("(", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(prompt, Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+    }
+    spans
 }
 
 fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
@@ -1204,5 +1238,32 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("test case_10 ... ok")));
         assert!(!text.iter().any(|l| l.contains("test case_11 ... ok")));
         assert!(text.iter().any(|l| l == "     + 4 more lines"));
+    }
+
+    #[test]
+    fn agent_tool_renders_typed_role_and_prompt_header() {
+        let call = ToolCall {
+            id: "agent_1".to_owned(),
+            name: "agent".to_owned(),
+            arguments: json!({
+                "type": "research",
+                "role": "Vendor Build Auditor",
+                "prompt": "Perform a strictly READ-ONLY audit"
+            }),
+        };
+        let entry = TranscriptEntry::tool_completed(
+            &call,
+            &ToolOutput {
+                call_id: "agent_1".to_owned(),
+                content: "Audit complete".to_owned(),
+                is_error: false,
+            },
+        );
+        let lines = render_transcript_lines(&[entry], 120, false);
+        let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            header,
+            "● Agent(research: Vendor Build Auditor)(Perform a strictly READ-ONLY audit) (ctrl+o to expand)"
+        );
     }
 }

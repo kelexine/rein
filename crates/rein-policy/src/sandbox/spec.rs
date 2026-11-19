@@ -13,27 +13,48 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::PolicyError;
-use crate::sandbox::linux::{apply_sandbox_in_child, probe_kernel_sandbox};
+use crate::sandbox::linux::{
+    apply_sandbox_in_child, detach_controlling_terminal, harden_process_dumpable,
+    probe_kernel_sandbox,
+};
 
 /// CLI flag used when the single binary re-execs itself as a sandboxed child worker.
 pub const SANDBOX_CHILD_FLAG: &str = "--sandbox-child";
 
 /// Default read-only system directories exposed to sandboxed child processes.
 pub const DEFAULT_READ_ONLY_DIRS: &[&str] = &[
-    "/usr", "/bin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/opt", "/nix", "/dev",
+    "/usr", "/bin", "/lib", "/lib64", "/etc", "/proc", "/opt", "/nix",
 ];
 
-/// Character device files that require read/write access even inside a read-only sandbox (e.g. `2>/dev/null`).
+/// Character device files that require read/write access inside the sandbox (excluding `/dev/tty`).
 pub const DEFAULT_RW_DEVICE_PATHS: &[&str] = &[
     "/dev/null",
     "/dev/zero",
     "/dev/urandom",
     "/dev/random",
     "/dev/full",
-    "/dev/tty",
 ];
 
-/// Resolves read+execute system, `$PATH`, and developer toolchain paths for Landlock sandboxing without exposing `$HOME` broadly.
+/// Safe environment variable names forwarded to sandboxed child processes after `env_clear()`.
+const SAFE_CHILD_ENV_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "BUN_INSTALL",
+    "NO_COLOR",
+    "COLORTERM",
+];
+
+/// Resolves read+execute system, `$PATH`, and developer toolchain paths for Landlock sandboxing without exposing credentials.
 #[must_use]
 pub fn default_sandbox_read_only_paths(workspace_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -57,10 +78,11 @@ pub fn default_sandbox_read_only_paths(workspace_root: &Path) -> Vec<PathBuf> {
 
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         for rel in [
-            ".cargo",
-            ".rustup",
+            ".cargo/bin",
+            ".rustup/toolchains",
+            ".rustup/settings.toml",
             ".bun",
-            ".local",
+            ".local/bin",
             "go",
             ".nvm",
             ".fnm",
@@ -68,8 +90,6 @@ pub fn default_sandbox_read_only_paths(workspace_root: &Path) -> Vec<PathBuf> {
             ".asdf",
             ".mise",
             ".volta",
-            ".gitconfig",
-            ".config/git",
         ] {
             push_sandbox_path(&mut paths, home.join(rel), workspace_root);
         }
@@ -78,11 +98,11 @@ pub fn default_sandbox_read_only_paths(workspace_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Resolves safe writable scratch/device paths (such as `/dev/null`, `/tmp`, and Cargo's lockfile) for Landlock sandboxing.
+/// Resolves safe writable device and cache paths (without exposing shared `/tmp` or `/dev/tty`).
 #[must_use]
 pub fn default_sandbox_read_write_paths(
-    workspace_root: &Path,
-    read_only_workspace: bool,
+    _workspace_root: &Path,
+    _read_only_workspace: bool,
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for dev in DEFAULT_RW_DEVICE_PATHS {
@@ -101,23 +121,6 @@ pub fn default_sandbox_read_write_paths(
         && !paths.contains(&cache)
     {
         paths.push(cache);
-    }
-
-    let mut scratch_dirs = vec![std::env::temp_dir()];
-    if let Some(tmpdir) = std::env::var_os("TMPDIR").map(PathBuf::from) {
-        scratch_dirs.push(tmpdir);
-    }
-    for dir in scratch_dirs {
-        if !dir.exists() {
-            continue;
-        }
-        // Keep read-only workspace boundaries strict when tests place a workspace under `/tmp`.
-        if read_only_workspace && workspace_root.starts_with(&dir) {
-            continue;
-        }
-        if !paths.contains(&dir) {
-            paths.push(dir);
-        }
     }
 
     paths
@@ -239,15 +242,23 @@ pub fn run_sandboxed_command(spec: &SandboxSpec) -> Result<SandboxCommandOutput,
     if let SandboxStatus::Unavailable { reason } = status {
         return Err(PolicyError::SandboxUnavailable(reason));
     }
+    harden_process_dumpable();
     let raw_exe = std::env::current_exe().map_err(|source| PolicyError::Io {
         path: PathBuf::from("current_exe"),
         source,
     })?;
     let exe = resolve_sandbox_exe(raw_exe);
-    let payload = serde_json::to_string(spec)?;
+
+    let private_tmp = PrivateTmpDir::create()?;
+    let mut effective_spec = spec.clone();
+    effective_spec
+        .read_write_paths
+        .push(private_tmp.path().to_path_buf());
+    let payload = serde_json::to_string(&effective_spec)?;
     let mut child = Command::new(&exe)
         .arg(SANDBOX_CHILD_FLAG)
         .arg(payload)
+        .env("REIN_SANDBOX_TMPDIR", private_tmp.path())
         .current_dir(&spec.workspace_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -298,20 +309,61 @@ pub fn run_sandboxed_command(spec: &SandboxSpec) -> Result<SandboxCommandOutput,
     })
 }
 
-/// Entrypoint executed inside the `--sandbox-child` process: applies Landlock, then runs command.
+struct PrivateTmpDir(PathBuf);
+
+impl PrivateTmpDir {
+    fn create() -> Result<Self, PolicyError> {
+        let seq = OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("rein-sbx-{}-{ts}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|source| PolicyError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateTmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Entrypoint executed inside the `--sandbox-child` process: detaches tty, clears env, applies Landlock, then runs command.
 pub fn execute_sandbox_child(raw_spec: &str) -> Result<i32, PolicyError> {
     let spec: SandboxSpec = serde_json::from_str(raw_spec)?;
-    apply_sandbox_in_child(&spec)?;
-    let mut cmd = Command::new(&spec.program);
-    cmd.args(&spec.args).current_dir(&spec.workspace_root);
-    if !spec.read_only_workspace {
-        // Keep temp scratch on the workspace filesystem so cross-mount renames
-        // from tmpfs `/tmp` into `target/` do not fail with EXDEV.
-        let ws_tmp = spec.workspace_root.join(".rein").join("tmp");
-        if std::fs::create_dir_all(&ws_tmp).is_ok() {
-            cmd.env("TMPDIR", &ws_tmp);
+    let private_tmp = std::env::var_os("REIN_SANDBOX_TMPDIR").map(PathBuf::from);
+    let mut safe_env: Vec<(String, std::ffi::OsString)> = Vec::new();
+    for key in SAFE_CHILD_ENV_VARS {
+        if let Some(val) = std::env::var_os(key) {
+            safe_env.push(((*key).to_owned(), val));
         }
     }
+
+    detach_controlling_terminal();
+    apply_sandbox_in_child(&spec)?;
+
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args)
+        .current_dir(&spec.workspace_root)
+        .env_clear();
+    for (k, v) in safe_env {
+        cmd.env(k, v);
+    }
+    if let Some(tmp) = private_tmp {
+        cmd.env("TMPDIR", tmp);
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+
     let status = cmd.status().map_err(|source| PolicyError::Io {
         path: PathBuf::from(&spec.program),
         source,
@@ -331,19 +383,23 @@ fn open_stream_log(output_dir: Option<&Path>) -> Result<(PathBuf, SharedLogWrite
     })?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let log_path = dir.join(format!("bash-{ts}-{seq}.log"));
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .map_err(|source| PolicyError::Io {
-            path: log_path.clone(),
-            source,
-        })?;
+    let pid = std::process::id();
+    let log_path = dir.join(format!("bash-{pid}-{ts}-{seq}.log"));
+
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&log_path).map_err(|source| PolicyError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
     Ok((log_path, Arc::new(Mutex::new(BufWriter::new(file)))))
 }
 
@@ -398,19 +454,25 @@ mod tests {
         let ws = std::env::temp_dir().join("rein_spec_paths_test_ws");
         let ro = default_sandbox_read_only_paths(&ws);
         assert!(ro.contains(&PathBuf::from("/usr")));
-        assert!(ro.contains(&PathBuf::from("/dev")));
+        assert!(!ro.contains(&PathBuf::from("/dev")));
+        assert!(!ro.contains(&PathBuf::from("/sys")));
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             assert!(!ro.contains(&home), "must not expose $HOME broadly");
+            assert!(!ro.contains(&home.join(".config/git")));
+            assert!(!ro.contains(&home.join(".gitconfig")));
+            assert!(!ro.contains(&home.join(".local")));
         }
 
         let rw_for_ro_ws = default_sandbox_read_write_paths(&ws, true);
         assert!(rw_for_ro_ws.contains(&PathBuf::from("/dev/null")));
+        assert!(!rw_for_ro_ws.contains(&PathBuf::from("/dev/tty")));
         assert!(!rw_for_ro_ws.contains(&std::env::temp_dir()));
 
         let non_tmp_ws = PathBuf::from("/nonexistent_rein_workspace_root_for_test");
         let rw_for_real_ws = default_sandbox_read_write_paths(&non_tmp_ws, false);
         assert!(rw_for_real_ws.contains(&PathBuf::from("/dev/null")));
-        assert!(rw_for_real_ws.contains(&PathBuf::from(&std::env::temp_dir())));
+        assert!(!rw_for_real_ws.contains(&PathBuf::from("/dev/tty")));
+        assert!(!rw_for_real_ws.contains(&std::env::temp_dir()));
     }
 
     #[test]

@@ -6,6 +6,8 @@
 pub mod runner;
 /// Per-turn workspace snapshots and `/rewind` restoration.
 pub mod snapshot;
+/// Policy-confined sub-agent tool (`agent`), live TUI status tracker, and child runner.
+pub mod subagent;
 
 pub use runner::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, HydratedEvent,
@@ -14,4 +16,8 @@ pub use runner::{
 pub use snapshot::{
     TurnCheckpoint, WorkspaceSnapshot, capture_workspace_snapshot, format_relative_age,
     now_unix_secs, restore_workspace_snapshot,
+};
+pub use subagent::{
+    AgentTool, DEFAULT_SUBAGENT_MAX_ROUNDS, LiveSubagentStatus, ProviderFactory, SubagentEnv,
+    SubagentSessionState, SubagentTracker,
 };

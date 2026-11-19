@@ -51,7 +51,9 @@ impl Tool for EditTool {
 
     fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
         let path_str = extract_str(arguments, "path", "edit")?;
-        if classify_path_token(path_str, Some(&self.sandbox)) == TargetScope::Protected {
+        if classify_path_token(path_str, Some(&self.sandbox)) == TargetScope::Protected
+            || self.sandbox.is_protected(Path::new(path_str))
+        {
             return Err(ToolError::InvalidArguments {
                 tool: "edit".to_owned(),
                 reason: format!("refusing to edit protected path '{path_str}'"),
@@ -60,6 +62,12 @@ impl Tool for EditTool {
         let old_text = extract_str(arguments, "old_text", "edit")?;
         let new_text = extract_str(arguments, "new_text", "edit")?;
         let resolved = self.sandbox.resolve_within(Path::new(path_str))?;
+        if std::fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(ToolError::InvalidArguments {
+                tool: "edit".to_owned(),
+                reason: format!("refusing to edit through symlink '{path_str}'"),
+            });
+        }
         let original = std::fs::read_to_string(&resolved).map_err(|source| ToolError::Io {
             path: resolved.clone(),
             source,

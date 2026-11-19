@@ -50,7 +50,9 @@ impl Tool for WriteTool {
 
     fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
         let path_str = extract_str(arguments, "path", "write")?;
-        if classify_path_token(path_str, Some(&self.sandbox)) == TargetScope::Protected {
+        if classify_path_token(path_str, Some(&self.sandbox)) == TargetScope::Protected
+            || self.sandbox.is_protected(Path::new(path_str))
+        {
             return Err(ToolError::InvalidArguments {
                 tool: "write".to_owned(),
                 reason: format!("refusing to write protected path '{path_str}'"),
@@ -58,6 +60,12 @@ impl Tool for WriteTool {
         }
         let content = extract_str(arguments, "content", "write")?;
         let resolved = self.sandbox.resolve_within(Path::new(path_str))?;
+        if std::fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(ToolError::InvalidArguments {
+                tool: "write".to_owned(),
+                reason: format!("refusing to write through symlink '{path_str}'"),
+            });
+        }
         if let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent).map_err(|source| ToolError::Io {
                 path: parent.to_path_buf(),

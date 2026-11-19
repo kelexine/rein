@@ -147,6 +147,69 @@ pub fn normalize_and_expand_word(raw: &str) -> Vec<String> {
     out
 }
 
+/// Returns `true` when `raw` contains an active (un-single-quoted, unescaped) shell variable expansion
+/// other than `$PWD` / `${PWD}` / `$IFS` / `${IFS}`.
+#[must_use]
+pub fn has_active_var_expansion(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+        } else if b == b'\\' {
+            i += 2;
+        } else if b == b'\'' && !in_double {
+            if i > 0 && bytes[i - 1] == b'$' {
+                i = skip_ansi_c_quote(bytes, i + 1).unwrap_or(bytes.len());
+            } else {
+                in_single = true;
+                i += 1;
+            }
+        } else if b == b'"' {
+            in_double = !in_double;
+            i += 1;
+        } else if b == b'$' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next == b'{' {
+                let tail = &raw[i + 2..];
+                if let Some(close) = tail.find('}') {
+                    let name = &tail[..close];
+                    if name != "PWD" && name != "IFS" {
+                        return true;
+                    }
+                    i += 2 + close + 1;
+                    continue;
+                }
+                return true;
+            } else if next.is_ascii_alphabetic() || next == b'_' {
+                let mut end = i + 2;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let name = &raw[i + 1..end];
+                if name != "PWD" && name != "IFS" {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 fn expand_braces(word: &str) -> Vec<String> {
     let Some(open) = word.find('{') else {
         return vec![word.to_owned()];

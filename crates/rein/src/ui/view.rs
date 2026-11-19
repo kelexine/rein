@@ -55,12 +55,17 @@ fn todo_bar_rows(state: &AppState) -> u16 {
     }
 }
 
+fn subagent_bar_rows(state: &AppState) -> u16 {
+    u16::try_from(state.active_subagents().len().min(5)).unwrap_or(0)
+}
+
 fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
     let popup_rows = compute_popup_rows(state, matches.len());
     let spinner_rows = u16::from(state.is_busy() && state.pending_approval().is_none());
     let todo_rows = todo_bar_rows(state);
+    let subagent_rows = subagent_bar_rows(state);
     let input_rows = prompt_rows(state, area.width, area.height);
 
     Layout::default()
@@ -74,6 +79,7 @@ fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Length(1),
             Constraint::Length(input_rows),
             Constraint::Length(1),
+            Constraint::Length(subagent_rows),
             Constraint::Length(1),
         ])
         .split(area)
@@ -131,7 +137,10 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
     render_rule(frame, chunks[5]);
     render_prompt_line(state, frame, chunks[6]);
     render_rule(frame, chunks[7]);
-    render_status_bar(state, frame, chunks[8]);
+    if chunks[8].height > 0 {
+        render_subagent_bar(state, frame, chunks[8]);
+    }
+    render_status_bar(state, frame, chunks[9]);
 }
 
 /// Computes the vertical max scroll offset for the rendered transcript inside `(width, height)`.
@@ -1037,6 +1046,42 @@ fn build_wrapped_prompt(
     (rows, c_row, c_col)
 }
 
+fn render_subagent_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
+    let running = state.active_subagents();
+    if running.is_empty() || area.height == 0 {
+        return;
+    }
+    let now = now_unix_secs();
+    let lines: Vec<Line<'_>> = running
+        .iter()
+        .take(usize::from(area.height))
+        .map(|sub| {
+            let elapsed = now.saturating_sub(sub.started_unix_secs);
+            Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("Agent({}: {})", sub.agent_type, sub.role),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    sub.model_label.clone(),
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(sub.status.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(" · {elapsed}s"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
     let mode = state.active_profile().mode;
     let mode_label = mode_name(mode);
@@ -1105,6 +1150,19 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         left_spans.push(Span::styled(
             format!("{pct}% quota"),
             Style::default().fg(quota_color(pct)),
+        ));
+    }
+    let subagent_count = state.active_subagents().len();
+    if subagent_count > 0 {
+        let noun = if subagent_count == 1 {
+            "subagent"
+        } else {
+            "subagents"
+        };
+        left_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        left_spans.push(Span::styled(
+            format!("{subagent_count} {noun}"),
+            Style::default().fg(Color::Yellow),
         ));
     }
 
@@ -1413,6 +1471,48 @@ mod tests {
             .join("\n");
         assert!(!cleared_text.contains("Refactor auth"));
         assert!(!cleared_text.contains("Verify session hooks"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_live_subagent_bar_and_status_count_when_active() -> std::io::Result<()> {
+        use crate::agent::{LiveSubagentStatus, SubagentTracker, now_unix_secs};
+
+        let backend = TestBackend::new(120, 22);
+        let mut terminal = Terminal::new(backend)?;
+        let tracker = SubagentTracker::new();
+        tracker.start(LiveSubagentStatus {
+            id: "sub_1".to_owned(),
+            agent_type: "research".to_owned(),
+            role: "Vendor ELF Auditor".to_owned(),
+            model_label: "gemini-4-argon".to_owned(),
+            status: "Reading file".to_owned(),
+            started_unix_secs: now_unix_secs(),
+        });
+        tracker.start(LiveSubagentStatus {
+            id: "sub_2".to_owned(),
+            agent_type: "research".to_owned(),
+            role: "HAL Config Auditor".to_owned(),
+            model_label: "gemini-4-argon".to_owned(),
+            status: "Searching files".to_owned(),
+            started_unix_secs: now_unix_secs(),
+        });
+
+        let state = AppState::new(Profile::coding(), "landlock v11", "gemini-4-argon-medium")
+            .with_subagent_tracker(tracker);
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..22)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Agent(research: Vendor ELF Auditor)"));
+        assert!(rendered.contains("Reading file"));
+        assert!(rendered.contains("2 subagents"));
         Ok(())
     }
 }

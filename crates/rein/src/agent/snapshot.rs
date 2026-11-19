@@ -96,12 +96,9 @@ pub fn restore_workspace_snapshot(
 }
 
 fn is_git_workspace(workspace_root: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .is_ok_and(|out| out.status.success())
+    workspace_root
+        .ancestors()
+        .any(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
 }
 
 struct TempIndexGuard(PathBuf);
@@ -126,12 +123,84 @@ impl Drop for TempIndexGuard {
     }
 }
 
+fn shadow_git_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let base = crate::config::loader::resolve_global_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("rein-snapshots"));
+    let canonical =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let bucket = crate::config::loader::workspace_session_bucket(&canonical);
+    let shadow = base.join("snapshots").join(format!("{bucket}.git"));
+    if !shadow.join("HEAD").exists() {
+        std::fs::create_dir_all(&shadow).with_context(|| {
+            format!("failed to create snapshot shadow dir {}", shadow.display())
+        })?;
+        let init = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["init", "--bare"])
+            .arg(&shadow)
+            .output()
+            .context("failed to initialize bare shadow git repository")?;
+        if !init.status.success() {
+            bail!(
+                "git init --bare snapshot shadow failed: {}",
+                String::from_utf8_lossy(&init.stderr).trim()
+            );
+        }
+    }
+    Ok(shadow)
+}
+
+fn shadow_git_command(
+    shadow_dir: &Path,
+    workspace_root: &Path,
+    index_path: Option<&Path>,
+) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_DIR", shadow_dir)
+        .env("GIT_WORK_TREE", workspace_root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.attributesfile=/dev/null",
+            "-c",
+            "core.excludesfile=/dev/null",
+        ]);
+    if let Some(idx) = index_path {
+        cmd.env("GIT_INDEX_FILE", idx);
+    }
+    cmd
+}
+
+fn validate_restore_target(
+    sandbox: &rein_policy::WorkspaceSandbox,
+    workspace_root: &Path,
+    rel: &str,
+) -> Result<PathBuf> {
+    let candidate = workspace_root.join(rel);
+    let resolved = sandbox
+        .resolve_within(&candidate)
+        .map_err(|err| anyhow::anyhow!("refusing snapshot path outside workspace: {err}"))?;
+    if std::fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!(
+            "refusing to modify symlink path during restore: {}",
+            resolved.display()
+        );
+    }
+    Ok(resolved)
+}
+
 fn capture_git_tree(workspace_root: &Path) -> Result<String> {
+    let shadow = shadow_git_dir(workspace_root)?;
     let idx = TempIndexGuard::new();
-    let add = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .env("GIT_INDEX_FILE", idx.path())
+    let add = shadow_git_command(&shadow, workspace_root, Some(idx.path()))
         .args(["add", "-A"])
         .output()
         .context("failed to run git add -A for snapshot")?;
@@ -142,10 +211,7 @@ fn capture_git_tree(workspace_root: &Path) -> Result<String> {
         );
     }
 
-    let write = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .env("GIT_INDEX_FILE", idx.path())
+    let write = shadow_git_command(&shadow, workspace_root, Some(idx.path()))
         .arg("write-tree")
         .output()
         .context("failed to run git write-tree for snapshot")?;
@@ -164,9 +230,10 @@ fn restore_git_tree(workspace_root: &Path, target_tree: &str) -> Result<()> {
         return Ok(());
     }
 
-    let diff = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
+    let shadow = shadow_git_dir(workspace_root)?;
+    let sandbox = rein_policy::WorkspaceSandbox::new(workspace_root);
+
+    let diff = shadow_git_command(&shadow, workspace_root, None)
         .args([
             "diff-tree",
             "-r",
@@ -184,6 +251,21 @@ fn restore_git_tree(workspace_root: &Path, target_tree: &str) -> Result<()> {
         );
     }
 
+    let ls_tree = shadow_git_command(&shadow, workspace_root, None)
+        .args(["ls-tree", "-r", "--name-only", "-z", target_tree])
+        .output()
+        .context("failed to list snapshot tree paths")?;
+    if !ls_tree.status.success() {
+        bail!(
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&ls_tree.stderr).trim()
+        );
+    }
+    for rel_bytes in ls_tree.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let rel = String::from_utf8_lossy(rel_bytes);
+        validate_restore_target(&sandbox, workspace_root, rel.as_ref())?;
+    }
+
     // `diff-tree -z` emits `<status>\0<path>\0...`; remove files added since `target_tree`.
     let mut parts = diff.stdout.split(|&b| b == 0).filter(|s| !s.is_empty());
     while let Some(status) = parts.next() {
@@ -192,18 +274,16 @@ fn restore_git_tree(workspace_root: &Path, target_tree: &str) -> Result<()> {
         };
         if status.starts_with(b"A") {
             let rel = String::from_utf8_lossy(path_bytes);
-            let full = workspace_root.join(rel.as_ref());
-            if full.exists() {
+            if let Ok(full) = validate_restore_target(&sandbox, workspace_root, rel.as_ref())
+                && full.exists()
+            {
                 let _ = std::fs::remove_file(&full);
             }
         }
     }
 
     let idx = TempIndexGuard::new();
-    let read_tree = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .env("GIT_INDEX_FILE", idx.path())
+    let read_tree = shadow_git_command(&shadow, workspace_root, Some(idx.path()))
         .args(["read-tree", target_tree])
         .output()
         .context("failed to run git read-tree for restore")?;
@@ -214,10 +294,7 @@ fn restore_git_tree(workspace_root: &Path, target_tree: &str) -> Result<()> {
         );
     }
 
-    let checkout = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .env("GIT_INDEX_FILE", idx.path())
+    let checkout = shadow_git_command(&shadow, workspace_root, Some(idx.path()))
         .args(["checkout-index", "-a", "-f"])
         .output()
         .context("failed to run git checkout-index for restore")?;
@@ -262,15 +339,18 @@ fn restore_in_memory(
     workspace_root: &Path,
     target_files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
+    let sandbox = rein_policy::WorkspaceSandbox::new(workspace_root);
     let mut current = BTreeMap::new();
     collect_files(workspace_root, workspace_root, &mut current)?;
     for rel in current.keys() {
-        if !target_files.contains_key(rel) {
-            let _ = std::fs::remove_file(workspace_root.join(rel));
+        if !target_files.contains_key(rel)
+            && let Ok(full) = validate_restore_target(&sandbox, workspace_root, rel)
+        {
+            let _ = std::fs::remove_file(full);
         }
     }
     for (rel, bytes) in target_files {
-        let full = workspace_root.join(rel);
+        let full = validate_restore_target(&sandbox, workspace_root, rel)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -401,6 +481,55 @@ mod tests {
         assert!(!dir.join("extra.py").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn git_snapshot_ignores_workspace_git_config_filters() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = std::env::temp_dir().join(format!("rein_snap_sec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("repo");
+        let canary = root.join("canary_r24.txt");
+        std::fs::create_dir_all(&dir)?;
+
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .arg("init")
+                .status()?
+                .success()
+        );
+        std::fs::write(dir.join("hello.txt"), "safe content\n")?;
+        let git_config_path = dir.join(".git").join("config");
+        let existing_cfg = std::fs::read_to_string(&git_config_path)?;
+        let malicious_cfg = format!(
+            "{existing_cfg}\n[filter \"x\"]\n\tclean = sh -c 'echo PWNED > {}' && cat\n",
+            canary.display()
+        );
+        std::fs::write(&git_config_path, malicious_cfg)?;
+        std::fs::write(dir.join(".gitattributes"), "* filter=x\n")?;
+
+        let snap = capture_workspace_snapshot(&dir)?;
+        assert!(matches!(snap, WorkspaceSnapshot::GitTree { .. }));
+        assert!(
+            !canary.exists(),
+            "capture_workspace_snapshot executed untrusted .git/config filter"
+        );
+
+        std::fs::write(dir.join("hello.txt"), "mutated\n")?;
+        restore_workspace_snapshot(&dir, &snap)?;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hello.txt"))?,
+            "safe content\n"
+        );
+        assert!(
+            !canary.exists(),
+            "restore_workspace_snapshot executed untrusted .git/config filter"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 }

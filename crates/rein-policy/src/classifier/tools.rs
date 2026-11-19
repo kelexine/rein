@@ -130,8 +130,14 @@ fn extract_sed_write_path(expr: &str) -> Option<&str> {
     if let Some(rest) = expr.strip_prefix("w ") {
         return Some(rest.trim());
     }
+    if expr.starts_with("w/") {
+        return Some(expr[1..].trim());
+    }
     if let Some((_, rest)) = expr.split_once("/w ") {
         return Some(rest.trim());
+    }
+    if let Some((idx, _)) = expr.match_indices("/w/").next() {
+        return Some(expr[idx + 2..].trim());
     }
     None
 }
@@ -266,8 +272,16 @@ fn classify_git(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> Shel
             "git flag or -c config executes helper command",
         );
     }
-    let dir_scope = find_flag_value(&cmd.raw_args, &["-C"])
-        .map_or(TargetScope::Workspace, |p| classify_path_token(p, sandbox));
+    let dir_scope = git_dir_scope(&cmd.raw_args, sandbox);
+    if let Some(out_path) = extract_output_option(cmd, "-o", "output") {
+        let out_scope = dir_scope.max(classify_path_token(&out_path, sandbox));
+        let eff = if out_scope == TargetScope::OutsideWorkspace {
+            EffectLevel::OutsideWrite
+        } else {
+            EffectLevel::WorkspaceWrite
+        };
+        return ShellClassification::with_target(eff, out_scope, "git --output writes file");
+    }
     let Some(sub) = cmd.positionals.first().map(String::as_str) else {
         return ShellClassification::with_target(
             EffectLevel::ReadOnly,
@@ -559,6 +573,28 @@ fn classify_network_tool(
     )
 }
 
+fn git_dir_scope(raw_args: &[String], sandbox: Option<&WorkspaceSandbox>) -> TargetScope {
+    let mut scope = TargetScope::Workspace;
+    let mut iter = raw_args.iter();
+    while let Some(arg) = iter.next() {
+        if matches!(arg.as_str(), "-C" | "--git-dir" | "--work-tree") {
+            if let Some(val) = iter.next() {
+                scope = scope.max(classify_path_token(val, sandbox));
+            }
+        } else if let Some(val) = arg.strip_prefix("-C")
+            && !val.is_empty()
+        {
+            scope = scope.max(classify_path_token(val, sandbox));
+        } else if let Some(val) = arg
+            .strip_prefix("--git-dir=")
+            .or_else(|| arg.strip_prefix("--work-tree="))
+        {
+            scope = scope.max(classify_path_token(val, sandbox));
+        }
+    }
+    scope
+}
+
 fn find_long_opt_value<'a>(long_opts: &'a [String], key: &str) -> Option<&'a str> {
     long_opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
@@ -583,6 +619,14 @@ fn extract_output_option(
 ) -> Option<String> {
     if let Some(val) = find_flag_value(&cmd.raw_args, &[short_flag]) {
         return Some(val.to_owned());
+    }
+    for arg in &cmd.raw_args {
+        if let Some(attached) = arg.strip_prefix(short_flag)
+            && !attached.is_empty()
+            && !attached.starts_with('-')
+        {
+            return Some(attached.to_owned());
+        }
     }
     for opt in &cmd.long_options {
         if let Some((k, v)) = opt.split_once('=')

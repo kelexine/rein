@@ -20,6 +20,7 @@ pub const CODING_TOOLS: &[&str] = &[
     "todo_write",
     "todo_read",
     "switch_mode",
+    "agent",
 ];
 
 /// Tool names enabled in the read-only Plan profile.
@@ -32,6 +33,7 @@ pub const PLAN_TOOLS: &[&str] = &[
     "todo_write",
     "todo_read",
     "switch_mode",
+    "agent",
 ];
 
 /// Tool names enabled in the Personal profile.
@@ -43,6 +45,7 @@ pub const PERSONAL_TOOLS: &[&str] = &[
     "todo_write",
     "todo_read",
     "switch_mode",
+    "agent",
 ];
 
 /// A self-contained mode profile keeping `rein-core` completely mode-agnostic.

@@ -108,6 +108,14 @@ impl PolicyEngine {
     }
 
     fn decide(&self, tool_name: &str, capability: &Capability) -> PolicyDecision {
+        if let Capability::Subagent {
+            agent_type,
+            role,
+            target_mode,
+        } = capability
+        {
+            return self.decide_subagent(agent_type, role, *target_mode);
+        }
         if self.bypass_permissions {
             return PolicyDecision::Allow {
                 reason: format!(
@@ -139,6 +147,48 @@ impl PolicyEngine {
                     }
                 }
             }
+            Capability::Subagent {
+                agent_type,
+                role,
+                target_mode,
+            } => self.decide_subagent(agent_type, role, *target_mode),
+        }
+    }
+
+    fn decide_subagent(&self, agent_type: &str, role: &str, target_mode: ModeId) -> PolicyDecision {
+        if self.rules.mode == ModeId::Plan && target_mode != ModeId::Plan {
+            return PolicyDecision::Deny {
+                reason: format!(
+                    "plan mode confines subagents to read-only research (cannot spawn '{agent_type}' in {target_mode:?} mode)"
+                ),
+            };
+        }
+        if target_mode == ModeId::Coding && self.rules.mode != ModeId::Coding {
+            return PolicyDecision::Deny {
+                reason: format!(
+                    "coding subagents require active Coding mode (current mode: {:?})",
+                    self.rules.mode
+                ),
+            };
+        }
+        if target_mode == ModeId::Personal && self.rules.mode != ModeId::Personal {
+            return PolicyDecision::Deny {
+                reason: format!(
+                    "personal subagents require active Personal mode (current mode: {:?})",
+                    self.rules.mode
+                ),
+            };
+        }
+        if target_mode == ModeId::Plan {
+            return PolicyDecision::Allow {
+                reason: format!("read-only research subagent '{agent_type}' ({role}) permitted"),
+            };
+        }
+        PolicyDecision::Allow {
+            reason: format!(
+                "subagent '{agent_type}' ({role}) permitted under active {:?} session policy",
+                self.rules.mode
+            ),
         }
     }
 
@@ -272,6 +322,11 @@ impl PolicyEngine {
         if self.sandbox.resolve_within(path).is_err() {
             return PolicyDecision::Deny {
                 reason: format!("path '{}' is outside workspace sandbox", path.display()),
+            };
+        }
+        if mode == AccessMode::Write && self.sandbox.is_protected(path) {
+            return PolicyDecision::Deny {
+                reason: format!("refusing write to protected path '{}'", path.display()),
             };
         }
         match mode {
@@ -530,7 +585,7 @@ fn tokens_start_with(stage_tokens: &[&str], pattern_tokens: &[&str]) -> bool {
     if pattern_tokens.is_empty() || stage_tokens.len() < pattern_tokens.len() {
         return false;
     }
-    basename(stage_tokens[0]) == basename(pattern_tokens[0])
+    stage_tokens[0] == pattern_tokens[0]
         && stage_tokens[1..pattern_tokens.len()] == pattern_tokens[1..]
 }
 
@@ -900,6 +955,74 @@ mod tests {
             },
         )?;
         assert!(matches!(switch_decision, PolicyDecision::Allow { .. }));
+
+        let _ = std::fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_policy_confines_plan_mode_to_research_and_requires_coding_mode_for_coder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ws = std::env::temp_dir().join("rein_policy_subagent_confinement");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws)?;
+        let audit_path = ws.join("audit.jsonl");
+
+        // Plan mode denies coding/personal subagents even if bypass_permissions is true.
+        let plan_engine = PolicyEngine::with_sandbox_status(
+            PolicyRuleSet::plan_default(),
+            WorkspaceSandbox::new(&ws),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        )
+        .with_bypass_permissions(true);
+
+        let plan_research = plan_engine.evaluate(
+            "agent",
+            &Capability::Subagent {
+                agent_type: "research".to_owned(),
+                role: "Codebase Explorer".to_owned(),
+                target_mode: ModeId::Plan,
+            },
+        )?;
+        assert!(matches!(plan_research, PolicyDecision::Allow { .. }));
+
+        let plan_coder = plan_engine.evaluate(
+            "agent",
+            &Capability::Subagent {
+                agent_type: "coder".to_owned(),
+                role: "Fix Bug".to_owned(),
+                target_mode: ModeId::Coding,
+            },
+        )?;
+        assert!(matches!(plan_coder, PolicyDecision::Deny { .. }));
+
+        // Coding mode allows both research and coding subagents, and denies personal subagents.
+        let coding_engine = PolicyEngine::with_sandbox_status(
+            PolicyRuleSet::coding_default(),
+            WorkspaceSandbox::new(&ws),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+        let coding_coder = coding_engine.evaluate(
+            "agent",
+            &Capability::Subagent {
+                agent_type: "coder".to_owned(),
+                role: "Implement Feature".to_owned(),
+                target_mode: ModeId::Coding,
+            },
+        )?;
+        assert!(matches!(coding_coder, PolicyDecision::Allow { .. }));
+
+        let coding_personal = coding_engine.evaluate(
+            "agent",
+            &Capability::Subagent {
+                agent_type: "personal".to_owned(),
+                role: "Send Email".to_owned(),
+                target_mode: ModeId::Personal,
+            },
+        )?;
+        assert!(matches!(coding_personal, PolicyDecision::Deny { .. }));
 
         let _ = std::fs::remove_dir_all(&ws);
         Ok(())

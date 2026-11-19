@@ -9,7 +9,8 @@ use rein_tools::{McpServerConfig, TodoItem, TodoListState, TodoStatus, TodoStore
 use serde_json::Value;
 
 use crate::agent::{
-    ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, TurnCheckpoint,
+    ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, LiveSubagentStatus,
+    SubagentTracker, TurnCheckpoint,
 };
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::config::{ProviderKind, SessionSummary};
@@ -111,6 +112,7 @@ pub struct AppState {
     history_cursor: Option<usize>,
     draft_input: String,
     bypass_permissions: bool,
+    subagent_tracker: SubagentTracker,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -193,7 +195,21 @@ impl AppState {
             history_cursor: None,
             draft_input: String::new(),
             bypass_permissions: false,
+            subagent_tracker: SubagentTracker::new(),
         }
+    }
+
+    /// Attaches the shared [`SubagentTracker`] so running sub-agents render live above the prompt box.
+    #[must_use]
+    pub fn with_subagent_tracker(mut self, tracker: SubagentTracker) -> Self {
+        self.subagent_tracker = tracker;
+        self
+    }
+
+    /// Returns a snapshot of currently running sub-agents.
+    #[must_use]
+    pub fn active_subagents(&self) -> Vec<LiveSubagentStatus> {
+        self.subagent_tracker.snapshot()
     }
 
     /// Marks whether `--dangerously-bypass-permission` / `--yolo` is active for TUI display.

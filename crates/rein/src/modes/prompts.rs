@@ -207,6 +207,7 @@ fn mode_guidance_section(mode: ModeId) -> &'static str {
 fn coding_mode_section() -> &'static str {
     "## Coding Workflow\n\
      - Locate and inspect before modifying: prefer `glob`, `grep`, and `read` over `bash` file commands to inspect definitions, callers, and tests; parallelize independent read-only tool calls when useful.\n\
+     - Delegate focused research or parallel audits using the `agent` tool (`type: \"research\"` or `\"coder\"`); emit multiple `agent` calls in a single turn to run sub-agents concurrently.\n\
      - Prefer targeted `edit` changes on existing files over rewriting whole files with `write`; keep edits minimal without unrequested abstractions or speculative refactors.\n\
      - Prioritize security: validate untrusted input, keep path/shell handling strict, and never hardcode secrets or bypass the Landlock sandbox.\n\
      - Complete all unblocked work cleanly instead of stopping early for unnecessary check-ins; use `todo_write` to track multi-step tasks.\n\
@@ -215,7 +216,7 @@ fn coding_mode_section() -> &'static str {
 
 fn plan_mode_section() -> &'static str {
     "## Plan Workflow\n\
-     - Explore strictly read-only using `read`, `glob`, `grep`, and read-only `bash` commands; never modify files in Plan mode.\n\
+     - Explore strictly read-only using `read`, `glob`, `grep`, read-only `bash` commands, and `agent` (`type: \"research\"` or `\"plan\"`); never modify files or spawn coding sub-agents in Plan mode.\n\
      - Follow four phases:\n\
        1. Explore — inspect key entrypoints, callers, types, and tests before designing.\n\
        2. Design — weigh architecture, edge cases, reversibility, and file boundaries; ask focused clarifying questions only if blocked on ambiguous intent.\n\

@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::classifier::lexer::{LexedScript, normalize_and_expand_word, scan_script, unquote_word};
+use crate::classifier::lexer::{
+    LexedScript, has_active_var_expansion, normalize_and_expand_word, scan_script, unquote_word,
+};
 
 /// Redirection operator kind attached to a shell stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,8 @@ pub struct ParsedCommand {
     pub raw_args: Vec<String>,
     /// Positional (non-flag) arguments.
     pub positionals: Vec<String>,
+    /// Whether any raw token in this stage contains an active `$VAR` / `${VAR}` expansion.
+    pub has_var_expansion: bool,
 }
 
 /// Complete parsed shell pipeline/script.
@@ -94,6 +98,7 @@ impl ParsedCommand {
             long_options,
             raw_args: args,
             positionals,
+            has_var_expansion: false,
         }
     }
 
@@ -170,6 +175,7 @@ fn flush_tokens(
         return;
     }
     let drained: Vec<String> = std::mem::take(raw_stage);
+    let stage_has_var = drained.iter().any(|raw| has_active_var_expansion(raw));
     let mut words = Vec::new();
     for raw in drained {
         if matches!(raw.as_str(), "(" | ")" | "{" | "}") {
@@ -194,13 +200,14 @@ fn flush_tokens(
             words.push(expand_vars(&w, vars));
         }
     }
-    build_stage_commands(words, vars, stages);
+    build_stage_commands(words, vars, stages, stage_has_var);
 }
 
 fn build_stage_commands(
     words: Vec<String>,
     vars: &mut BTreeMap<String, String>,
     stages: &mut Vec<ParsedCommand>,
+    stage_has_var: bool,
 ) {
     let mut idx = 0;
     while idx < words.len()
@@ -233,13 +240,13 @@ fn build_stage_commands(
     if idx < words.len() {
         let program = words[idx].clone();
         let args = words[idx + 1..].to_vec();
-        stages.push(ParsedCommand::from_words(program, args, env_vars));
+        let mut parsed = ParsedCommand::from_words(program, args, env_vars);
+        parsed.has_var_expansion = stage_has_var;
+        stages.push(parsed);
     } else if !env_vars.is_empty() {
-        stages.push(ParsedCommand::from_words(
-            String::new(),
-            Vec::new(),
-            env_vars,
-        ));
+        let mut parsed = ParsedCommand::from_words(String::new(), Vec::new(), env_vars);
+        parsed.has_var_expansion = stage_has_var;
+        stages.push(parsed);
     }
 }
 

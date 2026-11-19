@@ -20,18 +20,32 @@ const ACCESS_FS_READ_EXEC: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 #[cfg(target_os = "linux")]
 const ACCESS_FS_FILE_READ_EXEC: u64 = (1 << 0) | (1 << 2);
 #[cfg(target_os = "linux")]
-const ACCESS_FS_FILE_RW: u64 = (1 << 1) | (1 << 2);
+const ACCESS_FS_FILE_RW_V1: u64 = (1 << 1) | (1 << 2);
 #[cfg(target_os = "linux")]
 const ACCESS_FS_READ_WRITE_V1: u64 = (1 << 13) - 1;
 #[cfg(target_os = "linux")]
 const ACCESS_FS_REFER: u64 = 1 << 13;
 #[cfg(target_os = "linux")]
-const ACCESS_FS_READ_WRITE_V2: u64 = ACCESS_FS_READ_WRITE_V1 | ACCESS_FS_REFER;
+const ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+#[cfg(target_os = "linux")]
+const ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+#[cfg(target_os = "linux")]
+const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const SCOPE_SIGNAL: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const PROTECTED_WORKSPACE_ENTRIES: &[&str] = &[".git", ".rein", ".vscode"];
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
 struct LandlockRulesetAttr {
     handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -74,7 +88,29 @@ pub fn probe_kernel_sandbox() -> SandboxStatus {
     }
 }
 
-/// Applies `PR_SET_NO_NEW_PRIVS` and Landlock filesystem restrictions to the current child process.
+/// Detaches the child process from any controlling terminal (`setsid`) to prevent `TIOCSTI` injection.
+pub fn detach_controlling_terminal() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `setsid` takes no arguments and creates a new session with no controlling tty when not session leader.
+        unsafe {
+            let _ = libc::setsid();
+        }
+    }
+}
+
+/// Marks the process non-dumpable (`PR_SET_DUMPABLE = 0`) so same-UID children cannot read `/proc/<pid>/environ`.
+pub fn harden_process_dumpable() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` takes integer arguments and restricts ptrace / `/proc/<pid>/environ`.
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
+}
+
+/// Applies `PR_SET_NO_NEW_PRIVS` and Landlock ABI v1-v6+ restrictions to the current child process.
 pub fn apply_sandbox_in_child(spec: &SandboxSpec) -> Result<(), PolicyError> {
     #[cfg(target_os = "linux")]
     {
@@ -84,13 +120,25 @@ pub fn apply_sandbox_in_child(spec: &SandboxSpec) -> Result<(), PolicyError> {
                 return Err(PolicyError::SandboxUnavailable(reason));
             }
         };
-        let rw_dir_access = if abi_version >= 2 {
-            ACCESS_FS_READ_WRITE_V2
+        let (handled_fs, rw_dir_access, rw_file_access) = fs_masks_for_abi(abi_version);
+        let handled_net = if abi_version >= 4 {
+            ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
         } else {
-            ACCESS_FS_READ_WRITE_V1
+            0
         };
+        let scoped = if abi_version >= 6 {
+            SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+        } else {
+            0
+        };
+        let attr_size = match abi_version {
+            1..=3 => std::mem::size_of::<u64>(),
+            4..=5 => std::mem::size_of::<u64>() * 2,
+            _ => std::mem::size_of::<LandlockRulesetAttr>(),
+        };
+
         set_no_new_privs()?;
-        let ruleset_fd = create_ruleset(rw_dir_access)?;
+        let ruleset_fd = create_ruleset(handled_fs, handled_net, scoped, attr_size)?;
         for ro_path in &spec.read_only_paths {
             if ro_path.exists() {
                 let access = if ro_path.is_dir() {
@@ -106,17 +154,12 @@ pub fn apply_sandbox_in_child(spec: &SandboxSpec) -> Result<(), PolicyError> {
                 let access = if rw_path.is_dir() {
                     rw_dir_access
                 } else {
-                    ACCESS_FS_FILE_RW
+                    rw_file_access
                 };
                 add_path_rule(ruleset_fd, rw_path, access)?;
             }
         }
-        let ws_access = if spec.read_only_workspace {
-            ACCESS_FS_READ_EXEC
-        } else {
-            rw_dir_access
-        };
-        add_path_rule(ruleset_fd, &spec.workspace_root, ws_access)?;
+        apply_workspace_rules(ruleset_fd, spec, rw_dir_access, rw_file_access)?;
         restrict_self(ruleset_fd)
     }
     #[cfg(not(target_os = "linux"))]
@@ -126,6 +169,74 @@ pub fn apply_sandbox_in_child(spec: &SandboxSpec) -> Result<(), PolicyError> {
             "Landlock kernel sandbox requires Linux".to_owned(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn fs_masks_for_abi(abi_version: u32) -> (u64, u64, u64) {
+    let mut handled = ACCESS_FS_READ_WRITE_V1;
+    let mut rw_dir = ACCESS_FS_READ_WRITE_V1;
+    let mut rw_file = ACCESS_FS_FILE_RW_V1;
+
+    if abi_version >= 2 {
+        handled |= ACCESS_FS_REFER;
+        rw_dir |= ACCESS_FS_REFER;
+    }
+    if abi_version >= 3 {
+        handled |= ACCESS_FS_TRUNCATE;
+        rw_dir |= ACCESS_FS_TRUNCATE;
+        rw_file |= ACCESS_FS_TRUNCATE;
+    }
+    if abi_version >= 5 {
+        // Handle IOCTL_DEV without granting it to device files, blocking TIOCSTI/device ioctls.
+        handled |= ACCESS_FS_IOCTL_DEV;
+    }
+    (handled, rw_dir, rw_file)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_workspace_rules(
+    ruleset_fd: i32,
+    spec: &SandboxSpec,
+    rw_dir_access: u64,
+    rw_file_access: u64,
+) -> Result<(), PolicyError> {
+    if spec.read_only_workspace {
+        return add_path_rule(ruleset_fd, &spec.workspace_root, ACCESS_FS_READ_EXEC);
+    }
+
+    // Keep `workspace_root` itself and `.git`/`.rein`/`.vscode` read-only inside Landlock
+    // while granting read-write on all other workspace subdirectories and files.
+    add_path_rule(ruleset_fd, &spec.workspace_root, ACCESS_FS_READ_EXEC)?;
+    let Ok(entries) = std::fs::read_dir(&spec.workspace_root) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if PROTECTED_WORKSPACE_ENTRIES.contains(&name_str.as_ref()) {
+            let access = if path.is_dir() {
+                ACCESS_FS_READ_EXEC
+            } else {
+                ACCESS_FS_FILE_READ_EXEC
+            };
+            add_path_rule(ruleset_fd, &path, access)?;
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let access = if meta.is_dir() {
+            rw_dir_access
+        } else {
+            rw_file_access
+        };
+        add_path_rule(ruleset_fd, &path, access)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -143,14 +254,23 @@ fn set_no_new_privs() -> Result<(), PolicyError> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_ruleset(handled_access_fs: u64) -> Result<i32, PolicyError> {
-    let attr = LandlockRulesetAttr { handled_access_fs };
-    // SAFETY: `attr` is a valid stack-allocated LandlockRulesetAttr with exact size.
+fn create_ruleset(
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+    attr_size: usize,
+) -> Result<i32, PolicyError> {
+    let attr = LandlockRulesetAttr {
+        handled_access_fs,
+        handled_access_net,
+        scoped,
+    };
+    // SAFETY: `attr` is a valid stack-allocated LandlockRulesetAttr and `attr_size` matches the ABI struct prefix.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
             &raw const attr,
-            std::mem::size_of::<LandlockRulesetAttr>(),
+            attr_size,
             0u32,
         )
     };

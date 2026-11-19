@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
 use rein_core::{
@@ -18,6 +19,7 @@ use crate::agent::snapshot::{
     count_jsonl_lines, load_checkpoints, now_unix_secs, restore_workspace_snapshot,
     truncate_jsonl_lines,
 };
+use crate::agent::subagent::SubagentSessionState;
 use crate::config::append_allowed_command;
 use crate::modes::{ContextBuilder, ModeManager, Profile, RuntimeContext};
 
@@ -117,6 +119,8 @@ pub struct AgentLoop {
     allowed_commands: Vec<String>,
     extra_tools: Vec<String>,
     runtime_context: RuntimeContext,
+    subagent_state: Option<Arc<RwLock<SubagentSessionState>>>,
+    subagent_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl AgentLoop {
@@ -144,6 +148,33 @@ impl AgentLoop {
             allowed_commands,
             extra_tools: Vec::new(),
             runtime_context: RuntimeContext::new(),
+            subagent_state: None,
+            subagent_cancel: None,
+        }
+    }
+
+    /// Attaches shared policy and cancellation handles so spawned `agent` sub-agents stay confined to active session policy.
+    #[must_use]
+    pub fn with_subagent_handles(
+        mut self,
+        state: Arc<RwLock<SubagentSessionState>>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        self.subagent_state = Some(state);
+        self.subagent_cancel = Some(cancel);
+        self.sync_subagent_state();
+        self
+    }
+
+    fn sync_subagent_state(&self) {
+        if let Some(handle) = &self.subagent_state
+            && let Ok(mut guard) = handle.write()
+        {
+            guard.active_mode = self.modes.active().mode;
+            guard.policy_rules = self.policy.rules().clone();
+            guard.bypass_permissions = self.policy.is_bypass_permissions();
+            guard.allowed_commands = self.allowed_commands.clone();
+            guard.sandbox_status = self.policy.sandbox_status().clone();
         }
     }
 
@@ -237,6 +268,7 @@ impl AgentLoop {
             .modes
             .switch_to(next, &mut self.policy, &self.event_log)
             .context("failed to switch mode profile")?;
+        self.sync_subagent_state();
         Ok(switched)
     }
 
@@ -474,6 +506,7 @@ impl AgentLoop {
         {
             self.checkpoints = persisted;
         }
+        self.sync_subagent_state();
         Ok(items)
     }
 
@@ -519,6 +552,10 @@ impl AgentLoop {
         };
         let _ = append_checkpoint(&checkpoints_path_for(self.event_log.path()), &checkpoint);
         self.checkpoints.push(checkpoint);
+        self.sync_subagent_state();
+        if let Some(sub_cancel) = &self.subagent_cancel {
+            sub_cancel.store(false, Ordering::Relaxed);
+        }
 
         let user_msg = Message::new(Role::User, prompt);
         record_full_message(self.full_transcript_path.as_deref(), &user_msg)?;
@@ -557,6 +594,9 @@ impl AgentLoop {
             ) {
                 Ok(evs) => evs,
                 Err(CoreError::Cancelled) => {
+                    if let Some(sub_cancel) = &self.subagent_cancel {
+                        sub_cancel.store(true, Ordering::Relaxed);
+                    }
                     finalize_cancelled_stream(
                         streaming,
                         self.full_transcript_path.as_deref(),
@@ -708,6 +748,20 @@ fn execute_tool_batch(
     record_full_message(full_transcript_path, &assistant_msg)?;
     history.push(assistant_msg);
 
+    if calls.len() > 1 && calls.iter().all(|c| c.name == "agent") {
+        return execute_parallel_agent_batch(
+            streaming,
+            full_transcript_path,
+            policy,
+            registry,
+            modes,
+            history,
+            calls,
+            prompter,
+            cancel,
+        );
+    }
+
     let mut iter = calls.into_iter();
     let Some(first) = iter.next() else {
         return Ok(());
@@ -745,6 +799,120 @@ fn execute_tool_batch(
         )?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_parallel_agent_batch(
+    streaming: Turn<'_, rein_core::Streaming>,
+    full_transcript_path: Option<&Path>,
+    policy: &PolicyEngine,
+    registry: &ToolRegistry,
+    modes: &ModeManager,
+    history: &mut Vec<Message>,
+    calls: Vec<ToolCall>,
+    prompter: &mut dyn ApprovalPrompter,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    for call in &calls {
+        prompter.on_tool_status(&format_tool_status(call));
+        prompter.on_tool_start(call);
+    }
+
+    let mut decisions = Vec::with_capacity(calls.len());
+    let temp_dir = std::env::temp_dir().join(format!(
+        "rein_parallel_eval_{}_{}",
+        std::process::id(),
+        now_unix_secs()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let eval_log = EventLog::new(temp_dir.join("eval.jsonl"));
+    for call in &calls {
+        let awaiting = Turn::new(&eval_log).request_tool(call.clone())?;
+        let decision =
+            registry.evaluate_turn_for_profile(&awaiting, policy, &modes.active().allowed_tools)?;
+        decisions.push(decision);
+    }
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let mut raw_outputs: Vec<Option<ToolOutput>> = vec![None; calls.len()];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (idx, (call, decision)) in calls.iter().zip(decisions.iter()).enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                continue;
+            }
+            if matches!(decision, PolicyDecision::Allow { .. }) {
+                handles.push((idx, scope.spawn(move || registry.invoke_raw(call))));
+            }
+        }
+        for (idx, handle) in handles {
+            if let Ok(Ok(out)) = handle.join() {
+                raw_outputs[idx] = Some(out);
+            }
+        }
+    });
+
+    let mut iter = calls.into_iter().zip(decisions).zip(raw_outputs);
+    let Some(((first_call, first_decision), first_out)) = iter.next() else {
+        return Ok(());
+    };
+    let mut idle = commit_parallel_agent_turn(
+        streaming.request_tool(first_call)?,
+        first_decision,
+        first_out,
+        full_transcript_path,
+        history,
+        prompter,
+        cancel,
+    )?;
+    for ((call, decision), out) in iter {
+        idle = commit_parallel_agent_turn(
+            idle.request_tool(call)?,
+            decision,
+            out,
+            full_transcript_path,
+            history,
+            prompter,
+            cancel,
+        )?;
+    }
+    Ok(())
+}
+
+fn commit_parallel_agent_turn<'a>(
+    awaiting: Turn<'a, rein_core::AwaitingPolicy>,
+    decision: PolicyDecision,
+    precomputed: Option<ToolOutput>,
+    full_transcript_path: Option<&Path>,
+    history: &mut Vec<Message>,
+    prompter: &mut dyn ApprovalPrompter,
+    cancel: &AtomicBool,
+) -> Result<Turn<'a, rein_core::Idle>> {
+    let call = awaiting.pending_call().clone();
+    let (idle, output) = if cancel.load(Ordering::Relaxed) {
+        awaiting.deny("cancelled by user")?
+    } else {
+        match (decision, precomputed) {
+            (PolicyDecision::Allow { reason }, Some(out)) => {
+                let executing = awaiting.approve(reason)?;
+                let done = executing.complete(out.clone())?;
+                (done, out)
+            }
+            (PolicyDecision::Allow { reason }, None) => {
+                awaiting.deny(format!("parallel sub-agent execution failed ({reason})"))?
+            }
+            (PolicyDecision::Deny { reason }, _) => awaiting.deny(reason)?,
+            (PolicyDecision::Ask { prompt }, _) => awaiting.deny(format!(
+                "parallel sub-agent batch requires policy-allowed role: {prompt}"
+            ))?,
+        }
+    };
+    prompter.on_tool_finish(&call, &output);
+    let mut tool_msg = Message::new(Role::Tool, output.content);
+    tool_msg.tool_calls.push(call);
+    record_full_message(full_transcript_path, &tool_msg)?;
+    history.push(tool_msg);
+    Ok(idle)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -985,6 +1153,19 @@ fn format_history_for_summary(history: &[Message], focus: Option<&str>) -> Strin
 /// Formats a compact 1-line tool indicator shown inline in the TUI transcript.
 #[must_use]
 pub fn format_tool_status(call: &ToolCall) -> String {
+    if call.name == "agent" {
+        let kind = call
+            .arguments
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("research");
+        let role = call
+            .arguments
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Subagent");
+        return format!("· Agent({kind}: {})", truncate_inline(role, 48));
+    }
     let target = call
         .arguments
         .get("path")

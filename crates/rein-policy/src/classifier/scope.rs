@@ -21,7 +21,12 @@ pub fn classify_path_token(raw_token: &str, sandbox: Option<&WorkspaceSandbox>) 
     if is_protected_path(token) {
         return TargetScope::Protected;
     }
-    if is_explicit_outside_path(token) {
+    if let Some(sb) = sandbox
+        && sb.is_protected(Path::new(token))
+    {
+        return TargetScope::Protected;
+    }
+    if is_explicit_outside_path(token) || contains_unresolved_var(token) {
         return TargetScope::OutsideWorkspace;
     }
     if let Some(sb) = sandbox {
@@ -34,14 +39,33 @@ pub fn classify_path_token(raw_token: &str, sandbox: Option<&WorkspaceSandbox>) 
     TargetScope::Workspace
 }
 
-/// Checks if a path references `.git`, `.vscode`, or `.rein` protected trees.
+/// Checks if a path references `.git`, `.vscode`, or `.rein` protected trees (normalizing `.` and `..`).
 #[must_use]
 pub fn is_protected_path(token: &str) -> bool {
-    let trimmed = token.trim_start_matches("./");
-    for protected in PROTECTED_COMPONENTS {
-        if trimmed == *protected
-            || trimmed.starts_with(&format!("{protected}/"))
-            || trimmed.contains(&format!("/{protected}/"))
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in token.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let _ = stack.pop();
+            }
+            other => {
+                if PROTECTED_COMPONENTS.contains(&other) {
+                    return true;
+                }
+                stack.push(other);
+            }
+        }
+    }
+    false
+}
+
+fn contains_unresolved_var(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' || bytes[i + 1] == b'{')
         {
             return true;
         }

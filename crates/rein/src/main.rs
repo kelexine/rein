@@ -7,6 +7,8 @@
 
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use rein_core::{EventLog, ReplayProvider, Role, SessionEvent, login_with_browser};
@@ -20,7 +22,10 @@ use rein_tools::{
     TodoWriteTool, Tool, ToolRegistry, WriteTool,
 };
 
-use rein::agent::{AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest};
+use rein::agent::{
+    AgentLoop, AgentTool, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
+    SubagentEnv, SubagentSessionState, SubagentTracker,
+};
 use rein::commands::SlashKind;
 use rein::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
@@ -48,6 +53,8 @@ fn main() -> Result<()> {
         let code = execute_sandbox_child(raw_spec)?;
         std::process::exit(code);
     }
+
+    rein_policy::harden_process_dumpable();
 
     let workspace_root = std::env::current_dir().context("failed to resolve workspace root")?;
     let mut loaded = ensure_dirs_and_load(&workspace_root)?;
@@ -175,7 +182,7 @@ fn run_interactive(
     workspace_root: &Path,
     mut loaded: LoadedReinState,
     policy: PolicyEngine,
-    registry: ToolRegistry,
+    mut registry: ToolRegistry,
     memory: JsonlMemoryStore,
     todo_store: TodoStore,
     initial_profile: Profile,
@@ -235,9 +242,40 @@ fn run_interactive(
             &loaded.paths.repo_memory_dir,
             &loaded.paths.global_memory_dir,
         );
+    let subagent_tracker = SubagentTracker::new();
+    let subagent_state = Arc::new(RwLock::new(SubagentSessionState::default()));
+    let subagent_cancel = Arc::new(AtomicBool::new(false));
+    registry.register(Box::new(AgentTool::new(SubagentEnv {
+        sandbox: policy.sandbox().clone(),
+        audit_log_path: loaded.paths.audit_log.clone(),
+        sessions_dir: loaded.paths.sessions_dir.clone(),
+        bash_outputs_dir: loaded.paths.repo_dir.join("bash-outputs"),
+        notes_file: loaded.paths.notes.clone(),
+        calendar_file: loaded.paths.calendar.clone(),
+        calendar_ics_dir: loaded
+            .config
+            .ics_dir
+            .clone()
+            .unwrap_or_else(|| loaded.paths.global_dir.join("calendar")),
+        email_file: loaded.paths.email.clone(),
+        maildir_path: loaded
+            .config
+            .maildir
+            .clone()
+            .unwrap_or_else(|| loaded.paths.global_dir.join("maildir")),
+        memory: memory.clone(),
+        todo_store: todo_store.clone(),
+        runtime_context: runtime_context.clone(),
+        session_state: Arc::clone(&subagent_state),
+        tracker: subagent_tracker.clone(),
+        cancel: Arc::clone(&subagent_cancel),
+        provider_factory: SubagentEnv::config_provider_factory(loaded.config.clone()),
+    })));
+
     let event_log = EventLog::new(&event_log_path);
 
     let mut agent = AgentLoop::new(event_log, policy, registry, memory, initial_profile)
+        .with_subagent_handles(subagent_state, subagent_cancel)
         .with_full_transcript_path(&full_transcript_path)
         .with_command_allowlist_paths(&loaded.paths.repo_commands, &loaded.paths.global_commands)
         .with_allowed_commands(loaded.allowed_commands.clone())
@@ -246,6 +284,7 @@ fn run_interactive(
     let bypass_permissions = agent.policy().is_bypass_permissions();
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_bypass_permissions(bypass_permissions)
+        .with_subagent_tracker(subagent_tracker)
         .with_workspace_label(workspace_label)
         .with_session_id(&session_uid)
         .with_startup_notices(notices)

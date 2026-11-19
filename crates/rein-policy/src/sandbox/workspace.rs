@@ -35,22 +35,80 @@ impl WorkspaceSandbox {
             self.root.join(candidate)
         };
         let normalized = canonicalize_existing_prefix(&joined);
-        if normalized.starts_with(&self.root) {
-            Ok(normalized)
-        } else {
-            Err(PolicyError::SandboxEscape {
+        if !normalized.starts_with(&self.root) {
+            return Err(PolicyError::SandboxEscape {
                 root: self.root.clone(),
                 attempted: normalized,
-            })
+            });
         }
+        // Reject symlinks (including dangling symlinks) whose target escapes `self.root`.
+        if let Some(target) = resolve_symlink_target_if_any(&joined, &self.root)
+            && !target.starts_with(&self.root)
+        {
+            return Err(PolicyError::SandboxEscape {
+                root: self.root.clone(),
+                attempted: target,
+            });
+        }
+        Ok(normalized)
     }
+
+    /// Returns `true` when `candidate` (after normalizing `..` and resolving symlinks) hits `.git`, `.vscode`, or `.rein`.
+    #[must_use]
+    pub fn is_protected(&self, candidate: &Path) -> bool {
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.root.join(candidate)
+        };
+        let normalized = canonicalize_existing_prefix(&joined);
+        let rel = normalized.strip_prefix(&self.root).unwrap_or(candidate);
+        if has_protected_component(rel) {
+            return true;
+        }
+        if let Some(target) = resolve_symlink_target_if_any(&joined, &self.root) {
+            let target_rel = target.strip_prefix(&self.root).unwrap_or(&target);
+            if has_protected_component(target_rel) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn has_protected_component(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c,
+            Component::Normal(name)
+                if name == ".git" || name == ".vscode" || name == ".rein"
+        )
+    })
+}
+
+fn resolve_symlink_target_if_any(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut current = normalize_lexical(path);
+    for _ in 0..16 {
+        let meta = std::fs::symlink_metadata(&current).ok()?;
+        if !meta.file_type().is_symlink() {
+            return Some(canonicalize_existing_prefix(&current));
+        }
+        let target = std::fs::read_link(&current).ok()?;
+        let next = if target.is_absolute() {
+            target
+        } else {
+            current.parent().unwrap_or(root).join(target)
+        };
+        current = normalize_lexical(&next);
+    }
+    Some(current)
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
     let lexical = normalize_lexical(path);
     let mut current = lexical.as_path();
     let mut tail = Vec::new();
-    while !current.exists() {
+    while std::fs::symlink_metadata(current).is_err() {
         if let Some(name) = current.file_name() {
             tail.push(name.to_os_string());
         }
@@ -58,6 +116,23 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
             Some(parent) if !parent.as_os_str().is_empty() => current = parent,
             _ => return lexical,
         }
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(current)
+        && meta.file_type().is_symlink()
+        && let Ok(link_target) = std::fs::read_link(current)
+    {
+        let resolved_link = if link_target.is_absolute() {
+            link_target
+        } else {
+            current
+                .parent()
+                .map_or_else(|| link_target.clone(), |p| p.join(&link_target))
+        };
+        let mut base = canonicalize_existing_prefix(&resolved_link);
+        for part in tail.into_iter().rev() {
+            base.push(part);
+        }
+        return base;
     }
     let mut base = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
     for part in tail.into_iter().rev() {

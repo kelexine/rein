@@ -151,7 +151,15 @@ pub fn classify_parsed_command(
         return env_effect;
     }
     let stage_effect = classify_command_body(cmd, sandbox);
-    env_effect.merge(stage_effect)
+    let mut merged = env_effect.merge(stage_effect);
+    if cmd.has_var_expansion {
+        merged = merged.merge(ShellClassification::with_target(
+            EffectLevel::ReadOnly,
+            TargetScope::OutsideWorkspace,
+            "unresolved shell variable expansion",
+        ));
+    }
+    merged
 }
 
 fn classify_export(cmd: &ParsedCommand, sandbox: Option<&WorkspaceSandbox>) -> ShellClassification {
@@ -211,10 +219,16 @@ fn classify_command_body(
             "glob in command position cannot be resolved statically",
         );
     }
-    if cmd.program.starts_with("./")
-        || cmd.program.starts_with("../")
-        || cmd.program.ends_with(".sh")
+    if cmd.program.contains('/')
+        && !cmd.program.starts_with("/usr/bin/")
+        && !cmd.program.starts_with("/bin/")
     {
+        return ShellClassification::new(
+            EffectLevel::Exec,
+            format!("executing path-qualified binary '{}'", cmd.program),
+        );
+    }
+    if cmd.program.ends_with(".sh") {
         return ShellClassification::new(
             EffectLevel::Exec,
             format!("executing script '{}'", cmd.program),

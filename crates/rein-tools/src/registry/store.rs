@@ -86,28 +86,33 @@ impl ToolRegistry {
         self.evaluate_turn(turn, policy)
     }
 
+    /// Invokes a registered tool's `execute` method directly after policy approval, returning its [`ToolOutput`].
+    pub fn invoke_raw(&self, call: &rein_core::ToolCall) -> Result<ToolOutput, ToolError> {
+        let tool = self
+            .tools
+            .get(&call.name)
+            .ok_or_else(|| ToolError::NotFound(call.name.clone()))?;
+        Ok(match tool.execute(&call.arguments) {
+            Ok(content) => ToolOutput {
+                call_id: call.id.clone(),
+                content,
+                is_error: false,
+            },
+            Err(err) => ToolOutput {
+                call_id: call.id.clone(),
+                content: err.to_string(),
+                is_error: true,
+            },
+        })
+    }
+
     /// Executes a policy-approved [`Turn<Executing>`] and transitions the turn back to [`Idle`].
     pub fn execute_approved<'a>(
         &self,
         turn: Turn<'a, Executing>,
     ) -> Result<(Turn<'a, Idle>, ToolOutput), ToolError> {
         let call = turn.approved_call().clone();
-        let tool = self
-            .tools
-            .get(&call.name)
-            .ok_or_else(|| ToolError::NotFound(call.name.clone()))?;
-        let output = match tool.execute(&call.arguments) {
-            Ok(content) => ToolOutput {
-                call_id: call.id,
-                content,
-                is_error: false,
-            },
-            Err(err) => ToolOutput {
-                call_id: call.id,
-                content: err.to_string(),
-                is_error: true,
-            },
-        };
+        let output = self.invoke_raw(&call)?;
         let idle = turn
             .complete(output.clone())
             .map_err(|err| ToolError::InvalidArguments {
