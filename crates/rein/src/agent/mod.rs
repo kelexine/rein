@@ -19,5 +19,5 @@ pub use snapshot::{
 };
 pub use subagent::{
     AgentTool, DEFAULT_SUBAGENT_MAX_ROUNDS, LiveSubagentStatus, ProviderFactory, SubagentEnv,
-    SubagentSessionState, SubagentTracker,
+    SubagentRunState, SubagentSessionState, SubagentTracker,
 };

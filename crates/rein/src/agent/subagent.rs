@@ -10,6 +10,7 @@ use anyhow::Result;
 use rein_core::{EventLog, ModeId, Provider, ToolCall, ToolOutput};
 use rein_policy::{
     AuditLog, Capability, PolicyEngine, PolicyRuleSet, SandboxStatus, WorkspaceSandbox,
+    local_time_parts,
 };
 use rein_tools::{
     BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, MemoryTool,
@@ -33,8 +34,40 @@ pub const DEFAULT_SUBAGENT_MAX_ROUNDS: usize = 8;
 /// Factory closure producing a `(Provider, model_label)` for an optional model override.
 pub type ProviderFactory = Arc<dyn Fn(Option<&str>) -> (Box<dyn Provider>, String) + Send + Sync>;
 
-/// Live execution state of one running sub-agent rendered above the TUI prompt box.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Lifecycle state of a tracked sub-agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentRunState {
+    /// Currently executing rounds.
+    Running,
+    /// Finished successfully.
+    Completed,
+    /// Exited with an error.
+    Failed,
+    /// Cancelled / killed before finishing.
+    Killed,
+}
+
+impl SubagentRunState {
+    /// Returns `true` when this sub-agent has reached a terminal state.
+    #[must_use]
+    pub fn is_done(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+
+    /// Lowercase status label shown in the TUI.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+        }
+    }
+}
+
+/// Live execution state of one sub-agent rendered below the TUI prompt box and in `/tasks`.
+#[derive(Debug, Clone)]
 pub struct LiveSubagentStatus {
     /// Unique runtime sub-agent identifier.
     pub id: String,
@@ -46,14 +79,26 @@ pub struct LiveSubagentStatus {
     pub model_label: String,
     /// Current human-readable activity (`Thinking…`, `Reading file`, `Running command`, `Searching…`).
     pub status: String,
+    /// Current lifecycle state (`Running`, `Completed`, `Failed`, `Killed`).
+    pub run_state: SubagentRunState,
     /// Unix timestamp (seconds) when this sub-agent started.
     pub started_unix_secs: u64,
+    /// Local wall-clock `HH:MM:SS` start time.
+    pub started_hms: String,
+    /// Local wall-clock `YYYY-MM-DD HH:MM:SS` start timestamp.
+    pub started_full: String,
+    /// Completion Unix timestamp (seconds), if terminal.
+    pub finished_unix_secs: Option<u64>,
+    /// Accumulated step/tool log and final report lines for Task Details inspection.
+    pub output_lines: Vec<String>,
+    /// Per-subagent cancellation handle triggered via `k` in `/tasks` or parent cancellation.
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
-/// Thread-safe tracker of currently running sub-agents shared with `AppState`.
+/// Thread-safe tracker of running and recently finished sub-agents shared with `AppState`.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentTracker {
-    active: Arc<Mutex<Vec<LiveSubagentStatus>>>,
+    records: Arc<Mutex<Vec<LiveSubagentStatus>>>,
 }
 
 impl SubagentTracker {
@@ -64,32 +109,150 @@ impl SubagentTracker {
     }
 
     /// Registers a newly started sub-agent.
-    pub fn start(&self, status: LiveSubagentStatus) {
-        if let Ok(mut guard) = self.active.lock() {
+    pub fn start(&self, mut status: LiveSubagentStatus) {
+        let ts = i64::try_from(status.started_unix_secs).unwrap_or(0);
+        let p = local_time_parts(ts);
+        if status.started_hms.is_empty() {
+            status.started_hms = format!("{:02}:{:02}:{:02}", p.hour, p.minute, p.second);
+        }
+        if status.started_full.is_empty() {
+            status.started_full = format!(
+                "{:04}-{:02}-{:02} {}",
+                p.year, p.month, p.day, status.started_hms
+            );
+        }
+        if let Ok(mut guard) = self.records.lock() {
             guard.push(status);
         }
     }
 
     /// Updates the current human-readable activity string for sub-agent `id`.
     pub fn update_status(&self, id: &str, new_status: impl Into<String>) {
-        if let Ok(mut guard) = self.active.lock()
+        if let Ok(mut guard) = self.records.lock()
             && let Some(entry) = guard.iter_mut().find(|s| s.id == id)
         {
             entry.status = new_status.into();
         }
     }
 
-    /// Removes sub-agent `id` when its execution completes.
-    pub fn finish(&self, id: &str) {
-        if let Ok(mut guard) = self.active.lock() {
-            guard.retain(|s| s.id != id);
+    /// Appends one progress or output line for sub-agent `id` (bounded to last 500 lines).
+    pub fn append_log(&self, id: &str, line: impl Into<String>) {
+        if let Ok(mut guard) = self.records.lock()
+            && let Some(entry) = guard.iter_mut().find(|s| s.id == id)
+        {
+            entry.output_lines.push(line.into());
+            if entry.output_lines.len() > 500 {
+                let excess = entry.output_lines.len() - 500;
+                entry.output_lines.drain(..excess);
+            }
         }
     }
 
-    /// Returns a snapshot of all currently running sub-agents.
+    /// Marks sub-agent `id` as finished while retaining its record for inspection/deletion (`x`).
+    pub fn finish(&self, id: &str, final_state: SubagentRunState, output_text: &str) {
+        if let Ok(mut guard) = self.records.lock()
+            && let Some(entry) = guard.iter_mut().find(|s| s.id == id)
+        {
+            let resolved = if entry.cancel_flag.load(Ordering::Acquire) {
+                SubagentRunState::Killed
+            } else {
+                final_state
+            };
+            entry.run_state = resolved;
+            entry.status = resolved.label().to_owned();
+            entry.finished_unix_secs = Some(now_unix_secs());
+            if !output_text.trim().is_empty() {
+                if !entry.output_lines.is_empty() {
+                    entry.output_lines.push(String::new());
+                }
+                entry
+                    .output_lines
+                    .extend(output_text.lines().map(str::to_owned));
+            }
+        }
+    }
+
+    /// Requests cancellation of running sub-agent `id`.
+    pub fn kill(&self, id: &str) -> Result<LiveSubagentStatus, String> {
+        let mut guard = self
+            .records
+            .lock()
+            .map_err(|_| "subagent tracker lock poisoned".to_owned())?;
+        let Some(entry) = guard.iter_mut().find(|s| s.id == id) else {
+            return Err(format!("unknown subagent '{id}'"));
+        };
+        if entry.run_state.is_done() {
+            return Err(format!(
+                "subagent '{id}' is already {}",
+                entry.run_state.label()
+            ));
+        }
+        entry.cancel_flag.store(true, Ordering::Release);
+        entry.run_state = SubagentRunState::Killed;
+        entry.status = "killed".to_owned();
+        entry.finished_unix_secs = Some(now_unix_secs());
+        Ok(entry.clone())
+    }
+
+    /// Triggers cancellation on all currently running sub-agents (e.g., on `Esc` or shutdown).
+    pub fn cancel_all(&self) {
+        if let Ok(mut guard) = self.records.lock() {
+            for entry in guard.iter_mut() {
+                if entry.run_state == SubagentRunState::Running {
+                    entry.cancel_flag.store(true, Ordering::Release);
+                    entry.run_state = SubagentRunState::Killed;
+                    entry.status = "killed".to_owned();
+                    entry.finished_unix_secs = Some(now_unix_secs());
+                }
+            }
+        }
+    }
+
+    /// Removes a finished sub-agent record (`x` action in `/tasks`). Refuses if still running.
+    pub fn delete_done(&self, id: &str) -> Result<(), String> {
+        let mut guard = self
+            .records
+            .lock()
+            .map_err(|_| "subagent tracker lock poisoned".to_owned())?;
+        let Some(pos) = guard.iter().position(|s| s.id == id) else {
+            return Err(format!("unknown subagent '{id}'"));
+        };
+        if !guard[pos].run_state.is_done() {
+            return Err(format!(
+                "cannot delete running subagent '{id}' (kill first)"
+            ));
+        }
+        guard.remove(pos);
+        Ok(())
+    }
+
+    /// Returns a snapshot of currently running sub-agents.
     #[must_use]
     pub fn snapshot(&self) -> Vec<LiveSubagentStatus> {
-        self.active.lock().map(|g| g.clone()).unwrap_or_default()
+        self.records
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|s| s.run_state == SubagentRunState::Running)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns all tracked sub-agents (both running and finished) for `/tasks` management.
+    #[must_use]
+    pub fn all_records(&self) -> Vec<LiveSubagentStatus> {
+        self.records.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Looks up one sub-agent record by `id`.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<LiveSubagentStatus> {
+        self.records
+            .lock()
+            .ok()
+            .and_then(|g| g.iter().find(|s| s.id == id).cloned())
     }
 }
 
@@ -345,18 +508,27 @@ impl Tool for AgentTool {
         .with_allowed_commands(state.allowed_commands)
         .with_runtime_context(self.env.runtime_context.clone());
 
+        let sub_cancel = Arc::new(AtomicBool::new(self.env.cancel.load(Ordering::Acquire)));
         self.env.tracker.start(LiveSubagentStatus {
             id: sub_id.clone(),
             agent_type: agent_type.clone(),
             role: role.clone(),
             model_label: short_model_display(&model_label),
             status: "Thinking…".to_owned(),
+            run_state: SubagentRunState::Running,
             started_unix_secs: now_unix_secs(),
+            started_hms: String::new(),
+            started_full: String::new(),
+            finished_unix_secs: None,
+            output_lines: vec![format!("[prompt] {prompt}")],
+            cancel_flag: Arc::clone(&sub_cancel),
         });
 
         let mut prompter = SubagentPrompter {
             id: sub_id.clone(),
             tracker: self.env.tracker.clone(),
+            parent_cancel: Arc::clone(&self.env.cancel),
+            sub_cancel: Arc::clone(&sub_cancel),
         };
         let sub_prompt = format!(
             "[Subagent Role: {role} ({agent_type})]\nTask:\n{prompt}\n\nProvide a concise, well-structured findings/completion report for the parent orchestrator."
@@ -365,16 +537,24 @@ impl Tool for AgentTool {
             &sub_prompt,
             provider.as_mut(),
             &mut prompter,
-            &self.env.cancel,
+            &sub_cancel,
         );
-        self.env.tracker.finish(&sub_id);
-
         match result {
-            Ok(answer) => Ok(format!("[{agent_type}: {role}]\n{}", answer.trim())),
-            Err(err) => Err(ToolError::InvalidArguments {
-                tool: "agent".to_owned(),
-                reason: format!("sub-agent '{role}' failed: {err}"),
-            }),
+            Ok(answer) => {
+                self.env
+                    .tracker
+                    .finish(&sub_id, SubagentRunState::Completed, answer.trim());
+                Ok(format!("[{agent_type}: {role}]\n{}", answer.trim()))
+            }
+            Err(err) => {
+                self.env
+                    .tracker
+                    .finish(&sub_id, SubagentRunState::Failed, &err.to_string());
+                Err(ToolError::InvalidArguments {
+                    tool: "agent".to_owned(),
+                    reason: format!("sub-agent '{role}' failed: {err}"),
+                })
+            }
         }
     }
 }
@@ -440,10 +620,21 @@ fn short_model_display(label: &str) -> String {
 struct SubagentPrompter {
     id: String,
     tracker: SubagentTracker,
+    parent_cancel: Arc<AtomicBool>,
+    sub_cancel: Arc<AtomicBool>,
+}
+
+impl SubagentPrompter {
+    fn sync_parent_cancel(&self) {
+        if self.parent_cancel.load(Ordering::Acquire) {
+            self.sub_cancel.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl ApprovalPrompter for SubagentPrompter {
     fn confirm(&mut self, _request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        self.sync_parent_cancel();
         Ok(ApprovalDecision {
             action: ApprovalAction::Deny,
             feedback: Some(
@@ -453,14 +644,17 @@ impl ApprovalPrompter for SubagentPrompter {
     }
 
     fn on_thinking_delta(&mut self, _delta: &str) {
+        self.sync_parent_cancel();
         self.tracker.update_status(&self.id, "Thinking…");
     }
 
     fn on_delta(&mut self, _delta: &str) {
+        self.sync_parent_cancel();
         self.tracker.update_status(&self.id, "Writing report…");
     }
 
     fn on_tool_start(&mut self, call: &ToolCall) {
+        self.sync_parent_cancel();
         let activity = match call.name.as_str() {
             "read" => "Reading file",
             "glob" | "grep" => "Searching files",
@@ -470,9 +664,15 @@ impl ApprovalPrompter for SubagentPrompter {
             _ => "Running tool",
         };
         self.tracker.update_status(&self.id, activity);
+        self.tracker
+            .append_log(&self.id, format!("[tool] {}", call.name));
     }
 
-    fn on_tool_finish(&mut self, _call: &ToolCall, _output: &ToolOutput) {
+    fn on_tool_finish(&mut self, call: &ToolCall, output: &ToolOutput) {
+        self.sync_parent_cancel();
+        let state = if output.is_error { "error" } else { "ok" };
+        self.tracker
+            .append_log(&self.id, format!("[done] {} ({state})", call.name));
         self.tracker.update_status(&self.id, "Thinking…");
     }
 }
