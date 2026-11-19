@@ -84,6 +84,7 @@ pub struct AntigravityProvider {
     effort_wire_map: HashMap<String, (String, String)>,
     aicode_models: HashSet<String>,
     aicode_scope_blocked: bool,
+    aicode_entitlement: Option<Value>,
     call_seq: u64,
 }
 
@@ -103,6 +104,7 @@ impl AntigravityProvider {
             effort_wire_map: HashMap::new(),
             aicode_models: HashSet::new(),
             aicode_scope_blocked: false,
+            aicode_entitlement: None,
             call_seq: 0,
         }
     }
@@ -217,6 +219,9 @@ impl AntigravityProvider {
     ) -> Value {
         let (wire_model, mut body) = self.build_inner_request(system_prompt, messages, tools);
         body.insert("model".to_owned(), Value::String(wire_model));
+        if let Some(entitlement) = &self.aicode_entitlement {
+            body.insert("entitlement".to_owned(), entitlement.clone());
+        }
         Value::Object(body)
     }
 
@@ -452,6 +457,9 @@ impl AntigravityProvider {
         };
         let body = resp.into_string().ok()?;
         let parsed: Value = serde_json::from_str(&body).ok()?;
+        if let Some(ent) = parsed.get("entitlement").filter(|v| !v.is_null()) {
+            self.aicode_entitlement = Some(ent.clone());
+        }
         Some(parse_aicode_fetch_config(&parsed))
     }
 }
@@ -584,7 +592,9 @@ impl AntigravityProvider {
     ) -> Result<ureq::Response, CoreError> {
         match self.post_aicode_stream(ai_base, access_token, system_prompt, messages, tools) {
             Ok(resp) => Ok(resp),
-            Err((status, scope_missing, err)) if scope_missing || status == Some(404) => {
+            Err((status, scope_missing, err))
+                if scope_missing || matches!(status, Some(400 | 404)) =>
+            {
                 let v1_payload = serde_json::to_string(&self.build_request_body(
                     project_id,
                     system_prompt,
@@ -672,23 +682,39 @@ impl AntigravityProvider {
         on_event: &mut dyn FnMut(&ProviderStreamEvent),
     ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
         let reader = BufReader::new(response.into_reader());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in reader.lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut emitted = Vec::new();
-        for line in reader.lines() {
+        loop {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(CoreError::Cancelled);
             }
-            let line = line
-                .map_err(|err| CoreError::Provider(format!("Antigravity SSE read error: {err}")))?;
-            let trimmed = line.trim();
-            if let Some(raw) = trimmed.strip_prefix("data:") {
-                let data = raw.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(line_res) => {
+                    let line = line_res.map_err(|err| {
+                        CoreError::Provider(format!("Antigravity SSE read error: {err}"))
+                    })?;
+                    let trimmed = line.trim();
+                    if let Some(raw) = trimmed.strip_prefix("data:") {
+                        let data = raw.trim();
+                        if data.is_empty() || data == "[DONE]" {
+                            continue;
+                        }
+                        for ev in self.parse_sse_chunk(data)? {
+                            on_event(&ev);
+                            emitted.push(ev);
+                        }
+                    }
                 }
-                for ev in self.parse_sse_chunk(data)? {
-                    on_event(&ev);
-                    emitted.push(ev);
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         on_event(&ProviderStreamEvent::Done);

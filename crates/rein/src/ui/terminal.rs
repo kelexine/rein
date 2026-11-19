@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use rein_core::{
     CoreError, EventLog, MemoryScope, Provider, ToolCall, ToolOutput, UsageStats,
-    login_with_browser_until,
+    login_with_browser_until, logout_rein_token,
 };
 
 use crate::agent::{
@@ -435,6 +435,23 @@ fn run_builtin_action(
         }
         BuiltinAction::Mcp => run_mcp_command(agent, app),
         BuiltinAction::Login => return run_login_background(provider, config, paths, app, guard),
+        BuiltinAction::Logout => {
+            match logout_rein_token() {
+                Ok(Some(removed)) => {
+                    app.push_system_note(format!("signed out (removed {})", removed.display()));
+                }
+                Ok(None) => {
+                    app.push_system_note("signed out (no saved Rein OAuth token found)");
+                }
+                Err(err) => {
+                    app.push_system_note(format!("logout error: {err}"));
+                }
+            }
+            let (fresh_provider, label) = build_provider(config.resolved_provider(), config);
+            *provider = fresh_provider;
+            app.set_model_name(label);
+            app.set_model_quota(None);
+        }
         BuiltinAction::Model => {
             return run_model_command(args, provider, config, paths, app, guard);
         }

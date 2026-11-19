@@ -207,16 +207,43 @@ pub struct SandboxCommandOutput {
     pub output_file: Option<PathBuf>,
 }
 
+/// Resolves the executable path used to launch `--sandbox-child`.
+///
+/// On Linux, when the running binary is rebuilt in-place (`cargo build`),
+/// `std::env::current_exe()` (`readlink("/proc/self/exe")`) appends `" (deleted)"`
+/// to the path, which would fail `Command::new` with `ENOENT`. Stripping that
+/// suffix resolves the newly written binary at the original path, with
+/// `/proc/self/exe` as a final fallback.
+fn resolve_sandbox_exe(raw_exe: PathBuf) -> PathBuf {
+    if raw_exe.exists() {
+        return raw_exe;
+    }
+    if let Some(stripped) = raw_exe
+        .to_str()
+        .and_then(|s| s.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        && stripped.exists()
+    {
+        return stripped;
+    }
+    let proc_self = PathBuf::from("/proc/self/exe");
+    if proc_self.exists() {
+        return proc_self;
+    }
+    raw_exe
+}
+
 /// Spawns `current_exe() --sandbox-child <json>` without timeouts, streaming full logs to disk.
 pub fn run_sandboxed_command(spec: &SandboxSpec) -> Result<SandboxCommandOutput, PolicyError> {
     let status = probe_kernel_sandbox();
     if let SandboxStatus::Unavailable { reason } = status {
         return Err(PolicyError::SandboxUnavailable(reason));
     }
-    let exe = std::env::current_exe().map_err(|source| PolicyError::Io {
+    let raw_exe = std::env::current_exe().map_err(|source| PolicyError::Io {
         path: PathBuf::from("current_exe"),
         source,
     })?;
+    let exe = resolve_sandbox_exe(raw_exe);
     let payload = serde_json::to_string(spec)?;
     let mut child = Command::new(&exe)
         .arg(SANDBOX_CHILD_FLAG)
@@ -383,6 +410,15 @@ mod tests {
         let non_tmp_ws = PathBuf::from("/nonexistent_rein_workspace_root_for_test");
         let rw_for_real_ws = default_sandbox_read_write_paths(&non_tmp_ws, false);
         assert!(rw_for_real_ws.contains(&PathBuf::from("/dev/null")));
-        assert!(rw_for_real_ws.contains(&std::env::temp_dir()));
+        assert!(rw_for_real_ws.contains(&PathBuf::from(&std::env::temp_dir())));
+    }
+
+    #[test]
+    fn resolve_sandbox_exe_strips_deleted_suffix_when_replacement_exists() {
+        let tmp = std::env::temp_dir().join("rein_resolve_exe_test_bin");
+        std::fs::write(&tmp, b"").expect("create dummy binary");
+        let deleted = PathBuf::from(format!("{} (deleted)", tmp.display()));
+        assert_eq!(resolve_sandbox_exe(deleted), tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

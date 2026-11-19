@@ -28,6 +28,22 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// Returns `true` if a tool with `name` is already registered.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    /// Registers `tool` only if its schema name is not already present; returns `false` on collision.
+    pub fn try_register(&mut self, tool: Box<dyn Tool>) -> bool {
+        let name = tool.schema().name;
+        if self.tools.contains_key(&name) {
+            return false;
+        }
+        self.tools.insert(name, tool);
+        true
+    }
+
     /// Returns schemas for the subset of tool names enabled in the active profile.
     #[must_use]
     pub fn schemas_for(&self, allowed_names: &[String]) -> Vec<ToolSchema> {
@@ -60,7 +76,9 @@ impl ToolRegistry {
         allowed_tools: &[String],
     ) -> Result<PolicyDecision, ToolError> {
         let call = turn.pending_call();
-        if !allowed_tools.iter().any(|allowed| allowed == &call.name) {
+        if !policy.is_bypass_permissions()
+            && !allowed_tools.iter().any(|allowed| allowed == &call.name)
+        {
             return Ok(PolicyDecision::Deny {
                 reason: format!("tool '{}' is not enabled in the active profile", call.name),
             });

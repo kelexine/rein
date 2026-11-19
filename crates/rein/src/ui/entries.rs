@@ -9,6 +9,9 @@ use serde_json::Value;
 
 use crate::ui::markdown::render_assistant_markdown;
 
+/// Maximum number of body lines shown when expanding a tool output with `Ctrl+O`.
+const EXPANDED_TOOL_MAX_LINES: usize = 10;
+
 /// Live execution state of a rendered tool invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRunState {
@@ -327,7 +330,13 @@ fn render_tool_entry(
 
     out.push(Line::from(header_spans));
     let body_lines = build_tool_output_lines(tool);
-    for (idx, body) in body_lines.into_iter().enumerate() {
+    let total_lines = body_lines.len();
+    let hidden_lines = total_lines.saturating_sub(EXPANDED_TOOL_MAX_LINES);
+    for (idx, body) in body_lines
+        .into_iter()
+        .take(EXPANDED_TOOL_MAX_LINES)
+        .enumerate()
+    {
         let tree_prefix = if idx == 0 { "  └  " } else { "     " };
         let mut spans = vec![Span::styled(
             tree_prefix,
@@ -335,6 +344,12 @@ fn render_tool_entry(
         )];
         spans.extend(body.spans);
         out.push(Line::from(spans));
+    }
+    if hidden_lines > 0 {
+        out.push(Line::from(Span::styled(
+            format!("     + {hidden_lines} more lines"),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     out.push(Line::from(Span::styled(
         "     (ctrl+o to collapse)",
@@ -357,9 +372,18 @@ fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
                 .map(|s| clip_single_line(s, 72));
             ("Bash".to_owned(), cmd)
         }
-        "read" => ("Read".to_owned(), arg_str(args, "path", 68)),
-        "write" => ("Write".to_owned(), arg_str(args, "path", 68)),
-        "edit" => ("Edit".to_owned(), arg_str(args, "path", 68)),
+        "read" => (
+            "Read".to_owned(),
+            arg_str(args, "path", 68).map(|p| format_read_arg(&relative_display_path(&p), args)),
+        ),
+        "write" => (
+            "Write".to_owned(),
+            arg_str(args, "path", 68).map(|p| relative_display_path(&p)),
+        ),
+        "edit" => (
+            "Edit".to_owned(),
+            arg_str(args, "path", 68).map(|p| relative_display_path(&p)),
+        ),
         "glob" => ("Glob".to_owned(), arg_str(args, "pattern", 68)),
         "grep" => (
             "Grep".to_owned(),
@@ -507,6 +531,9 @@ fn render_edit_diff_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
 }
 
 fn render_write_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
+    if tool.state == ToolRunState::Error {
+        return split_plain_lines(&tool.output, Color::LightRed);
+    }
     let content = tool
         .arguments
         .get("content")
@@ -516,7 +543,8 @@ fn render_write_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
         .arguments
         .get("path")
         .and_then(Value::as_str)
-        .unwrap_or("file");
+        .map(relative_display_path)
+        .unwrap_or_else(|| "file".to_owned());
     let count = content.lines().count();
     let mut out = vec![Line::from(Span::styled(
         format!("Wrote {count} lines to {path}"),
@@ -529,6 +557,39 @@ fn render_write_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+fn format_read_arg(path: &str, args: &Value) -> String {
+    let start = args.get("start_line").and_then(Value::as_u64);
+    let end = args.get("end_line").and_then(Value::as_u64);
+    match (start, end) {
+        (Some(s), Some(e)) => format!("{path}:{s}-{e}"),
+        (Some(s), None) => format!("{path}:{s}-"),
+        (None, Some(e)) => format!("{path}:1-{e}"),
+        (None, None) => path.to_owned(),
+    }
+}
+
+fn relative_display_path(raw: &str) -> String {
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir()
+            && let Ok(rel) = path.strip_prefix(&cwd)
+        {
+            let s = rel.to_string_lossy();
+            return if s.is_empty() {
+                ".".to_owned()
+            } else {
+                s.into_owned()
+            };
+        }
+        if let Some(home) = std::env::var_os("HOME")
+            && let Ok(rel) = path.strip_prefix(std::path::Path::new(&home))
+        {
+            return format!("~/{}", rel.to_string_lossy());
+        }
+    }
+    raw.to_owned()
 }
 
 fn render_read_lines(raw_output: &str) -> Vec<Line<'static>> {
@@ -775,5 +836,61 @@ mod tests {
             .collect();
         assert!(err_text.iter().any(|l| l.contains("file not found")));
         assert_eq!(err_lines[0].spans[0].style.fg, Some(Color::LightRed));
+    }
+
+    #[test]
+    fn expanded_tool_output_truncates_to_ten_lines_and_write_relativizes_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let many_lines: String = (1..=25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bash_call = ToolCall {
+            id: "bash_1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": "seq 1 25"}),
+        };
+        let bash_entry = TranscriptEntry::tool_completed(
+            &bash_call,
+            &ToolOutput {
+                call_id: "bash_1".to_owned(),
+                content: many_lines,
+                is_error: false,
+            },
+        );
+        let rendered = render_transcript_lines(&[bash_entry], 90, true);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("line 10")));
+        assert!(!text.iter().any(|l| l.contains("line 11")));
+        assert!(text.iter().any(|l| l == "     + 15 more lines"));
+
+        let abs_path = std::env::current_dir()?.join("src/new_file.rs");
+        let write_call = ToolCall {
+            id: "write_1".to_owned(),
+            name: "write".to_owned(),
+            arguments: json!({
+                "path": abs_path.to_string_lossy().to_string(),
+                "content": "fn a() {}\nfn b() {}\nfn c() {}"
+            }),
+        };
+        let write_entry = TranscriptEntry::tool_completed(
+            &write_call,
+            &ToolOutput {
+                call_id: "write_1".to_owned(),
+                content: "wrote 30 bytes".to_owned(),
+                is_error: false,
+            },
+        );
+        let write_rendered = render_transcript_lines(&[write_entry], 90, true);
+        let write_text: Vec<String> = write_rendered
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(write_text[0], "● Write(src/new_file.rs)");
+        assert_eq!(write_text[1], "  └  Wrote 3 lines to src/new_file.rs");
+        Ok(())
     }
 }

@@ -5,6 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rein_core::MemoryScope;
@@ -281,9 +282,21 @@ fn ensure_parent_dir(path: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("memory.jsonl");
+    path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"))
+}
+
 fn write_atomic_jsonl(path: &Path, records: &[MemoryRecord]) -> Result<(), ToolError> {
     ensure_parent_dir(path)?;
-    let tmp = path.with_extension("jsonl.tmp");
+    let tmp = unique_tmp_path(path);
     {
         let mut file = File::create(&tmp).map_err(|source| ToolError::Io {
             path: tmp.clone(),

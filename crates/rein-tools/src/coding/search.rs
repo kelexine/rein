@@ -158,9 +158,17 @@ fn collect_files(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<(), T
         if IGNORED_DIRS.contains(&name) {
             continue;
         }
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             collect_files(&path, root, out)?;
-        } else if let Ok(rel) = path.strip_prefix(root) {
+        } else if meta.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
             out.push(rel.to_string_lossy().into_owned());
         }
     }
@@ -168,12 +176,73 @@ fn collect_files(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<(), T
 }
 
 fn wildcard_match(pattern: &str, rel_path: &str) -> bool {
-    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    if let Some(ext) = pattern.strip_prefix("*.") {
-        file_name.ends_with(&format!(".{ext}"))
-    } else {
-        rel_path.contains(pattern) || file_name == pattern
+    let pat = pattern.trim().trim_start_matches("./");
+    if pat.is_empty() || pat == "*" || pat == "**" || pat == "**/*" {
+        return true;
     }
+    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    if pat.contains('*') || pat.contains('?') {
+        if let Some(sub_pat) = pat.strip_prefix("**/")
+            && (glob_match_path(sub_pat, rel_path) || glob_match_segment(sub_pat, file_name))
+        {
+            return true;
+        }
+        if pat.contains('/') {
+            glob_match_path(pat, rel_path)
+        } else {
+            glob_match_segment(pat, file_name) || glob_match_path(pat, rel_path)
+        }
+    } else {
+        rel_path.contains(pat) || file_name == pat
+    }
+}
+
+fn glob_match_path(pattern: &str, path: &str) -> bool {
+    let pat_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match_path_segments(&pat_segs, &path_segs)
+}
+
+fn match_path_segments(pat: &[&str], path: &[&str]) -> bool {
+    if pat.is_empty() {
+        return path.is_empty();
+    }
+    if pat[0] == "**" {
+        return match_path_segments(&pat[1..], path)
+            || (!path.is_empty() && match_path_segments(pat, &path[1..]));
+    }
+    if path.is_empty() {
+        return false;
+    }
+    glob_match_segment(pat[0], path[0]) && match_path_segments(&pat[1..], &path[1..])
+}
+
+fn glob_match_segment(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[cfg(test)]
@@ -243,6 +312,58 @@ mod tests {
 
         assert!(GlobTool::new(sandbox.clone()).execute(&json!({})).is_err());
         assert!(GrepTool::new(sandbox).execute(&json!({})).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn glob_supports_standard_wildcards_and_skips_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!(
+            "rein_search_wildcards_symlinks_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("crates/core/src"))?;
+        std::fs::create_dir_all(dir.join("crates/tools/src"))?;
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(dir.join("crates/core/Cargo.toml"), "[package]\n")?;
+        std::fs::write(dir.join("crates/core/src/lib.rs"), "pub fn a() {}\n")?;
+        std::fs::write(dir.join("crates/tools/src/mod1.rs"), "pub fn b() {}\n")?;
+
+        #[cfg(unix)]
+        {
+            // Self-referential symlink cycle and outside-workspace symlink escape.
+            std::os::unix::fs::symlink(&dir, dir.join("crates/core/cycle_link"))?;
+            std::os::unix::fs::symlink("/etc/hosts", dir.join("crates/core/hosts_link.rs"))?;
+        }
+
+        let sandbox = WorkspaceSandbox::new(&dir);
+        let glob = GlobTool::new(sandbox);
+
+        let all = glob.execute(&json!({"pattern": "*"}))?;
+        assert_eq!(
+            all.lines().collect::<Vec<_>>(),
+            vec![
+                "Cargo.toml",
+                "crates/core/Cargo.toml",
+                "crates/core/src/lib.rs",
+                "crates/tools/src/mod1.rs",
+            ]
+        );
+
+        let double_star = glob.execute(&json!({"pattern": "**/*.rs"}))?;
+        assert_eq!(
+            double_star.lines().collect::<Vec<_>>(),
+            vec!["crates/core/src/lib.rs", "crates/tools/src/mod1.rs"]
+        );
+
+        let path_glob = glob.execute(&json!({"pattern": "crates/*/Cargo.toml"}))?;
+        assert_eq!(path_glob, "crates/core/Cargo.toml");
+
+        let qmark = glob.execute(&json!({"pattern": "mod?.rs"}))?;
+        assert_eq!(qmark, "crates/tools/src/mod1.rs");
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

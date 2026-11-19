@@ -103,6 +103,30 @@ pub fn default_rein_token_path() -> Option<PathBuf> {
     })
 }
 
+/// Removes the persisted Rein Antigravity OAuth token file at `path` if present.
+pub fn logout_rein_token_at(path: &Path) -> Result<bool, CoreError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(path).map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(true)
+}
+
+/// Removes the default Rein Antigravity OAuth token file (`~/.rein/antigravity-oauth.json`) if present.
+pub fn logout_rein_token() -> Result<Option<PathBuf>, CoreError> {
+    let Some(path) = default_rein_token_path() else {
+        return Ok(None);
+    };
+    if logout_rein_token_at(&path)? {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Resolves Antigravity credentials across config path, env vars, Rein file, OS keyring, and CLI paths.
 pub fn resolve_token(
     custom_path: Option<&Path>,

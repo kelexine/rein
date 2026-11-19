@@ -20,6 +20,7 @@ pub struct PolicyEngine {
     sandbox: WorkspaceSandbox,
     sandbox_status: SandboxStatus,
     audit: AuditLog,
+    bypass_permissions: bool,
 }
 
 impl PolicyEngine {
@@ -42,7 +43,21 @@ impl PolicyEngine {
             sandbox,
             sandbox_status,
             audit,
+            bypass_permissions: false,
         }
+    }
+
+    /// Enables or disables explicit permission bypass (`--dangerously-bypass-permission` / `--yolo`).
+    #[must_use]
+    pub fn with_bypass_permissions(mut self, bypass: bool) -> Self {
+        self.bypass_permissions = bypass;
+        self
+    }
+
+    /// Returns `true` when explicit permission bypass is active.
+    #[must_use]
+    pub fn is_bypass_permissions(&self) -> bool {
+        self.bypass_permissions
     }
 
     /// Swaps the active [`PolicyRuleSet`] when switching profiles between Coding and Personal modes.
@@ -93,6 +108,13 @@ impl PolicyEngine {
     }
 
     fn decide(&self, tool_name: &str, capability: &Capability) -> PolicyDecision {
+        if self.bypass_permissions {
+            return PolicyDecision::Allow {
+                reason: format!(
+                    "auto-approved '{tool_name}' via --dangerously-bypass-permission / --yolo"
+                ),
+            };
+        }
         match capability {
             Capability::Memory { scope, mode } => self.decide_memory(tool_name, *scope, *mode),
             Capability::FileSystem { path, mode } => self.decide_fs(tool_name, path, *mode),

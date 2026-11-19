@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rein_core::{MemoryScope, ToolCall, ToolSpec};
 use rein_tools::{JsonlMemoryStore, MemoryKind, MemoryRecord};
@@ -400,8 +401,16 @@ fn list_md_files(dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+static VAULT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
-    let tmp = path.with_extension("md.tmp");
+    let seq = VAULT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("MEMORY.md");
+    let tmp = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
     std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }

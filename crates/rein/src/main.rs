@@ -5,19 +5,6 @@
 //! Rein single binary entrypoint.
 #![forbid(unsafe_code)]
 
-/// In-process event-sourced agent loop.
-pub mod agent;
-/// Built-in slash commands and `~/.rein/skills` + `<workspace>/.rein/skills` loader.
-pub mod commands;
-/// Dual-scope (`~/.rein` and `<workspace>/.rein`) config and command allowlist loader.
-pub mod config;
-/// Automatic memory consolidation (`AutoDream`), vault tools, and Ebbinghaus salience decay.
-pub mod memory;
-/// Mode profiles, context strategy, and runtime switcher.
-pub mod modes;
-/// In-process Ratatui terminal interface.
-pub mod ui;
-
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -30,20 +17,18 @@ use rein_policy::{
 use rein_tools::{
     BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
     McpToolAdapter, MemoryTool, NotesTool, ReadTool, SwitchModeTool, TodoReadTool, TodoStore,
-    TodoWriteTool, ToolRegistry, WriteTool,
+    TodoWriteTool, Tool, ToolRegistry, WriteTool,
 };
 
-use crate::agent::{
-    AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
-};
-use crate::commands::SlashKind;
-use crate::config::{
+use rein::agent::{AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest};
+use rein::commands::SlashKind;
+use rein::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
     generate_session_uid, list_sessions, provider_startup_notice, resolve_resume_session,
     save_provider_selection, write_latest_session_uid,
 };
-use crate::modes::{Profile, RuntimeContext, utc_today_iso};
-use crate::ui::{AppState, run_tui};
+use rein::modes::{Profile, RuntimeContext, utc_today_iso};
+use rein::ui::{AppState, run_tui};
 
 struct HeadlessDenier;
 impl ApprovalPrompter for HeadlessDenier {
@@ -87,6 +72,7 @@ fn main() -> Result<()> {
     let (registry, mcp_tools, mcp_warnings) =
         build_registry(&loaded, &sandbox, memory.clone(), todo_store.clone());
 
+    let bypass_permissions = has_bypass_permissions_flag(&args);
     let initial_profile = Profile::coding()
         .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(&mcp_tools);
@@ -94,7 +80,8 @@ fn main() -> Result<()> {
         initial_profile.policy_rules.clone(),
         sandbox,
         AuditLog::new(&loaded.paths.audit_log),
-    );
+    )
+    .with_bypass_permissions(bypass_permissions);
 
     if args.get(1).map(String::as_str) == Some("replay")
         && let Some(replay_path) = args.get(2)
@@ -129,7 +116,7 @@ fn main() -> Result<()> {
     )
 }
 
-fn print_resume_usage_help(msg: &anyhow::Error, paths: &config::ReinPaths) {
+fn print_resume_usage_help(msg: &anyhow::Error, paths: &rein::config::ReinPaths) {
     eprintln!("warning: {msg}");
     eprintln!("usage: rein --resume <uid>");
     if let Ok(sessions) = list_sessions(paths) {
@@ -146,6 +133,12 @@ fn print_resume_usage_help(msg: &anyhow::Error, paths: &config::ReinPaths) {
             }
         }
     }
+}
+
+fn has_bypass_permissions_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "--dangerously-bypass-permission" || arg == "--yolo")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +187,11 @@ fn run_interactive(
     let active_kind = loaded.config.resolved_provider();
     let (mut provider, model_label) = build_provider(active_kind, &loaded.config);
     let mut notices = Vec::new();
+    if policy.is_bypass_permissions() {
+        notices.push(
+            "auto-approve enabled (--dangerously-bypass-permission / --yolo): all policy checks and tool permissions bypassed".to_owned(),
+        );
+    }
     if let Some(notice) = provider_startup_notice(active_kind, &loaded.config) {
         notices.push(notice);
     }
@@ -215,12 +213,12 @@ fn run_interactive(
             )
         }
     };
-    if config::is_valid_session_uid(&session_uid) {
+    if rein::config::is_valid_session_uid(&session_uid) {
         let _ = write_latest_session_uid(&loaded.paths, &session_uid);
     }
     todo_store.set_session_uid(&session_uid);
 
-    let slash_registry = crate::commands::load_slash_registry(&loaded.paths)?;
+    let slash_registry = rein::commands::load_slash_registry(&loaded.paths)?;
     let skill_names: Vec<String> = slash_registry
         .all()
         .iter()
@@ -245,7 +243,9 @@ fn run_interactive(
         .with_allowed_commands(loaded.allowed_commands.clone())
         .with_extra_tools(mcp_tools)
         .with_runtime_context(runtime_context);
+    let bypass_permissions = agent.policy().is_bypass_permissions();
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
+        .with_bypass_permissions(bypass_permissions)
         .with_workspace_label(workspace_label)
         .with_session_id(&session_uid)
         .with_startup_notices(notices)
@@ -385,8 +385,19 @@ fn build_registry(
         match client.list_tools() {
             Ok(schemas) => {
                 for schema in schemas {
-                    mcp_names.push(schema.name.clone());
-                    registry.register(Box::new(McpToolAdapter::new(client.clone(), schema)));
+                    let adapter = if registry.contains(&schema.name) {
+                        let namespaced =
+                            McpToolAdapter::namespaced_name(&server.name, &schema.name);
+                        warnings.push(format!(
+                            "mcp '{}': tool '{}' collided with an existing tool; registered as '{}'",
+                            server.name, schema.name, namespaced
+                        ));
+                        McpToolAdapter::with_registered_name(client.clone(), schema, namespaced)
+                    } else {
+                        McpToolAdapter::new(client.clone(), schema)
+                    };
+                    mcp_names.push(adapter.schema().name);
+                    registry.register(Box::new(adapter));
                 }
             }
             Err(err) => warnings.push(format!("mcp '{}': {err}", server.name)),
@@ -452,5 +463,23 @@ mod tests {
             parse_resume_flag(&valid_eq).ok(),
             Some(ResumeSpec::Uid("deadbeef".to_owned()))
         );
+    }
+
+    #[test]
+    fn bypass_permissions_requires_explicit_yolo_or_dangerously_flag() {
+        assert!(!has_bypass_permissions_flag(&["rein".to_owned()]));
+        assert!(!has_bypass_permissions_flag(&[
+            "rein".to_owned(),
+            "--model".to_owned(),
+            "yolo".to_owned(),
+        ]));
+        assert!(has_bypass_permissions_flag(&[
+            "rein".to_owned(),
+            "--yolo".to_owned(),
+        ]));
+        assert!(has_bypass_permissions_flag(&[
+            "rein".to_owned(),
+            "--dangerously-bypass-permission".to_owned(),
+        ]));
     }
 }

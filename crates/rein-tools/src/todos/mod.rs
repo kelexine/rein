@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rein_policy::{AccessMode, Capability};
@@ -484,6 +485,8 @@ fn write_state_atomic(path: &Path, state: &TodoListState) -> Result<(), ToolErro
     write_json_string(path, &format!("{encoded}\n"))
 }
 
+static TODO_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn write_json_string(path: &Path, content: &str) -> Result<(), ToolError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -493,7 +496,13 @@ fn write_json_string(path: &Path, content: &str) -> Result<(), ToolError> {
             source,
         })?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let seq = TODO_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("todo.json");
+    let tmp = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
     fs::write(&tmp, content).map_err(|source| ToolError::Io {
         path: tmp.clone(),
         source,

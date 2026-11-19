@@ -25,7 +25,8 @@ pub use antigravity::{
 };
 pub use antigravity_auth::{
     AntigravityLoginResult, AntigravityTokenSet, default_rein_token_path, login_with_browser,
-    login_with_browser_until, parse_token_json, resolve_token,
+    login_with_browser_until, logout_rein_token, logout_rein_token_at, parse_token_json,
+    resolve_token,
 };
 pub use replay::ReplayProvider;
 pub use sse::SseEventAccumulator;

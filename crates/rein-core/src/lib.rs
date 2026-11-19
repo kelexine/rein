@@ -21,6 +21,7 @@ pub use provider::{
     AntigravityLoginResult, AntigravityProvider, AntigravityTokenSet, AvailableModel,
     DEFAULT_ANTIGRAVITY_BASE_URL, DEFAULT_ANTIGRAVITY_MODEL, Provider, ProviderStreamEvent,
     ReplayProvider, SseEventAccumulator, ToolSpec, UsageStats, default_rein_token_path,
-    login_with_browser, login_with_browser_until, resolve_token,
+    login_with_browser, login_with_browser_until, logout_rein_token, logout_rein_token_at,
+    resolve_token,
 };
 pub use state::{AwaitingPolicy, Executing, Idle, Streaming, Turn};

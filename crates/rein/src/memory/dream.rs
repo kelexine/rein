@@ -137,12 +137,22 @@ impl AutoDream {
 
     /// Stamps `last_consolidated_at = now` and persists `.consolidation_state.json`.
     pub fn save_state(&self, state: &mut ConsolidationState) -> Result<()> {
+        static STATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
         state.last_consolidated_at = Some(now_unix_secs());
         if let Some(parent) = self.state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(state)?;
-        let tmp = self.state_file.with_extension("json.tmp");
+        let seq = STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let file_name = self
+            .state_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(".consolidation_state.json");
+        let tmp = self
+            .state_file
+            .with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
         std::fs::write(&tmp, format!("{json}\n"))?;
         std::fs::rename(&tmp, &self.state_file)?;
         Ok(())

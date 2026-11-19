@@ -84,6 +84,7 @@ pub struct AppState {
     prompt_history: Vec<String>,
     history_cursor: Option<usize>,
     draft_input: String,
+    bypass_permissions: bool,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -164,7 +165,21 @@ impl AppState {
             prompt_history: Vec::new(),
             history_cursor: None,
             draft_input: String::new(),
+            bypass_permissions: false,
         }
+    }
+
+    /// Marks whether `--dangerously-bypass-permission` / `--yolo` is active for TUI display.
+    #[must_use]
+    pub fn with_bypass_permissions(mut self, bypass: bool) -> Self {
+        self.bypass_permissions = bypass;
+        self
+    }
+
+    /// Returns `true` when explicit permission bypass (`--dangerously-bypass-permission` / `--yolo`) is active.
+    #[must_use]
+    pub fn bypass_permissions(&self) -> bool {
+        self.bypass_permissions
     }
 
     /// Sets the workspace display path shown in the Citadel Owl header (`~/dev/rein`).

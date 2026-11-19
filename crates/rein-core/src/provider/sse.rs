@@ -55,19 +55,62 @@ impl SseEventAccumulator {
                 return Err(CoreError::Cancelled);
             }
             let line = line.map_err(|err| CoreError::Provider(format!("SSE read error: {err}")))?;
-            let trimmed = line.trim();
-            if let Some(payload) = trimmed.strip_prefix("data:") {
-                let data = payload.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
+            self.process_sse_line(&line, on_event, &mut emitted)?;
+        }
+        Ok(emitted)
+    }
+
+    /// Reads an owned SSE stream with non-blocking cancellation polling (wakes every 50 ms).
+    pub fn read_stream_cancellable_owned<R: BufRead + Send + 'static>(
+        &mut self,
+        reader: R,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_event: &mut dyn FnMut(&ProviderStreamEvent),
+    ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in reader.lines() {
+                if tx.send(line).is_err() {
+                    break;
                 }
-                for ev in self.feed_json(data)? {
-                    on_event(&ev);
-                    emitted.push(ev);
+            }
+        });
+        let mut emitted = Vec::new();
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CoreError::Cancelled);
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(line_res) => {
+                    let line = line_res
+                        .map_err(|err| CoreError::Provider(format!("SSE read error: {err}")))?;
+                    self.process_sse_line(&line, on_event, &mut emitted)?;
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         Ok(emitted)
+    }
+
+    fn process_sse_line(
+        &mut self,
+        line: &str,
+        on_event: &mut dyn FnMut(&ProviderStreamEvent),
+        emitted: &mut Vec<ProviderStreamEvent>,
+    ) -> Result<(), CoreError> {
+        let trimmed = line.trim();
+        if let Some(payload) = trimmed.strip_prefix("data:") {
+            let data = payload.trim();
+            if data.is_empty() || data == "[DONE]" {
+                return Ok(());
+            }
+            for ev in self.feed_json(data)? {
+                on_event(&ev);
+                emitted.push(ev);
+            }
+        }
+        Ok(())
     }
 
     /// Parses a single Anthropic SSE JSON payload into zero or more [`ProviderStreamEvent`]s.
@@ -293,6 +336,41 @@ mod tests {
                 .read_stream(Cursor::new(bad_sse.as_bytes()), &mut |_| {})
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn read_stream_cancellable_owned_unblocks_promptly_when_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{BufReader, Read};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct BlockingReader(std::sync::mpsc::Receiver<()>);
+        impl Read for BlockingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cancel_bg.store(true, Ordering::Relaxed);
+        });
+
+        let mut acc = SseEventAccumulator::new();
+        let started = std::time::Instant::now();
+        let res = acc.read_stream_cancellable_owned(
+            BufReader::new(BlockingReader(rx)),
+            &cancel,
+            &mut |_| {},
+        );
+        assert!(matches!(res, Err(CoreError::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         Ok(())
     }
 }

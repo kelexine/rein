@@ -44,6 +44,8 @@ pub enum BuiltinAction {
     Mcp,
     /// Authenticates directly with Antigravity via browser OAuth 2.0.
     Login,
+    /// Signs out and removes saved Antigravity OAuth credentials.
+    Logout,
     /// Displays interactive model picker or switches model (`[provider/model|model]`).
     Model,
     /// Displays or switches the active model provider (`[anthropic|antigravity] [model]`).
@@ -167,6 +169,11 @@ impl SlashRegistry {
                 "login",
                 "Authenticate directly with Google Antigravity OAuth",
                 BuiltinAction::Login,
+            ),
+            builtin(
+                "logout",
+                "Sign out and remove saved Google Antigravity OAuth token",
+                BuiltinAction::Logout,
             ),
             builtin(
                 "model",

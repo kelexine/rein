@@ -325,6 +325,14 @@ fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(state.model_name(), Style::default().fg(Color::LightBlue)),
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(mode_label, Style::default().fg(mode_color(mode))),
+            if state.bypass_permissions() {
+                Span::styled(
+                    " [AUTO·BYPASS]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 state.sandbox_summary(),
@@ -943,8 +951,17 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         ])
         .split(area);
 
-    let mut left_spans = vec![
-        Span::styled(mode_label, Style::default().fg(mode_color(mode))),
+    let mut left_spans = vec![Span::styled(
+        mode_label,
+        Style::default().fg(mode_color(mode)),
+    )];
+    if state.bypass_permissions() {
+        left_spans.push(Span::styled(
+            " [AUTO·BYPASS]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    left_spans.extend([
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             state.sandbox_summary(),
@@ -952,7 +969,7 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(state.model_name(), Style::default().fg(Color::LightBlue)),
-    ];
+    ]);
     let usage = state.usage_totals();
     if usage.total_tokens > 0 {
         left_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));

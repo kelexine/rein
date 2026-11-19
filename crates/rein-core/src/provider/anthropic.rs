@@ -179,7 +179,7 @@ impl Provider for AnthropicProvider {
 
         let reader = BufReader::new(response.into_reader());
         let mut acc = SseEventAccumulator::new();
-        acc.read_stream_cancellable(reader, cancel, on_event)
+        acc.read_stream_cancellable_owned(reader, cancel, on_event)
     }
 }
 
