@@ -37,15 +37,16 @@ pub struct PolicyRuleSet {
     pub allow_personal_memory_write: bool,
     /// Whether workspace filesystem writes are permitted without interactive confirmation.
     pub allow_workspace_write: bool,
-    /// Fail-closed default: refuse shell execution if kernel sandboxing (Landlock) is unavailable.
+    /// Legacy compatibility flag (`false`: shell commands inherit user configs under PolicyEngine).
+    #[serde(default)]
     pub require_kernel_sandbox: bool,
-    /// Merged global (`~/.rein/commands.json`) and repo (`<workspace>/.rein/commands.json`) command allowlist.
+    /// Merged global (`~/.rein/commands.json`) and session allowlist.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
 }
 
 impl PolicyRuleSet {
-    /// Default sandbox policy for Coding mode (requires Landlock for shell, reads personal memory).
+    /// Default policy for Coding mode (reads personal memory, gates shell writes/exec via classifier + allowlists).
     #[must_use]
     pub fn coding_default() -> Self {
         Self {
@@ -53,12 +54,12 @@ impl PolicyRuleSet {
             allow_personal_memory_read: true,
             allow_personal_memory_write: false,
             allow_workspace_write: true,
-            require_kernel_sandbox: true,
+            require_kernel_sandbox: false,
             allowed_commands: Vec::new(),
         }
     }
 
-    /// Default sandbox policy for Plan mode (read-only exploration; denies workspace writes and mutating shell commands).
+    /// Default policy for Plan mode (read-only exploration; denies workspace writes and mutating shell commands).
     #[must_use]
     pub fn plan_default() -> Self {
         Self {
@@ -66,12 +67,12 @@ impl PolicyRuleSet {
             allow_personal_memory_read: true,
             allow_personal_memory_write: false,
             allow_workspace_write: false,
-            require_kernel_sandbox: true,
+            require_kernel_sandbox: false,
             allowed_commands: Vec::new(),
         }
     }
 
-    /// Default sandbox policy for Personal mode (full personal memory, asks on email/calendar writes).
+    /// Default policy for Personal mode (full personal memory, asks on email/calendar writes).
     #[must_use]
     pub fn personal_default() -> Self {
         Self {
@@ -79,7 +80,7 @@ impl PolicyRuleSet {
             allow_personal_memory_read: true,
             allow_personal_memory_write: true,
             allow_workspace_write: false,
-            require_kernel_sandbox: true,
+            require_kernel_sandbox: false,
             allowed_commands: Vec::new(),
         }
     }
@@ -96,21 +97,21 @@ mod tests {
         assert!(coding.allow_personal_memory_read);
         assert!(!coding.allow_personal_memory_write);
         assert!(coding.allow_workspace_write);
-        assert!(coding.require_kernel_sandbox);
+        assert!(!coding.require_kernel_sandbox);
 
         let plan = PolicyRuleSet::plan_default();
         assert_eq!(plan.mode, ModeId::Plan);
         assert!(plan.allow_personal_memory_read);
         assert!(!plan.allow_personal_memory_write);
         assert!(!plan.allow_workspace_write);
-        assert!(plan.require_kernel_sandbox);
+        assert!(!plan.require_kernel_sandbox);
 
         let personal = PolicyRuleSet::personal_default();
         assert_eq!(personal.mode, ModeId::Personal);
         assert!(personal.allow_personal_memory_read);
         assert!(personal.allow_personal_memory_write);
         assert!(!personal.allow_workspace_write);
-        assert!(personal.require_kernel_sandbox);
+        assert!(!personal.require_kernel_sandbox);
     }
 
     #[test]

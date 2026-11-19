@@ -152,6 +152,9 @@ impl PolicyEngine {
                 role,
                 target_mode,
             } => self.decide_subagent(agent_type, role, *target_mode),
+            Capability::Task { action, mode } => PolicyDecision::Allow {
+                reason: format!("session task operation '{action}' ({mode:?}) permitted"),
+            },
         }
     }
 
@@ -193,13 +196,6 @@ impl PolicyEngine {
     }
 
     fn decide_shell(&self, program: &str, args: &[String]) -> PolicyDecision {
-        if let SandboxStatus::Unavailable { reason } = &self.sandbox_status
-            && self.rules.require_kernel_sandbox
-        {
-            return PolicyDecision::Deny {
-                reason: format!("refusing unsandboxed shell command '{program}': {reason}"),
-            };
-        }
         let classification =
             ShellClassifier::classify_with_sandbox(program, args, Some(&self.sandbox));
         if classification.target == TargetScope::Protected
@@ -594,17 +590,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refuses_shell_when_kernel_sandbox_unavailable() -> Result<(), Box<dyn std::error::Error>> {
+    fn allows_readonly_shell_without_kernel_landlock() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = std::env::temp_dir();
-        let audit_path = temp_dir.join("rein_policy_fail_closed_audit.jsonl");
+        let audit_path = temp_dir.join("rein_policy_no_landlock_audit.jsonl");
         let _ = std::fs::remove_file(&audit_path);
 
         let engine = PolicyEngine::with_sandbox_status(
             PolicyRuleSet::coding_default(),
             WorkspaceSandbox::new(&temp_dir),
-            SandboxStatus::Unavailable {
-                reason: "kernel compiled without CONFIG_SECURITY_LANDLOCK".to_owned(),
-            },
+            SandboxStatus::PolicyOnly,
             AuditLog::new(&audit_path),
         );
         let decision = engine.evaluate(
@@ -614,7 +608,7 @@ mod tests {
                 args: vec!["-n".to_owned(), "5".to_owned(), "Cargo.toml".to_owned()],
             },
         )?;
-        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+        assert!(matches!(decision, PolicyDecision::Allow { .. }));
         let _ = std::fs::remove_file(&audit_path);
         Ok(())
     }

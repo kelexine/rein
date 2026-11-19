@@ -27,8 +27,8 @@ pub use engine::{
     PolicyDecision, PolicyEngine, PolicyError, PolicyRuleSet, suggest_command_allow_pattern,
 };
 pub use sandbox::{
-    DEFAULT_READ_ONLY_DIRS, DEFAULT_RW_DEVICE_PATHS, OUTPUT_CAP_BYTES, SANDBOX_CHILD_FLAG,
-    SandboxCommandOutput, SandboxSpec, SandboxStatus, WorkspaceSandbox, apply_sandbox_in_child,
-    default_sandbox_read_only_paths, default_sandbox_read_write_paths, execute_sandbox_child,
-    harden_process_dumpable, probe_kernel_sandbox, run_sandboxed_command,
+    LocalTimeParts, OUTPUT_CAP_BYTES, SandboxCommandOutput, SandboxSpec, SandboxStatus,
+    SharedLogWriter, SpawnedSandboxProcess, WorkspaceSandbox, detach_controlling_terminal,
+    drain_pipe_to_log_and_sink, harden_process_dumpable, local_time_parts, probe_kernel_sandbox,
+    run_sandboxed_command, signal_process_group, spawn_sandboxed_command,
 };

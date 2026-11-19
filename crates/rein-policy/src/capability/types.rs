@@ -88,4 +88,11 @@ pub enum Capability {
         /// Target operating mode required by this sub-agent.
         target_mode: ModeId,
     },
+    /// Background task management and time-scheduled prompt triggers (`manage_task`, `schedule`).
+    Task {
+        /// Task operation (`list`, `status`, `send_input`, `kill`, `schedule`).
+        action: String,
+        /// Read or write access mode.
+        mode: AccessMode,
+    },
 }
