@@ -384,10 +384,26 @@ fn format_tool_header(name: &str, args: &Value) -> (String, Option<String>) {
             "Edit".to_owned(),
             arg_str(args, "path", 68).map(|p| relative_display_path(&p)),
         ),
-        "glob" => ("Glob".to_owned(), arg_str(args, "pattern", 68)),
+        "glob" => (
+            "Glob".to_owned(),
+            arg_str(args, "pattern", 68).map(|pat| match arg_str(args, "path", 24) {
+                Some(path) if path != "." => format!("{pat} in {}", relative_display_path(&path)),
+                _ => pat,
+            }),
+        ),
         "grep" => (
             "Grep".to_owned(),
-            arg_str(args, "query", 68).or_else(|| arg_str(args, "pattern", 68)),
+            arg_str(args, "query", 52)
+                .or_else(|| arg_str(args, "pattern", 52))
+                .map(|q| {
+                    let filter = arg_str(args, "glob", 20)
+                        .or_else(|| arg_str(args, "include", 20))
+                        .or_else(|| arg_str(args, "type", 16));
+                    match filter {
+                        Some(f) => format!("{q} · {f}"),
+                        None => q,
+                    }
+                }),
         ),
         "memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
