@@ -52,6 +52,8 @@ pub enum BuiltinAction {
     Provider,
     /// Opens an interactive picker of saved sessions in the current directory.
     Resume,
+    /// Rewinds conversation history and optionally workspace code to a previous turn.
+    Rewind,
     /// Exits Rein cleanly.
     Quit,
 }
@@ -189,6 +191,11 @@ impl SlashRegistry {
                 "resume",
                 "Interactively pick and resume a saved session in this directory",
                 BuiltinAction::Resume,
+            ),
+            builtin(
+                "rewind",
+                "Rewind conversation to a previous message",
+                BuiltinAction::Rewind,
             ),
             builtin(
                 "exit",

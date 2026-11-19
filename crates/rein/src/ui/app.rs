@@ -8,7 +8,9 @@ use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
 use rein_tools::{McpServerConfig, TodoItem, TodoListState, TodoStatus, TodoStore};
 use serde_json::Value;
 
-use crate::agent::{ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent};
+use crate::agent::{
+    ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, TurnCheckpoint,
+};
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::config::{ProviderKind, SessionSummary};
 use crate::modes::Profile;
@@ -47,6 +49,29 @@ pub struct PendingSessionPicker {
     pub selected: usize,
 }
 
+/// Active step inside the interactive `/rewind` picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindStep {
+    /// Selecting which user turn (or `(current)`) to rewind to.
+    SelectTurn,
+    /// Choosing whether to rewind messages only or messages and code.
+    SelectAction {
+        /// Target turn index chosen in [`RewindStep::SelectTurn`].
+        turn_index: usize,
+    },
+}
+
+/// Active interactive `/rewind` popup opened by `/rewind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRewindPicker {
+    /// Recorded turn checkpoints in chronological order.
+    pub items: Vec<TurnCheckpoint>,
+    /// Highlighted row index (`items.len()` represents `(current)` in `SelectTurn`; `0 | 1` in `SelectAction`).
+    pub selected: usize,
+    /// Current picker step.
+    pub step: RewindStep,
+}
+
 /// State owned by the in-process minimalist Ratatui frontend.
 #[derive(Debug)]
 pub struct AppState {
@@ -72,6 +97,7 @@ pub struct AppState {
     pending_approval: Option<PendingApproval>,
     pending_model_picker: Option<PendingModelPicker>,
     pending_session_picker: Option<PendingSessionPicker>,
+    pending_rewind_picker: Option<PendingRewindPicker>,
     expand_outputs: bool,
     scroll_offset: u16,
     auto_scroll: bool,
@@ -153,6 +179,7 @@ impl AppState {
             pending_approval: None,
             pending_model_picker: None,
             pending_session_picker: None,
+            pending_rewind_picker: None,
             expand_outputs: false,
             scroll_offset: 0,
             auto_scroll: true,
@@ -968,6 +995,109 @@ impl AppState {
     /// Dismisses the interactive `/resume` picker without making changes.
     pub fn clear_session_picker(&mut self) {
         self.pending_session_picker = None;
+    }
+
+    /// Opens the interactive `/rewind` selector populated from recorded turn checkpoints.
+    pub fn open_rewind_picker(&mut self, items: Vec<TurnCheckpoint>) {
+        let selected = items.len();
+        self.pending_rewind_picker = Some(PendingRewindPicker {
+            items,
+            selected,
+            step: RewindStep::SelectTurn,
+        });
+    }
+
+    /// Returns any active interactive `/rewind` picker state.
+    #[must_use]
+    pub fn pending_rewind_picker(&self) -> Option<&PendingRewindPicker> {
+        self.pending_rewind_picker.as_ref()
+    }
+
+    /// Moves selection up/down inside the interactive `/rewind` picker with wrap-around.
+    pub fn move_rewind_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.pending_rewind_picker else {
+            return;
+        };
+        let count = match picker.step {
+            RewindStep::SelectTurn => picker.items.len() + 1,
+            RewindStep::SelectAction { turn_index } => {
+                let has_snapshot = picker
+                    .items
+                    .get(turn_index)
+                    .is_some_and(|c| c.snapshot.is_some());
+                if has_snapshot { 2 } else { 1 }
+            }
+        };
+        if count == 0 {
+            picker.selected = 0;
+            return;
+        }
+        let len = isize::try_from(count).unwrap_or(1);
+        let current = isize::try_from(picker.selected.min(count - 1)).unwrap_or(0);
+        picker.selected = usize::try_from((current + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Advances `/rewind` from turn selection to action selection, or returns `(turn_index, restore_code)` on confirm.
+    pub fn confirm_rewind_step(&mut self) -> Option<(usize, bool)> {
+        let picker = self.pending_rewind_picker.as_mut()?;
+        match picker.step {
+            RewindStep::SelectTurn => {
+                if picker.selected >= picker.items.len() {
+                    self.pending_rewind_picker = None;
+                    return None;
+                }
+                let turn_index = picker.selected;
+                let has_snapshot = picker
+                    .items
+                    .get(turn_index)
+                    .is_some_and(|c| c.snapshot.is_some());
+                picker.step = RewindStep::SelectAction { turn_index };
+                picker.selected = usize::from(has_snapshot);
+                None
+            }
+            RewindStep::SelectAction { turn_index } => {
+                let has_snapshot = picker
+                    .items
+                    .get(turn_index)
+                    .is_some_and(|c| c.snapshot.is_some());
+                let restore_code = has_snapshot && picker.selected == 1;
+                self.pending_rewind_picker = None;
+                Some((turn_index, restore_code))
+            }
+        }
+    }
+
+    /// Steps back from action selection to turn selection, or closes the `/rewind` picker.
+    pub fn cancel_rewind_step(&mut self) {
+        let Some(picker) = &mut self.pending_rewind_picker else {
+            return;
+        };
+        match picker.step {
+            RewindStep::SelectTurn => {
+                self.pending_rewind_picker = None;
+            }
+            RewindStep::SelectAction { turn_index } => {
+                picker.step = RewindStep::SelectTurn;
+                picker.selected = turn_index;
+            }
+        }
+    }
+
+    /// Truncates the rendered transcript entries back to the `turn_index`-th user prompt.
+    pub fn truncate_entries_to_user_turn(&mut self, turn_index: usize) {
+        let mut seen = 0usize;
+        let mut cut_idx = self.entries.len();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if matches!(entry, TranscriptEntry::UserTurn(_)) {
+                if seen == turn_index {
+                    cut_idx = idx;
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        self.entries.truncate(cut_idx);
+        self.auto_scroll = true;
     }
 
     /// Sets or clears an interactive 4-option approval prompt from the policy layer.

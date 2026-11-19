@@ -10,10 +10,12 @@ use ratatui::widgets::Paragraph;
 use rein_core::ModeId;
 use rein_tools::{TodoItem, TodoStatus};
 
+use crate::agent::{format_relative_age, now_unix_secs};
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
 use crate::ui::app::{
-    PendingApproval, PendingModelPicker, PendingSessionPicker, is_model_active, model_vendor_group,
+    PendingApproval, PendingModelPicker, PendingRewindPicker, PendingSessionPicker, RewindStep,
+    is_model_active, model_vendor_group,
 };
 use crate::ui::entries::render_transcript_lines;
 
@@ -117,6 +119,8 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
             frame,
             chunks[3],
         );
+    } else if let Some(picker) = state.pending_rewind_picker() {
+        render_rewind_picker(picker, frame, chunks[3]);
     } else if chunks[3].height > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
@@ -152,6 +156,14 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
     } else if let Some(picker) = state.pending_session_picker() {
         let count = picker.items.len().clamp(1, MAX_MENU_ROWS);
         u16::try_from(count + 1).unwrap_or(2)
+    } else if let Some(picker) = state.pending_rewind_picker() {
+        match picker.step {
+            RewindStep::SelectTurn => {
+                let count = (picker.items.len() + 1).clamp(1, MAX_MENU_ROWS);
+                u16::try_from(count + 2).unwrap_or(3)
+            }
+            RewindStep::SelectAction { .. } => 4,
+        }
     } else {
         u16::try_from(slash_count.min(MAX_MENU_ROWS)).unwrap_or(0)
     }
@@ -589,6 +601,116 @@ fn render_session_picker(
             spans.push(Span::styled(" (active)", Style::default().fg(Color::Green)));
         }
         rows.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_rewind_picker(picker: &PendingRewindPicker, frame: &mut Frame<'_>, area: Rect) {
+    let mut rows = Vec::with_capacity(MAX_MENU_ROWS + 2);
+    match picker.step {
+        RewindStep::SelectTurn => {
+            rows.push(Line::from(vec![
+                Span::styled(
+                    "Rewind Conversation ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "[↑/↓ Navigate · Enter Select · Esc Cancel]",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            let total = picker.items.len() + 1;
+            let clamped = picker.selected.min(total.saturating_sub(1));
+            let window_start = clamped.saturating_sub(MAX_MENU_ROWS - 1);
+            let window_end = (window_start + MAX_MENU_ROWS).min(total);
+            let now = now_unix_secs();
+
+            for idx in window_start..window_end {
+                let is_selected = idx == clamped;
+                let marker = if is_selected { "› " } else { "  " };
+                let style = if is_selected {
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                if idx < picker.items.len() {
+                    let cp = &picker.items[idx];
+                    let age = if cp.timestamp_secs == 0 {
+                        "resumed".to_owned()
+                    } else {
+                        format_relative_age(cp.timestamp_secs, now)
+                    };
+                    let snap_tag = if cp.snapshot.is_some() {
+                        ""
+                    } else {
+                        " · no code snapshot"
+                    };
+                    rows.push(Line::from(vec![
+                        Span::styled(format!("{marker}{}", cp.prompt_preview), style),
+                        Span::styled(
+                            format!(" ({age}{snap_tag})"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                } else {
+                    rows.push(Line::from(Span::styled(
+                        format!("{marker}(current)"),
+                        if is_selected {
+                            Style::default()
+                                .fg(Color::LightBlue)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    )));
+                }
+            }
+        }
+        RewindStep::SelectAction { turn_index } => {
+            let preview = picker
+                .items
+                .get(turn_index)
+                .map_or("", |c| c.prompt_preview.as_str());
+            let has_snapshot = picker
+                .items
+                .get(turn_index)
+                .is_some_and(|c| c.snapshot.is_some());
+            rows.push(Line::from(vec![
+                Span::styled(
+                    "Rewind to: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(preview.to_owned(), Style::default().fg(Color::White)),
+                Span::styled(
+                    " [↑/↓ · Enter · Esc Back]",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            let mut options = vec!["1. Rewind messages only"];
+            if has_snapshot {
+                options.push("2. Rewind messages and code changes");
+            }
+            for (idx, label) in options.iter().enumerate() {
+                let is_selected = idx == picker.selected;
+                let marker = if is_selected { "› " } else { "  " };
+                rows.push(Line::from(Span::styled(
+                    format!("{marker}{label}"),
+                    if is_selected {
+                        Style::default()
+                            .fg(Color::LightBlue)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                )));
+            }
+        }
     }
     frame.render_widget(Paragraph::new(rows), area);
 }

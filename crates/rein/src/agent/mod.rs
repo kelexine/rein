@@ -4,8 +4,14 @@
 
 /// In-process agent loop orchestrating Core, Policy, Tools, and Modes.
 pub mod runner;
+/// Per-turn workspace snapshots and `/rewind` restoration.
+pub mod snapshot;
 
 pub use runner::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, HydratedEvent,
     MAX_TOOL_ROUNDS,
+};
+pub use snapshot::{
+    TurnCheckpoint, WorkspaceSnapshot, capture_workspace_snapshot, format_relative_age,
+    now_unix_secs, restore_workspace_snapshot,
 };

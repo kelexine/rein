@@ -13,6 +13,11 @@ use rein_core::{
 use rein_policy::{PolicyDecision, PolicyEngine, WorkspaceSandbox, suggest_command_allow_pattern};
 use rein_tools::{JsonlMemoryStore, MemoryRecord, ToolRegistry, ToolSchema, parse_mode_id};
 
+use crate::agent::snapshot::{
+    TurnCheckpoint, append_checkpoint, capture_workspace_snapshot, checkpoints_path_for,
+    count_jsonl_lines, load_checkpoints, now_unix_secs, restore_workspace_snapshot,
+    truncate_jsonl_lines,
+};
 use crate::config::append_allowed_command;
 use crate::modes::{ContextBuilder, ModeManager, Profile, RuntimeContext};
 
@@ -108,6 +113,7 @@ pub struct AgentLoop {
     memory: JsonlMemoryStore,
     modes: ModeManager,
     history: Vec<Message>,
+    checkpoints: Vec<TurnCheckpoint>,
     allowed_commands: Vec<String>,
     extra_tools: Vec<String>,
     runtime_context: RuntimeContext,
@@ -134,6 +140,7 @@ impl AgentLoop {
             memory,
             modes: ModeManager::new(initial_profile),
             history: Vec::new(),
+            checkpoints: Vec::new(),
             allowed_commands,
             extra_tools: Vec::new(),
             runtime_context: RuntimeContext::new(),
@@ -233,9 +240,36 @@ impl AgentLoop {
         Ok(switched)
     }
 
+    /// Returns recorded pre-turn checkpoints for `/rewind`.
+    #[must_use]
+    pub fn checkpoints(&self) -> &[TurnCheckpoint] {
+        &self.checkpoints
+    }
+
+    /// Rewinds conversation history, session logs, and optionally workspace code to `turn_index`.
+    pub fn rewind_to(&mut self, turn_index: usize, restore_code: bool) -> Result<TurnCheckpoint> {
+        let checkpoint = self
+            .checkpoints
+            .get(turn_index)
+            .cloned()
+            .with_context(|| format!("invalid rewind checkpoint index {turn_index}"))?;
+        if restore_code && let Some(snapshot) = &checkpoint.snapshot {
+            restore_workspace_snapshot(self.policy.sandbox().root(), snapshot)?;
+        }
+        self.history.truncate(checkpoint.history_len);
+        truncate_jsonl_lines(self.event_log.path(), checkpoint.event_count)?;
+        if let Some(full_path) = &self.full_transcript_path {
+            truncate_jsonl_lines(full_path, checkpoint.full_transcript_count)?;
+        }
+        truncate_jsonl_lines(&checkpoints_path_for(self.event_log.path()), turn_index)?;
+        self.checkpoints.truncate(turn_index);
+        Ok(checkpoint)
+    }
+
     /// Clears active in-memory conversation history (`full-transcript.jsonl` stays preserved).
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.checkpoints.clear();
     }
 
     /// Rebinds this [`AgentLoop`] to a new session `EventLog` and `full_transcript` archive and clears active history.
@@ -243,6 +277,7 @@ impl AgentLoop {
         self.event_log = event_log;
         self.full_transcript_path = Some(full_transcript_path);
         self.history.clear();
+        self.checkpoints.clear();
     }
 
     /// Queries the dual-scope memory store for `scope` and substring `query`.
@@ -326,8 +361,9 @@ impl AgentLoop {
         let mut pending_tools: Vec<Message> = Vec::new();
         let mut round_text = String::new();
         self.history.clear();
+        self.checkpoints.clear();
 
-        for ev in events {
+        for (event_idx, ev) in events.into_iter().enumerate() {
             match ev {
                 SessionEvent::ModeSwitched { mode } => {
                     let profile = self.build_profile(mode);
@@ -377,6 +413,24 @@ impl AgentLoop {
                     round_text.clear();
                     match message.role {
                         Role::User => {
+                            let preview: String = message
+                                .content
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .chars()
+                                .take(80)
+                                .collect();
+                            self.checkpoints.push(TurnCheckpoint {
+                                turn_index: self.checkpoints.len(),
+                                prompt_preview: preview,
+                                timestamp_secs: 0,
+                                history_len: self.history.len(),
+                                event_count: event_idx,
+                                full_transcript_count: 0,
+                                snapshot: None,
+                            });
                             items.push(HydratedEvent::User(message.content.clone()));
                         }
                         Role::Assistant => {
@@ -415,6 +469,11 @@ impl AgentLoop {
             &mut pending_calls,
             &mut pending_tools,
         );
+        if let Ok(persisted) = load_checkpoints(&checkpoints_path_for(self.event_log.path()))
+            && !persisted.is_empty()
+        {
+            self.checkpoints = persisted;
+        }
         Ok(items)
     }
 
@@ -437,6 +496,30 @@ impl AgentLoop {
         prompter: &mut dyn ApprovalPrompter,
         cancel: &AtomicBool,
     ) -> Result<String> {
+        let preview = prompt
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(80)
+            .collect::<String>();
+        let snapshot = capture_workspace_snapshot(self.policy.sandbox().root()).ok();
+        let checkpoint = TurnCheckpoint {
+            turn_index: self.checkpoints.len(),
+            prompt_preview: preview,
+            timestamp_secs: now_unix_secs(),
+            history_len: self.history.len(),
+            event_count: count_jsonl_lines(self.event_log.path()),
+            full_transcript_count: self
+                .full_transcript_path
+                .as_deref()
+                .map_or(0, count_jsonl_lines),
+            snapshot,
+        };
+        let _ = append_checkpoint(&checkpoints_path_for(self.event_log.path()), &checkpoint);
+        self.checkpoints.push(checkpoint);
+
         let user_msg = Message::new(Role::User, prompt);
         record_full_message(self.full_transcript_path.as_deref(), &user_msg)?;
         self.history.push(user_msg);

@@ -146,6 +146,8 @@ fn resume_session_resolves_latest_and_hydrates_history() -> Result<(), Box<dyn s
     assert_eq!(agent.history().len(), 2);
     assert_eq!(agent.history()[0].content, "first prompt");
     assert_eq!(agent.history()[1].content, "first reply");
+    assert_eq!(agent.checkpoints().len(), 1);
+    assert_eq!(agent.checkpoints()[0].prompt_preview, "first prompt");
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -250,6 +252,87 @@ fn bypass_permissions_allows_all_tools_across_modes_without_prompting()
 
     let audit_raw = std::fs::read_to_string(&loaded.paths.audit_log)?;
     assert!(audit_raw.contains("dangerously-bypass-permission"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn agent_loop_rewind_restores_messages_and_code_from_turns()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = fresh_temp_dir("rewind")?;
+    let workspace = dir.join("workspace");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(workspace.join("app.txt"), "v1\n")?;
+
+    let loaded = ensure_dirs_and_load_in(&workspace, &home)?;
+    let sandbox = WorkspaceSandbox::new(&workspace);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(WriteTool::new(sandbox.clone())));
+
+    let profile = Profile::coding();
+    let policy = PolicyEngine::new(
+        profile.policy_rules.clone(),
+        sandbox,
+        AuditLog::new(&loaded.paths.audit_log),
+    )
+    .with_bypass_permissions(true);
+    let memory = JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory);
+    let session_path = loaded.paths.sessions_dir.join("rewind-session.jsonl");
+    let mut agent = AgentLoop::new(
+        EventLog::new(&session_path),
+        policy,
+        registry,
+        memory,
+        profile,
+    );
+
+    let recorded = vec![
+        SessionEvent::StreamDelta {
+            delta: "Turn 1 ok.".to_owned(),
+        },
+        SessionEvent::MessageRecorded {
+            message: rein_core::Message::new(Role::Assistant, "Turn 1 ok."),
+        },
+        SessionEvent::ToolRequested {
+            call: ToolCall {
+                id: "call_w2".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({ "path": "app.txt", "content": "v2\n" }),
+            },
+        },
+        SessionEvent::ToolCompleted {
+            output: rein_core::ToolOutput {
+                call_id: "call_w2".to_owned(),
+                content: "wrote".to_owned(),
+                is_error: false,
+            },
+        },
+        SessionEvent::StreamDelta {
+            delta: "Turn 2 ok.".to_owned(),
+        },
+    ];
+
+    let mut provider = ReplayProvider::from_events(&recorded);
+    let mut prompter = AutoDenyPrompter;
+    assert_eq!(
+        agent.run_user_prompt("turn 1", &mut provider, &mut prompter)?,
+        "Turn 1 ok."
+    );
+    assert_eq!(
+        agent.run_user_prompt("turn 2", &mut provider, &mut prompter)?,
+        "Turn 2 ok."
+    );
+    assert_eq!(std::fs::read_to_string(workspace.join("app.txt"))?, "v2\n");
+    assert_eq!(agent.checkpoints().len(), 2);
+
+    // Rewind to turn 2 (index 1) with restore_code = true -> restores app.txt to "v1\n" and trims history.
+    agent.rewind_to(1, true)?;
+    assert_eq!(std::fs::read_to_string(workspace.join("app.txt"))?, "v1\n");
+    assert_eq!(agent.checkpoints().len(), 1);
+    assert_eq!(agent.history().len(), 2);
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

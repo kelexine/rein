@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -48,12 +47,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        )?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -65,7 +59,6 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
-            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -160,9 +153,6 @@ pub fn run_tui(
                     app.push_input_str(&text);
                 }
             }
-            Event::Mouse(mouse) => {
-                handle_mouse_event(mouse, app, &guard)?;
-            }
             _ => {}
         }
     }
@@ -191,6 +181,9 @@ fn handle_idle_key(
     }
     if app.pending_session_picker().is_some() {
         return handle_session_picker_key(key, agent, paths, app);
+    }
+    if app.pending_rewind_picker().is_some() {
+        return handle_rewind_picker_key(key, agent, app);
     }
     if key.code == KeyCode::Esc {
         return Ok(false);
@@ -293,6 +286,40 @@ fn handle_session_picker_key(
                 app.sync_todo_session(&chosen.uid);
                 app.set_active_profile(agent.active_profile().clone());
                 app.push_system_note(format!("resumed session {}", chosen.uid));
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_rewind_picker_key(
+    key: KeyEvent,
+    agent: &mut AgentLoop,
+    app: &mut AppState,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => app.cancel_rewind_step(),
+        KeyCode::Up => app.move_rewind_selection(-1),
+        KeyCode::Down => app.move_rewind_selection(1),
+        KeyCode::Enter => {
+            if let Some((turn_index, restore_code)) = app.confirm_rewind_step() {
+                match agent.rewind_to(turn_index, restore_code) {
+                    Ok(cp) => {
+                        app.truncate_entries_to_user_turn(turn_index);
+                        let scope = if restore_code {
+                            "messages and code"
+                        } else {
+                            "messages only"
+                        };
+                        app.push_system_note(format!(
+                            "rewound {scope} to turn {}: {}",
+                            turn_index + 1,
+                            cp.prompt_preview
+                        ));
+                    }
+                    Err(err) => app.push_error_note(format!("rewind failed: {err}")),
+                }
             }
         }
         _ => {}
@@ -464,6 +491,14 @@ fn run_builtin_action(
                 app.open_session_picker(sessions);
             }
         }
+        BuiltinAction::Rewind => {
+            let checkpoints = agent.checkpoints().to_vec();
+            if checkpoints.is_empty() {
+                app.push_system_note("no turns to rewind in this session yet");
+            } else {
+                app.open_rewind_picker(checkpoints);
+            }
+        }
     }
     Ok(false)
 }
@@ -628,33 +663,27 @@ fn run_login_background(
             if !app.is_busy() {
                 break;
             }
-            if event::poll(Duration::from_millis(25)).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if is_ctrl_c(key) {
-                            if app.arm_or_confirm_ctrl_c(Instant::now()) {
-                                cancel.store(true, Ordering::Relaxed);
-                                should_quit = true;
-                                break;
-                            }
-                        } else {
-                            app.clear_ctrl_c_arm();
-                            if is_ctrl_o(key) {
-                                let _ = app.toggle_expand_outputs();
-                            } else if key.code == KeyCode::PageUp {
-                                let _ = scroll_page(app, guard, -1);
-                            } else if key.code == KeyCode::PageDown {
-                                let _ = scroll_page(app, guard, 1);
-                            } else if key.code == KeyCode::Esc {
-                                cancel.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                        }
+            if event::poll(Duration::from_millis(25)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+            {
+                if is_ctrl_c(key) {
+                    if app.arm_or_confirm_ctrl_c(Instant::now()) {
+                        cancel.store(true, Ordering::Relaxed);
+                        should_quit = true;
+                        break;
                     }
-                    Ok(Event::Mouse(mouse)) => {
-                        let _ = handle_mouse_event(mouse, app, guard);
+                } else {
+                    app.clear_ctrl_c_arm();
+                    if is_ctrl_o(key) {
+                        let _ = app.toggle_expand_outputs();
+                    } else if key.code == KeyCode::PageUp {
+                        let _ = scroll_page(app, guard, -1);
+                    } else if key.code == KeyCode::PageDown {
+                        let _ = scroll_page(app, guard, 1);
+                    } else if key.code == KeyCode::Esc {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
                     }
-                    _ => {}
                 }
             }
         }
@@ -755,29 +784,23 @@ fn compact_background(
             if !app.is_busy() {
                 break;
             }
-            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if is_ctrl_c(key) {
-                            if app.arm_or_confirm_ctrl_c(Instant::now()) {
-                                should_quit = true;
-                                break;
-                            }
-                        } else {
-                            app.clear_ctrl_c_arm();
-                            if is_ctrl_o(key) {
-                                let _ = app.toggle_expand_outputs();
-                            } else if key.code == KeyCode::PageUp {
-                                let _ = scroll_page(app, guard, -1);
-                            } else if key.code == KeyCode::PageDown {
-                                let _ = scroll_page(app, guard, 1);
-                            }
-                        }
+            if event::poll(Duration::from_millis(16)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+            {
+                if is_ctrl_c(key) {
+                    if app.arm_or_confirm_ctrl_c(Instant::now()) {
+                        should_quit = true;
+                        break;
                     }
-                    Ok(Event::Mouse(mouse)) => {
-                        let _ = handle_mouse_event(mouse, app, guard);
+                } else {
+                    app.clear_ctrl_c_arm();
+                    if is_ctrl_o(key) {
+                        let _ = app.toggle_expand_outputs();
+                    } else if key.code == KeyCode::PageUp {
+                        let _ = scroll_page(app, guard, -1);
+                    } else if key.code == KeyCode::PageDown {
+                        let _ = scroll_page(app, guard, 1);
                     }
-                    _ => {}
                 }
             }
         }
@@ -846,9 +869,6 @@ fn stream_prompt_background(
                         if app.pending_approval().is_none() {
                             app.push_input_str(&text);
                         }
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        let _ = handle_mouse_event(mouse, app, guard);
                     }
                     _ => {}
                 }
@@ -1019,36 +1039,12 @@ fn handle_streaming_key(
     false
 }
 
-fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState, guard: &TerminalGuard) -> Result<()> {
-    let dir: i16 = match mouse.kind {
-        MouseEventKind::ScrollUp => -3,
-        MouseEventKind::ScrollDown => 3,
-        _ => return Ok(()),
-    };
-    if app.pending_model_picker().is_some() {
-        app.move_model_selection(if dir < 0 { -1 } else { 1 });
-        return Ok(());
-    }
-    if app.pending_session_picker().is_some() {
-        app.move_session_selection(if dir < 0 { -1 } else { 1 });
-        return Ok(());
-    }
-    scroll_lines(app, guard, dir)
-}
-
 fn viewport_rect(app: &AppState, guard: &TerminalGuard) -> Result<Rect> {
     let size = guard.terminal.size()?;
     Ok(transcript_viewport(
         app,
         Rect::new(0, 0, size.width, size.height),
     ))
-}
-
-fn scroll_lines(app: &mut AppState, guard: &TerminalGuard, delta: i16) -> Result<()> {
-    let rect = viewport_rect(app, guard)?;
-    let max_scroll = compute_max_scroll(app, rect.width, rect.height);
-    app.scroll_by(delta, max_scroll);
-    Ok(())
 }
 
 fn scroll_page(app: &mut AppState, guard: &TerminalGuard, dir: i16) -> Result<()> {
