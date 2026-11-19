@@ -2,15 +2,19 @@
 // Date: 2026-11-14
 // Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, Slash commands, and Model picker
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
-use rein_tools::{McpServerConfig, TodoItem, TodoListState, TodoStatus, TodoStore};
+use rein_tools::{
+    McpServerConfig, TaskKind, TaskNotification, TaskRegistry, TaskStatus, TodoItem, TodoListState,
+    TodoStatus, TodoStore,
+};
 use serde_json::Value;
 
 use crate::agent::{
     ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, LiveSubagentStatus,
-    SubagentTracker, TurnCheckpoint,
+    SubagentRunState, SubagentTracker, TurnCheckpoint, now_unix_secs,
 };
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::config::{ProviderKind, SessionSummary};
@@ -60,6 +64,96 @@ pub enum RewindStep {
         /// Target turn index chosen in [`RewindStep::SelectTurn`].
         turn_index: usize,
     },
+}
+
+/// Source kind of an entry displayed in the bottom live strip, `/tasks` manager, or Task Details view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskTargetKind {
+    /// Policy-confined child sub-agent.
+    Subagent,
+    /// Sandboxed background shell command.
+    Shell,
+    /// One-shot scheduled timer.
+    Timer,
+    /// Recurring 5-field cron schedule.
+    Cron,
+}
+
+impl TaskTargetKind {
+    /// Human-readable label shown in Task Details (`Agent`, `Shell`, `Timer`, `Cron`).
+    #[must_use]
+    pub fn display_type(self) -> &'static str {
+        match self {
+            Self::Subagent => "Agent",
+            Self::Shell => "Shell",
+            Self::Timer => "Timer",
+            Self::Cron => "Cron",
+        }
+    }
+}
+
+/// Unified task/subagent row used by the bottom live strip and `/tasks` manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskListEntry {
+    /// Task or subagent identifier.
+    pub id: String,
+    /// Kind (`Subagent`, `Shell`, `Timer`, `Cron`).
+    pub kind: TaskTargetKind,
+    /// Primary title (`Agent(type: role)` or command/schedule label).
+    pub title: String,
+    /// Short trailing status/model/elapsed string.
+    pub detail: String,
+    /// Local `HH:MM:SS` start timestamp.
+    pub started_hms: String,
+    /// Local `YYYY-MM-DD HH:MM:SS` start timestamp.
+    pub started_full: String,
+    /// Status word (`running`, `completed`, `failed`, `killed`, `fired`, `cancelled`).
+    pub status_label: String,
+    /// `true` while actively running.
+    pub is_running: bool,
+    /// `true` when terminal failure/kill.
+    pub is_error: bool,
+}
+
+/// Live inspection screen opened via `Enter` from the bottom strip or `/tasks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDetailsView {
+    /// Inspected task or subagent ID.
+    pub target_id: String,
+    /// Source kind.
+    pub kind: TaskTargetKind,
+    /// Scroll offset from top when `follow_bottom` is `false`.
+    pub scroll: usize,
+    /// Whether output follows the bottom automatically (`ctrl+end` enables, `↑`/`pgup` disables).
+    pub follow_bottom: bool,
+    /// Whether pressing `Esc` returns to `/tasks` manager instead of chat.
+    pub return_to_manager: bool,
+}
+
+/// Live data snapshot rendered inside the **Task Details** screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDetailsSnapshot {
+    /// Command or subagent label.
+    pub command: String,
+    /// Status label (`running`, `completed`, etc.).
+    pub status_label: String,
+    /// Type string (`Agent`, `Shell`, `Timer`, `Cron`).
+    pub type_label: String,
+    /// Local `YYYY-MM-DD HH:MM:SS` start timestamp.
+    pub started_full: String,
+    /// `true` if currently running.
+    pub is_running: bool,
+    /// `true` if failed/killed.
+    pub is_error: bool,
+    /// Output or step lines.
+    pub output_lines: Vec<String>,
+}
+
+/// Active interactive `/tasks` manager overlay (`k` kills running, `x` deletes done).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTaskManager {
+    /// Currently highlighted row index.
+    pub selected: usize,
 }
 
 /// Active interactive `/rewind` popup opened by `/rewind`.
@@ -113,6 +207,11 @@ pub struct AppState {
     draft_input: String,
     bypass_permissions: bool,
     subagent_tracker: SubagentTracker,
+    task_registry: TaskRegistry,
+    task_notifications_rx: Option<mpsc::Receiver<TaskNotification>>,
+    strip_selected: Option<usize>,
+    pending_task_manager: Option<PendingTaskManager>,
+    pending_task_details: Option<TaskDetailsView>,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -196,7 +295,56 @@ impl AppState {
             draft_input: String::new(),
             bypass_permissions: false,
             subagent_tracker: SubagentTracker::new(),
+            task_registry: TaskRegistry::new(),
+            task_notifications_rx: None,
+            strip_selected: None,
+            pending_task_manager: None,
+            pending_task_details: None,
         }
+    }
+
+    /// Attaches the session [`TaskRegistry`] tracking background bash processes, timers, and crons.
+    #[must_use]
+    pub fn with_task_registry(mut self, registry: TaskRegistry) -> Self {
+        self.task_registry = registry;
+        self
+    }
+
+    /// Attaches the inbox receiver delivering asynchronous [`TaskNotification`] wakeups.
+    #[must_use]
+    pub fn with_task_notifications(mut self, rx: mpsc::Receiver<TaskNotification>) -> Self {
+        self.task_notifications_rx = Some(rx);
+        self
+    }
+
+    /// Returns a reference to the active [`TaskRegistry`].
+    #[must_use]
+    pub fn task_registry(&self) -> &TaskRegistry {
+        &self.task_registry
+    }
+
+    /// Returns a reference to the shared [`SubagentTracker`].
+    #[must_use]
+    pub fn subagent_tracker(&self) -> &SubagentTracker {
+        &self.subagent_tracker
+    }
+
+    /// Non-blockingly drains all queued background task / schedule wakeup notifications.
+    pub fn drain_task_notifications(&mut self) -> Vec<TaskNotification> {
+        let Some(rx) = &self.task_notifications_rx else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Returns `true` when currently browsing prompt history.
+    #[must_use]
+    pub fn history_cursor_active(&self) -> bool {
+        self.history_cursor.is_some()
     }
 
     /// Attaches the shared [`SubagentTracker`] so running sub-agents render live above the prompt box.
@@ -1083,7 +1231,7 @@ impl AppState {
         }
     }
 
-    /// Steps back from action selection to turn selection, or closes the `/rewind` picker.
+    /// Cancels `/rewind` step.
     pub fn cancel_rewind_step(&mut self) {
         let Some(picker) = &mut self.pending_rewind_picker else {
             return;
@@ -1096,6 +1244,301 @@ impl AppState {
                 picker.step = RewindStep::SelectTurn;
                 picker.selected = turn_index;
             }
+        }
+    }
+
+    /// Returns currently running subagents and background tasks rendered in the bottom strip below the input box.
+    #[must_use]
+    pub fn running_strip_items(&self) -> Vec<TaskListEntry> {
+        let now = now_unix_secs();
+        let mut items: Vec<TaskListEntry> = self
+            .subagent_tracker
+            .snapshot()
+            .into_iter()
+            .map(|s| subagent_to_entry(&s, now))
+            .collect();
+        for t in self.task_registry.list_tasks() {
+            if !t.status.is_done() {
+                items.push(task_to_entry(&t));
+            }
+        }
+        items
+    }
+
+    /// Returns all tracked subagents and background tasks (running + done) for `/tasks` management.
+    #[must_use]
+    pub fn all_task_entries(&self) -> Vec<TaskListEntry> {
+        let now = now_unix_secs();
+        let mut items: Vec<TaskListEntry> = self
+            .subagent_tracker
+            .all_records()
+            .into_iter()
+            .map(|s| subagent_to_entry(&s, now))
+            .collect();
+        for t in self.task_registry.list_tasks() {
+            items.push(task_to_entry(&t));
+        }
+        items
+    }
+
+    /// Returns the currently highlighted index inside the bottom live task strip, if focused.
+    #[must_use]
+    pub fn strip_selected(&self) -> Option<usize> {
+        let items = self.running_strip_items();
+        if items.is_empty() {
+            return None;
+        }
+        self.strip_selected.map(|idx| idx.min(items.len() - 1))
+    }
+
+    /// Moves selection down/up inside the bottom live strip (`Up` from index `0` returns focus to input).
+    pub fn move_strip_selection(&mut self, delta: isize) -> bool {
+        let count = self.running_strip_items().len();
+        if count == 0 {
+            self.strip_selected = None;
+            return false;
+        }
+        match self.strip_selected {
+            None => {
+                if delta > 0 {
+                    self.strip_selected = Some(0);
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(cur) => {
+                if delta < 0 && cur == 0 {
+                    self.strip_selected = None;
+                    return true;
+                }
+                let max_idx = count.saturating_sub(1);
+                let next = if delta < 0 {
+                    cur.saturating_sub(delta.unsigned_abs())
+                } else {
+                    cur.saturating_add(delta.unsigned_abs()).min(max_idx)
+                };
+                self.strip_selected = Some(next);
+                true
+            }
+        }
+    }
+
+    /// Returns focus from the bottom live strip back to the input box.
+    pub fn clear_strip_selection(&mut self) {
+        self.strip_selected = None;
+    }
+
+    /// Opens the **Task Details** screen for the currently highlighted item in the bottom strip.
+    pub fn open_selected_strip_details(&mut self) -> bool {
+        let items = self.running_strip_items();
+        let Some(idx) = self.strip_selected() else {
+            return false;
+        };
+        let Some(entry) = items.get(idx) else {
+            return false;
+        };
+        self.strip_selected = None;
+        self.pending_task_details = Some(TaskDetailsView {
+            target_id: entry.id.clone(),
+            kind: entry.kind,
+            scroll: 0,
+            follow_bottom: true,
+            return_to_manager: false,
+        });
+        true
+    }
+
+    /// Opens the interactive `/tasks` manager overlay (`k` kills running, `x` deletes done).
+    pub fn open_task_manager(&mut self) {
+        self.strip_selected = None;
+        self.pending_task_details = None;
+        self.pending_task_manager = Some(PendingTaskManager { selected: 0 });
+    }
+
+    /// Returns any active `/tasks` manager overlay state.
+    #[must_use]
+    pub fn pending_task_manager(&self) -> Option<&PendingTaskManager> {
+        self.pending_task_manager.as_ref()
+    }
+
+    /// Moves selection up/down inside `/tasks` manager with wrap-around.
+    pub fn move_task_manager_selection(&mut self, delta: isize) {
+        let count = self.all_task_entries().len();
+        let Some(mgr) = &mut self.pending_task_manager else {
+            return;
+        };
+        if count == 0 {
+            mgr.selected = 0;
+            return;
+        }
+        let len = isize::try_from(count).unwrap_or(1);
+        let current = isize::try_from(mgr.selected.min(count - 1)).unwrap_or(0);
+        mgr.selected = usize::try_from((current + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Closes the `/tasks` manager overlay.
+    pub fn close_task_manager(&mut self) {
+        self.pending_task_manager = None;
+    }
+
+    /// Opens the **Task Details** view for the selected row in `/tasks` manager.
+    pub fn open_selected_manager_details(&mut self) -> bool {
+        let items = self.all_task_entries();
+        let Some(mgr) = &self.pending_task_manager else {
+            return false;
+        };
+        if items.is_empty() {
+            return false;
+        }
+        let entry = &items[mgr.selected.min(items.len() - 1)];
+        self.pending_task_details = Some(TaskDetailsView {
+            target_id: entry.id.clone(),
+            kind: entry.kind,
+            scroll: 0,
+            follow_bottom: true,
+            return_to_manager: true,
+        });
+        true
+    }
+
+    /// Kills the currently highlighted running task or subagent in `/tasks` (`k` key).
+    pub fn kill_selected_managed_task(&mut self) -> Option<Result<String, String>> {
+        let items = self.all_task_entries();
+        let mgr = self.pending_task_manager.as_ref()?;
+        let entry = items.get(mgr.selected.min(items.len().saturating_sub(1)))?;
+        let res = match entry.kind {
+            TaskTargetKind::Subagent => self
+                .subagent_tracker
+                .kill(&entry.id)
+                .map(|s| format!("killed subagent {}", s.role)),
+            TaskTargetKind::Shell | TaskTargetKind::Timer | TaskTargetKind::Cron => self
+                .task_registry
+                .kill_task(&entry.id)
+                .map(|t| format!("killed {} ({})", t.id, t.label)),
+        };
+        Some(res)
+    }
+
+    /// Deletes the currently highlighted finished task or subagent from `/tasks` (`x` key).
+    pub fn delete_selected_done_task(&mut self) -> Option<Result<String, String>> {
+        let items = self.all_task_entries();
+        let selected = self.pending_task_manager.as_ref()?.selected;
+        if items.is_empty() {
+            return None;
+        }
+        let idx = selected.min(items.len() - 1);
+        let entry = &items[idx];
+        let res = match entry.kind {
+            TaskTargetKind::Subagent => self
+                .subagent_tracker
+                .delete_done(&entry.id)
+                .map(|()| format!("deleted subagent {}", entry.title)),
+            TaskTargetKind::Shell | TaskTargetKind::Timer | TaskTargetKind::Cron => self
+                .task_registry
+                .delete_done_task(&entry.id)
+                .map(|()| format!("deleted {}", entry.id)),
+        };
+        let remaining = self.all_task_entries().len();
+        if let Some(mgr) = &mut self.pending_task_manager {
+            if remaining == 0 {
+                mgr.selected = 0;
+            } else {
+                mgr.selected = mgr.selected.min(remaining - 1);
+            }
+        }
+        Some(res)
+    }
+
+    /// Returns any active **Task Details** screen state.
+    #[must_use]
+    pub fn pending_task_details(&self) -> Option<&TaskDetailsView> {
+        self.pending_task_details.as_ref()
+    }
+
+    /// Builds a live [`TaskDetailsSnapshot`] for the currently open Task Details screen.
+    #[must_use]
+    pub fn task_details_snapshot(&self) -> Option<TaskDetailsSnapshot> {
+        let details = self.pending_task_details.as_ref()?;
+        match details.kind {
+            TaskTargetKind::Subagent => {
+                let s = self.subagent_tracker.get(&details.target_id)?;
+                Some(TaskDetailsSnapshot {
+                    command: format!("Agent({}: {})", s.agent_type, s.role),
+                    status_label: s.run_state.label().to_owned(),
+                    type_label: details.kind.display_type().to_owned(),
+                    started_full: s.started_full,
+                    is_running: !s.run_state.is_done(),
+                    is_error: matches!(
+                        s.run_state,
+                        SubagentRunState::Failed | SubagentRunState::Killed
+                    ),
+                    output_lines: s.output_lines,
+                })
+            }
+            TaskTargetKind::Shell | TaskTargetKind::Timer | TaskTargetKind::Cron => {
+                let t = self
+                    .task_registry
+                    .task_status(&details.target_id, 500)
+                    .ok()?;
+                let lines = self.task_registry.task_output_lines(&details.target_id);
+                Some(TaskDetailsSnapshot {
+                    command: t.label,
+                    status_label: t.status.label().to_owned(),
+                    type_label: details.kind.display_type().to_owned(),
+                    started_full: t.started_full,
+                    is_running: !t.status.is_done(),
+                    is_error: matches!(
+                        t.status,
+                        TaskStatus::Failed | TaskStatus::Killed | TaskStatus::Cancelled
+                    ),
+                    output_lines: lines,
+                })
+            }
+        }
+    }
+
+    /// Scrolls the active **Task Details** output pane vertically by `delta` lines.
+    pub fn scroll_task_details(&mut self, delta: isize, total_lines: usize, view_height: usize) {
+        let Some(details) = &mut self.pending_task_details else {
+            return;
+        };
+        let max_scroll = total_lines.saturating_sub(view_height.max(1));
+        let base = if details.follow_bottom {
+            max_scroll
+        } else {
+            details.scroll.min(max_scroll)
+        };
+        let next = if delta < 0 {
+            base.saturating_sub(delta.unsigned_abs())
+        } else {
+            base.saturating_add(delta.unsigned_abs()).min(max_scroll)
+        };
+        details.scroll = next;
+        details.follow_bottom = next >= max_scroll;
+    }
+
+    /// Jumps to the top of **Task Details** output (`Ctrl+Home`).
+    pub fn task_details_home(&mut self) {
+        if let Some(details) = &mut self.pending_task_details {
+            details.scroll = 0;
+            details.follow_bottom = false;
+        }
+    }
+
+    /// Jumps to the bottom of **Task Details** output and re-enables live follow (`Ctrl+End`).
+    pub fn task_details_end(&mut self) {
+        if let Some(details) = &mut self.pending_task_details {
+            details.follow_bottom = true;
+        }
+    }
+
+    /// Closes the **Task Details** view back to `/tasks` manager or chat.
+    pub fn close_task_details(&mut self) {
+        if let Some(details) = self.pending_task_details.take()
+            && details.return_to_manager
+        {
+            self.pending_task_manager = Some(PendingTaskManager { selected: 0 });
         }
     }
 
@@ -1271,6 +1714,62 @@ impl AppState {
 
 fn normalize_newlines(raw: &str) -> String {
     raw.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn subagent_to_entry(sub: &LiveSubagentStatus, now_secs: u64) -> TaskListEntry {
+    let elapsed = sub
+        .finished_unix_secs
+        .unwrap_or(now_secs)
+        .saturating_sub(sub.started_unix_secs);
+    let is_running = !sub.run_state.is_done();
+    let is_error = matches!(
+        sub.run_state,
+        SubagentRunState::Failed | SubagentRunState::Killed
+    );
+    let detail = if is_running {
+        format!("{} · {} · {elapsed}s", sub.model_label, sub.status)
+    } else {
+        format!(
+            "{} · {} · {elapsed}s",
+            sub.model_label,
+            sub.run_state.label()
+        )
+    };
+    TaskListEntry {
+        id: sub.id.clone(),
+        kind: TaskTargetKind::Subagent,
+        title: format!("Agent({}: {})", sub.agent_type, sub.role),
+        detail,
+        started_hms: sub.started_hms.clone(),
+        started_full: sub.started_full.clone(),
+        status_label: sub.run_state.label().to_owned(),
+        is_running,
+        is_error,
+    }
+}
+
+fn task_to_entry(task: &rein_tools::TaskSummary) -> TaskListEntry {
+    let kind = match task.kind {
+        TaskKind::Shell => TaskTargetKind::Shell,
+        TaskKind::Timer => TaskTargetKind::Timer,
+        TaskKind::Cron => TaskTargetKind::Cron,
+    };
+    let is_running = !task.status.is_done();
+    let is_error = matches!(
+        task.status,
+        TaskStatus::Failed | TaskStatus::Killed | TaskStatus::Cancelled
+    );
+    TaskListEntry {
+        id: task.id.clone(),
+        kind,
+        title: task.label.clone(),
+        detail: task.status.label().to_owned(),
+        started_hms: task.started_hms.clone(),
+        started_full: task.started_full.clone(),
+        status_label: task.status.label().to_owned(),
+        is_running,
+        is_error,
+    }
 }
 
 fn logical_line_ranges(text: &str) -> Vec<(usize, usize)> {

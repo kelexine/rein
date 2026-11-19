@@ -496,6 +496,42 @@ fn render_bash_lines(tool: &ToolTranscriptEntry) -> Vec<Line<'static>> {
     let Some(obj) = parsed.as_object() else {
         return split_plain_lines(&tool.output, fallback_color);
     };
+    if obj.get("status").and_then(Value::as_str) == Some("backgrounded") {
+        let task_id = obj.get("task_id").and_then(Value::as_str).unwrap_or("task");
+        let is_daemon = obj
+            .get("is_daemon")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let label = if is_daemon {
+            format!("daemon started in background ({task_id})")
+        } else {
+            format!("running in background ({task_id})")
+        };
+        let mut out = vec![Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Yellow),
+        ))];
+        if let Some(partial) = obj
+            .get("partial_output")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            for line in partial.lines() {
+                out.push(Line::from(Span::styled(
+                    line.to_owned(),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        }
+        if let Some(output_file) = obj.get("output_file").and_then(Value::as_str) {
+            out.push(Line::from(Span::styled(
+                format!("log: {}", relative_display_path(output_file)),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        return out;
+    }
     if !obj.contains_key("stdout")
         && !obj.contains_key("stderr")
         && !obj.contains_key("status_code")

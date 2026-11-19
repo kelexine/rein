@@ -8,18 +8,16 @@
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 
 use anyhow::{Context, Result};
 use rein_core::{EventLog, ReplayProvider, Role, SessionEvent, login_with_browser};
-use rein_policy::{
-    AuditLog, PolicyEngine, SANDBOX_CHILD_FLAG, SandboxStatus, WorkspaceSandbox,
-    execute_sandbox_child,
-};
+use rein_policy::{AuditLog, PolicyEngine, SandboxStatus, WorkspaceSandbox};
 use rein_tools::{
-    BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore, McpClient,
-    McpToolAdapter, MemoryTool, NotesTool, ReadTool, SwitchModeTool, TodoReadTool, TodoStore,
-    TodoWriteTool, Tool, ToolRegistry, WriteTool,
+    BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore,
+    ManageTaskTool, McpClient, McpToolAdapter, MemoryTool, NotesTool, ReadTool, ScheduleTool,
+    SwitchModeTool, TaskNotification, TaskRegistry, TodoReadTool, TodoStore, TodoWriteTool, Tool,
+    ToolRegistry, WriteTool,
 };
 
 use rein::agent::{
@@ -47,13 +45,6 @@ impl ApprovalPrompter for HeadlessDenier {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(SANDBOX_CHILD_FLAG)
-        && let Some(raw_spec) = args.get(2)
-    {
-        let code = execute_sandbox_child(raw_spec)?;
-        std::process::exit(code);
-    }
-
     rein_policy::harden_process_dumpable();
 
     let workspace_root = std::env::current_dir().context("failed to resolve workspace root")?;
@@ -76,8 +67,16 @@ fn main() -> Result<()> {
     let sandbox = WorkspaceSandbox::new(&workspace_root);
     let memory = JsonlMemoryStore::dual(&loaded.paths.repo_memory, &loaded.paths.global_memory);
     let todo_store = TodoStore::for_session(&loaded.paths.todos_dir, "replay");
-    let (registry, mcp_tools, mcp_warnings) =
-        build_registry(&loaded, &sandbox, memory.clone(), todo_store.clone());
+    let task_registry = TaskRegistry::new();
+    let (task_tx, task_rx) = mpsc::channel::<TaskNotification>();
+    task_registry.set_inbox_tx(task_tx);
+    let (registry, mcp_tools, mcp_warnings) = build_registry(
+        &loaded,
+        &sandbox,
+        memory.clone(),
+        todo_store.clone(),
+        task_registry.clone(),
+    );
 
     let bypass_permissions = has_bypass_permissions_flag(&args);
     let initial_profile = Profile::coding()
@@ -116,6 +115,8 @@ fn main() -> Result<()> {
         registry,
         memory,
         todo_store,
+        task_registry,
+        task_rx,
         initial_profile,
         mcp_tools,
         mcp_warnings,
@@ -185,6 +186,8 @@ fn run_interactive(
     mut registry: ToolRegistry,
     memory: JsonlMemoryStore,
     todo_store: TodoStore,
+    task_registry: TaskRegistry,
+    task_rx: mpsc::Receiver<TaskNotification>,
     initial_profile: Profile,
     mcp_tools: Vec<String>,
     mcp_warnings: Vec<String>,
@@ -285,6 +288,8 @@ fn run_interactive(
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_bypass_permissions(bypass_permissions)
         .with_subagent_tracker(subagent_tracker)
+        .with_task_registry(task_registry)
+        .with_task_notifications(task_rx)
         .with_workspace_label(workspace_label)
         .with_session_id(&session_uid)
         .with_startup_notices(notices)
@@ -389,6 +394,7 @@ fn build_registry(
     sandbox: &WorkspaceSandbox,
     memory: JsonlMemoryStore,
     todo_store: TodoStore,
+    task_registry: TaskRegistry,
 ) -> (ToolRegistry, Vec<String>, Vec<String>) {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool::new(sandbox.clone())));
@@ -397,8 +403,12 @@ fn build_registry(
     registry.register(Box::new(GlobTool::new(sandbox.clone())));
     registry.register(Box::new(GrepTool::new(sandbox.clone())));
     registry.register(Box::new(
-        BashTool::new(sandbox.clone()).with_output_dir(loaded.paths.repo_dir.join("bash-outputs")),
+        BashTool::new(sandbox.clone())
+            .with_output_dir(loaded.paths.repo_dir.join("bash-outputs"))
+            .with_task_registry(task_registry.clone()),
     ));
+    registry.register(Box::new(ManageTaskTool::new(task_registry.clone())));
+    registry.register(Box::new(ScheduleTool::new(task_registry)));
     registry.register(Box::new(MemoryTool::new(memory)));
     registry.register(Box::new(SwitchModeTool::new()));
     registry.register(Box::new(TodoWriteTool::with_store(todo_store.clone())));
@@ -447,6 +457,7 @@ fn build_registry(
 
 fn format_sandbox_label(status: &SandboxStatus) -> String {
     match status {
+        SandboxStatus::PolicyOnly => "policy-gated".to_owned(),
         SandboxStatus::Enforced { abi_version } => format!("landlock v{abi_version}"),
         SandboxStatus::Unavailable { .. } => "sandbox off".to_owned(),
     }

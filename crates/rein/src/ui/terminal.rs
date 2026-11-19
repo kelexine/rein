@@ -22,6 +22,7 @@ use rein_core::{
     CoreError, EventLog, MemoryScope, Provider, ToolCall, ToolOutput, UsageStats,
     login_with_browser_until, logout_rein_token,
 };
+use rein_tools::TaskNotification;
 
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
@@ -134,6 +135,15 @@ pub fn run_tui(
     let auto_dream = AutoDreamCoordinator::new();
     loop {
         auto_dream.maybe_spawn(config, paths, agent.memory_store());
+        if app.pending_approval().is_none()
+            && app.pending_model_picker().is_none()
+            && app.pending_session_picker().is_none()
+            && app.pending_rewind_picker().is_none()
+            && let Some((display, prompt)) = collect_wakeup_batch(app)
+            && stream_prompt_background(display, prompt, agent, provider.as_mut(), app, &mut guard)?
+        {
+            break;
+        }
         guard.terminal.draw(|f| render_frame(app, f))?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -148,14 +158,19 @@ pub fn run_tui(
                 app.clear_ctrl_c_arm();
                 if app.pending_model_picker().is_none()
                     && app.pending_session_picker().is_none()
+                    && app.pending_task_manager().is_none()
+                    && app.pending_task_details().is_none()
                     && app.pending_approval().is_none()
                 {
+                    app.clear_strip_selection();
                     app.push_input_str(&text);
                 }
             }
             _ => {}
         }
     }
+    app.subagent_tracker().cancel_all();
+    app.task_registry().shutdown_all();
     Ok(())
 }
 
@@ -176,6 +191,16 @@ fn handle_idle_key(
         let _ = app.toggle_expand_outputs();
         return Ok(false);
     }
+    if app.pending_task_details().is_some() {
+        return handle_task_details_key(key, app, guard);
+    }
+    if app.pending_task_manager().is_some() {
+        return handle_task_manager_key(key, app);
+    }
+    if is_ctrl_t(key) {
+        app.open_task_manager();
+        return Ok(false);
+    }
     if app.pending_model_picker().is_some() {
         return handle_model_picker_key(key, provider, config, paths, app);
     }
@@ -184,6 +209,29 @@ fn handle_idle_key(
     }
     if app.pending_rewind_picker().is_some() {
         return handle_rewind_picker_key(key, agent, app);
+    }
+    if app.strip_selected().is_some() {
+        match key.code {
+            KeyCode::Up => {
+                let _ = app.move_strip_selection(-1);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                let _ = app.move_strip_selection(1);
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                let _ = app.open_selected_strip_details();
+                return Ok(false);
+            }
+            KeyCode::Esc => {
+                app.clear_strip_selection();
+                return Ok(false);
+            }
+            _ => {
+                app.clear_strip_selection();
+            }
+        }
     }
     if key.code == KeyCode::Esc {
         return Ok(false);
@@ -218,7 +266,13 @@ fn handle_idle_key(
         }
         KeyCode::Down => {
             if !app.move_cursor_vertical(1) {
-                app.navigate_history(1);
+                if app.history_cursor_active() {
+                    app.navigate_history(1);
+                } else if !app.running_strip_items().is_empty() {
+                    let _ = app.move_strip_selection(1);
+                } else {
+                    app.navigate_history(1);
+                }
             }
         }
         KeyCode::Left => app.move_cursor_left(),
@@ -360,6 +414,7 @@ fn handle_enter(
     if trimmed.starts_with('/') && !trimmed.contains('\n') {
         return dispatch_slash(trimmed, agent, provider, config, paths, app, guard);
     }
+    app.task_registry().notify_external_event("user");
     stream_prompt_background(
         trimmed.to_owned(),
         trimmed.to_owned(),
@@ -499,6 +554,7 @@ fn run_builtin_action(
                 app.open_rewind_picker(checkpoints);
             }
         }
+        BuiltinAction::Tasks => app.open_task_manager(),
     }
     Ok(false)
 }
@@ -1001,8 +1057,45 @@ fn handle_streaming_key(
         return false;
     }
 
+    if app.pending_task_details().is_some() {
+        let _ = handle_task_details_key(key, app, guard);
+        return false;
+    }
+    if app.pending_task_manager().is_some() {
+        let _ = handle_task_manager_key(key, app);
+        return false;
+    }
+    if is_ctrl_t(key) {
+        app.open_task_manager();
+        return false;
+    }
+    if app.strip_selected().is_some() {
+        match key.code {
+            KeyCode::Up => {
+                let _ = app.move_strip_selection(-1);
+                return false;
+            }
+            KeyCode::Down => {
+                let _ = app.move_strip_selection(1);
+                return false;
+            }
+            KeyCode::Enter => {
+                let _ = app.open_selected_strip_details();
+                return false;
+            }
+            KeyCode::Esc => {
+                app.clear_strip_selection();
+                return false;
+            }
+            _ => {
+                app.clear_strip_selection();
+            }
+        }
+    }
+
     if key.code == KeyCode::Esc {
         cancel.store(true, Ordering::Relaxed);
+        app.subagent_tracker().cancel_all();
         app.set_busy_status("Stopping…");
         return false;
     }
@@ -1018,7 +1111,13 @@ fn handle_streaming_key(
         }
         KeyCode::Down => {
             if !app.move_cursor_vertical(1) {
-                app.navigate_history(1);
+                if app.history_cursor_active() {
+                    app.navigate_history(1);
+                } else if !app.running_strip_items().is_empty() {
+                    let _ = app.move_strip_selection(1);
+                } else {
+                    app.navigate_history(1);
+                }
             }
         }
         KeyCode::Left => app.move_cursor_left(),
@@ -1069,4 +1168,123 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
 
 fn is_ctrl_o(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_t(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn handle_task_manager_key(key: KeyEvent, app: &mut AppState) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => app.close_task_manager(),
+        KeyCode::Up => app.move_task_manager_selection(-1),
+        KeyCode::Down => app.move_task_manager_selection(1),
+        KeyCode::Enter => {
+            let _ = app.open_selected_manager_details();
+        }
+        KeyCode::Char('k' | 'K') => {
+            if let Some(outcome) = app.kill_selected_managed_task() {
+                match outcome {
+                    Ok(msg) => app.push_system_note(msg),
+                    Err(err) => app.push_error_note(err),
+                }
+            }
+        }
+        KeyCode::Char('x' | 'X') => {
+            if let Some(outcome) = app.delete_selected_done_task() {
+                match outcome {
+                    Ok(msg) => app.push_system_note(msg),
+                    Err(err) => app.push_error_note(err),
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_task_details_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    guard: &TerminalGuard,
+) -> Result<bool> {
+    let total_lines = app
+        .task_details_snapshot()
+        .map_or(0, |s| s.output_lines.len());
+    let size = guard.terminal.size()?;
+    let view_height = usize::from(size.height.saturating_sub(10).max(3));
+    let page_step = isize::try_from(view_height.saturating_sub(2).max(1)).unwrap_or(10);
+
+    match key.code {
+        KeyCode::Esc => app.close_task_details(),
+        KeyCode::Up => app.scroll_task_details(-1, total_lines, view_height),
+        KeyCode::Down => app.scroll_task_details(1, total_lines, view_height),
+        KeyCode::PageUp => app.scroll_task_details(-page_step, total_lines, view_height),
+        KeyCode::PageDown => app.scroll_task_details(page_step, total_lines, view_height),
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => app.task_details_home(),
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => app.task_details_end(),
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
+    let mut events = app.drain_task_notifications();
+    if events.is_empty() {
+        return None;
+    }
+    std::thread::sleep(Duration::from_millis(35));
+    events.extend(app.drain_task_notifications());
+
+    let mut labels = Vec::new();
+    let mut sections = Vec::new();
+    for ev in events {
+        match ev {
+            TaskNotification::TaskExited {
+                task_id,
+                command,
+                status,
+                exit_code,
+                tail,
+                log_path,
+            } => {
+                app.task_registry().notify_external_event(&task_id);
+                labels.push(format!("{task_id} ({})", status.label()));
+                let code_str = exit_code.map_or_else(|| "none".to_owned(), |c| c.to_string());
+                let log_hint = log_path
+                    .map(|p| format!("\nLog file: {}", p.display()))
+                    .unwrap_or_default();
+                let excerpt = if tail.trim().is_empty() {
+                    "(no output)".to_owned()
+                } else {
+                    tail
+                };
+                sections.push(format!(
+                    "- Background task `{task_id}` (`{command}`) finished with status `{}` (exit code: {code_str}).{log_hint}\nOutput tail:\n```\n{excerpt}\n```",
+                    status.label()
+                ));
+            }
+            TaskNotification::ScheduleFired {
+                task_id,
+                label,
+                prompt,
+                iteration,
+                finished,
+            } => {
+                app.task_registry().notify_external_event(&task_id);
+                labels.push(format!("{task_id} ({label})"));
+                let state = if finished { "completed" } else { "recurring" };
+                sections.push(format!(
+                    "- Scheduled task `{task_id}` (`{label}`, trigger #{iteration}, {state}) fired with prompt:\n{prompt}"
+                ));
+            }
+        }
+    }
+
+    let display = format!("[task wakeup] {}", labels.join(", "));
+    let prompt_for_model = format!(
+        "[Background Task / Schedule Wakeup Notification]\n{}\n\nRespond to these completed task/schedule events and continue any pending work.",
+        sections.join("\n\n")
+    );
+    Some((display, prompt_for_model))
 }

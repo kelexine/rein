@@ -14,8 +14,9 @@ use crate::agent::{format_relative_age, now_unix_secs};
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
 use crate::ui::app::{
-    PendingApproval, PendingModelPicker, PendingRewindPicker, PendingSessionPicker, RewindStep,
-    is_model_active, model_vendor_group,
+    PendingApproval, PendingModelPicker, PendingRewindPicker, PendingSessionPicker,
+    PendingTaskManager, RewindStep, TaskDetailsSnapshot, TaskDetailsView, TaskListEntry,
+    TaskTargetKind, is_model_active, model_vendor_group,
 };
 use crate::ui::entries::render_transcript_lines;
 
@@ -55,8 +56,8 @@ fn todo_bar_rows(state: &AppState) -> u16 {
     }
 }
 
-fn subagent_bar_rows(state: &AppState) -> u16 {
-    u16::try_from(state.active_subagents().len().min(5)).unwrap_or(0)
+fn task_strip_rows(state: &AppState) -> u16 {
+    u16::try_from(state.running_strip_items().len().min(5)).unwrap_or(0)
 }
 
 fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
@@ -65,7 +66,7 @@ fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
     let popup_rows = compute_popup_rows(state, matches.len());
     let spinner_rows = u16::from(state.is_busy() && state.pending_approval().is_none());
     let todo_rows = todo_bar_rows(state);
-    let subagent_rows = subagent_bar_rows(state);
+    let strip_rows = task_strip_rows(state);
     let input_rows = prompt_rows(state, area.width, area.height);
 
     Layout::default()
@@ -79,7 +80,7 @@ fn split_layout(state: &AppState, area: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Length(1),
             Constraint::Length(input_rows),
             Constraint::Length(1),
-            Constraint::Length(subagent_rows),
+            Constraint::Length(strip_rows),
             Constraint::Length(1),
         ])
         .split(area)
@@ -91,9 +92,14 @@ pub fn transcript_viewport(state: &AppState, area: Rect) -> Rect {
     split_layout(state, area)[1]
 }
 
-/// Renders the Citadel Owl header, styled transcript, optional popup/spinner, hairline prompt, and status bar.
+/// Renders the Citadel Owl header, styled transcript, optional popup/spinner, hairline prompt, live strip, or Task Details.
 pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
     let area = frame.area();
+    if let Some(details) = state.pending_task_details() {
+        render_task_details_frame(state, details, frame, area);
+        return;
+    }
+
     let hdr_rows = header_height(state, area.height);
     let matches = state.slash_matches();
     let chunks = split_layout(state, area);
@@ -127,6 +133,8 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         );
     } else if let Some(picker) = state.pending_rewind_picker() {
         render_rewind_picker(picker, frame, chunks[3]);
+    } else if let Some(mgr) = state.pending_task_manager() {
+        render_task_manager(mgr, &state.all_task_entries(), frame, chunks[3]);
     } else if chunks[3].height > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
@@ -138,7 +146,7 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
     render_prompt_line(state, frame, chunks[6]);
     render_rule(frame, chunks[7]);
     if chunks[8].height > 0 {
-        render_subagent_bar(state, frame, chunks[8]);
+        render_task_strip(state, frame, chunks[8]);
     }
     render_status_bar(state, frame, chunks[9]);
 }
@@ -173,6 +181,9 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
             }
             RewindStep::SelectAction { .. } => 4,
         }
+    } else if state.pending_task_manager().is_some() {
+        let count = state.all_task_entries().len().clamp(1, MAX_MENU_ROWS);
+        u16::try_from(count + 1).unwrap_or(2)
     } else {
         u16::try_from(slash_count.min(MAX_MENU_ROWS)).unwrap_or(0)
     }
@@ -982,6 +993,9 @@ fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         .collect();
     frame.render_widget(Paragraph::new(rendered), area);
 
+    if state.strip_selected().is_some() || state.pending_task_manager().is_some() {
+        return;
+    }
     let cursor_offset_x = u16::try_from(cursor_col).unwrap_or(u16::MAX);
     let cursor_offset_y = u16::try_from(cursor_row.saturating_sub(scroll_top)).unwrap_or(0);
     let cursor_x = area
@@ -1046,40 +1060,253 @@ fn build_wrapped_prompt(
     (rows, c_row, c_col)
 }
 
-fn render_subagent_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
-    let running = state.active_subagents();
-    if running.is_empty() || area.height == 0 {
+fn render_task_strip(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
+    let items = state.running_strip_items();
+    if items.is_empty() || area.height == 0 {
         return;
     }
-    let now = now_unix_secs();
-    let lines: Vec<Line<'_>> = running
+    let selected = state.strip_selected();
+    let lines: Vec<Line<'_>> = items
         .iter()
+        .enumerate()
         .take(usize::from(area.height))
-        .map(|sub| {
-            let elapsed = now.saturating_sub(sub.started_unix_secs);
-            Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    format!("Agent({}: {})", sub.agent_type, sub.role),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    sub.model_label.clone(),
-                    Style::default().fg(Color::LightBlue),
-                ),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(sub.status.clone(), Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!(" · {elapsed}s"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        })
+        .map(|(idx, item)| format_strip_entry(item, selected == Some(idx)))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_strip_entry(item: &TaskListEntry, is_selected: bool) -> Line<'static> {
+    let prefix = if is_selected { "▸ • " } else { "  • " };
+    let marker_style = if is_selected {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    if item.kind == TaskTargetKind::Subagent {
+        let title_style = if is_selected {
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        };
+        return Line::from(vec![
+            Span::styled(prefix, marker_style),
+            Span::styled(item.title.clone(), title_style),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(item.detail.clone(), Style::default().fg(Color::Gray)),
+        ]);
+    }
+    let title_style = if is_selected {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let status_color = if item.is_running {
+        Color::Yellow
+    } else if item.is_error {
+        Color::LightRed
+    } else {
+        Color::Green
+    };
+    Line::from(vec![
+        Span::styled(prefix, marker_style),
+        Span::styled(
+            format!("[{}] ", item.started_hms),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(item.title.clone(), title_style),
+        Span::styled(
+            format!(" {}", item.status_label),
+            Style::default().fg(status_color),
+        ),
+    ])
+}
+
+fn render_task_manager(
+    mgr: &PendingTaskManager,
+    items: &[TaskListEntry],
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let mut rows = Vec::with_capacity(MAX_MENU_ROWS + 1);
+    rows.push(Line::from(vec![
+        Span::styled(
+            "? Tasks ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "[↑/↓ · Enter: details · k: kill · x: delete done · Esc: close]",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    if items.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "  (no background tasks or subagents)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(Paragraph::new(rows), area);
+        return;
+    }
+
+    let total = items.len();
+    let clamped = mgr.selected.min(total.saturating_sub(1));
+    let window_start = clamped.saturating_sub(MAX_MENU_ROWS - 1);
+    let window_end = (window_start + MAX_MENU_ROWS).min(total);
+    for (offset, item) in items[window_start..window_end].iter().enumerate() {
+        let is_selected = window_start + offset == clamped;
+        let marker = if is_selected { "› " } else { "  " };
+        let title_style = if is_selected {
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let status_color = if item.is_running {
+            Color::Yellow
+        } else if item.is_error {
+            Color::LightRed
+        } else {
+            Color::Green
+        };
+        rows.push(Line::from(vec![
+            Span::styled(marker, title_style),
+            Span::styled(
+                format!("[{}] ", item.started_hms),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(format!("{} ", item.title), title_style),
+            Span::styled(
+                format!("({}) ", item.kind.display_type()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(item.status_label.clone(), Style::default().fg(status_color)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_task_details_frame(
+    state: &AppState,
+    details: &TaskDetailsView,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let snap = state
+        .task_details_snapshot()
+        .unwrap_or_else(|| TaskDetailsSnapshot {
+            command: details.target_id.clone(),
+            status_label: "removed".to_owned(),
+            type_label: details.kind.display_type().to_owned(),
+            started_full: "-".to_owned(),
+            is_running: false,
+            is_error: false,
+            output_lines: Vec::new(),
+        });
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Task Details",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        chunks[0],
+    );
+
+    let status_color = if snap.is_running {
+        Color::Yellow
+    } else if snap.is_error {
+        Color::LightRed
+    } else {
+        Color::Green
+    };
+    let meta = vec![
+        Line::from(vec![
+            Span::styled("Command: ", Style::default().fg(Color::LightBlue)),
+            Span::styled(snap.command, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Status:  ", Style::default().fg(Color::LightBlue)),
+            Span::styled(
+                format!("• {}", snap.status_label),
+                Style::default().fg(status_color),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Type:    ", Style::default().fg(Color::LightBlue)),
+            Span::styled(snap.type_label, Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Started: ", Style::default().fg(Color::LightBlue)),
+            Span::styled(snap.started_full, Style::default().fg(Color::Gray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(meta), chunks[2]);
+    render_rule(frame, chunks[3]);
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(Span::styled(
+            "Output",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))]),
+        chunks[4],
+    );
+
+    let out_lines: Vec<Line<'_>> = if snap.output_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no output)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        snap.output_lines
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Gray))))
+            .collect()
+    };
+    let view_height = usize::from(chunks[5].height.max(1));
+    let max_scroll = out_lines.len().saturating_sub(view_height);
+    let scroll = if details.follow_bottom {
+        max_scroll
+    } else {
+        details.scroll.min(max_scroll)
+    };
+    frame.render_widget(
+        Paragraph::new(out_lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        chunks[5],
+    );
+    render_rule(frame, chunks[6]);
+
+    let hint = Line::from(Span::styled(
+        "↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · esc back",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(hint), chunks[7]);
 }
 
 fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
@@ -1096,6 +1323,11 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+        )
+    } else if state.strip_selected().is_some() {
+        (
+            "↑/↓: select task · enter: view · esc: prompt".to_owned(),
+            Style::default().fg(Color::LightBlue),
         )
     } else if state.is_busy() {
         (
@@ -1164,6 +1396,24 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
             format!("{subagent_count} {noun}"),
             Style::default().fg(Color::Yellow),
         ));
+    }
+    let running_tasks = state
+        .task_registry()
+        .list_tasks()
+        .into_iter()
+        .filter(|t| !t.status.is_done())
+        .count();
+    if running_tasks > 0 {
+        let noun = if running_tasks == 1 { "task" } else { "tasks" };
+        left_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        left_spans.push(Span::styled(
+            format!("{running_tasks} {noun}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if subagent_count > 0 || !state.all_task_entries().is_empty() {
+        left_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        left_spans.push(Span::styled("/tasks", Style::default().fg(Color::DarkGray)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(left_spans)), bar_cols[0]);
@@ -1476,7 +1726,9 @@ mod tests {
 
     #[test]
     fn renders_live_subagent_bar_and_status_count_when_active() -> std::io::Result<()> {
-        use crate::agent::{LiveSubagentStatus, SubagentTracker, now_unix_secs};
+        use crate::agent::{LiveSubagentStatus, SubagentRunState, SubagentTracker, now_unix_secs};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         let backend = TestBackend::new(120, 22);
         let mut terminal = Terminal::new(backend)?;
@@ -1487,7 +1739,13 @@ mod tests {
             role: "Vendor ELF Auditor".to_owned(),
             model_label: "gemini-4-argon".to_owned(),
             status: "Reading file".to_owned(),
+            run_state: SubagentRunState::Running,
             started_unix_secs: now_unix_secs(),
+            started_hms: String::new(),
+            started_full: String::new(),
+            finished_unix_secs: None,
+            output_lines: vec!["line 1".to_owned()],
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         });
         tracker.start(LiveSubagentStatus {
             id: "sub_2".to_owned(),
@@ -1495,10 +1753,16 @@ mod tests {
             role: "HAL Config Auditor".to_owned(),
             model_label: "gemini-4-argon".to_owned(),
             status: "Searching files".to_owned(),
+            run_state: SubagentRunState::Running,
             started_unix_secs: now_unix_secs(),
+            started_hms: String::new(),
+            started_full: String::new(),
+            finished_unix_secs: None,
+            output_lines: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         });
 
-        let state = AppState::new(Profile::coding(), "landlock v11", "gemini-4-argon-medium")
+        let mut state = AppState::new(Profile::coding(), "landlock v11", "gemini-4-argon-medium")
             .with_subagent_tracker(tracker);
         terminal.draw(|frame| render_frame(&state, frame))?;
         let buffer = terminal.backend().buffer();
@@ -1513,6 +1777,74 @@ mod tests {
         assert!(rendered.contains("Agent(research: Vendor ELF Auditor)"));
         assert!(rendered.contains("Reading file"));
         assert!(rendered.contains("2 subagents"));
+
+        assert!(state.move_strip_selection(1));
+        assert!(state.open_selected_strip_details());
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let details_buf = terminal.backend().buffer();
+        let details_str: String = (0..22)
+            .map(|y| {
+                (0..120)
+                    .map(|x| details_buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details_str.contains("Task Details"));
+        assert!(details_str.contains("Agent(research: Vendor ELF Auditor)"));
+        assert!(details_str.contains("line 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_lists_kills_and_deletes_done_tasks() -> Result<(), Box<dyn std::error::Error>> {
+        use rein_tools::{TaskRegistry, TimerCondition};
+
+        let reg = TaskRegistry::new();
+        let summary = reg.schedule_timer(
+            60,
+            "check status".to_owned(),
+            TimerCondition::Never,
+            Some("1m timer".to_owned()),
+        )?;
+
+        let mut state = AppState::new(Profile::coding(), "landlock v11", "gemini-4-argon-medium")
+            .with_task_registry(reg);
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let strip_buf = terminal.backend().buffer();
+        let strip_str: String = (0..24)
+            .map(|y| {
+                (0..120)
+                    .map(|x| strip_buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(strip_str.contains("1m timer"));
+        assert!(strip_str.contains("1 task"));
+        assert!(strip_str.contains("/tasks"));
+
+        state.open_task_manager();
+        // Cannot delete a still-running task with 'x' before killing.
+        let del_running = state
+            .delete_selected_done_task()
+            .ok_or("expected delete outcome")?;
+        assert!(del_running.is_err());
+
+        let killed = state
+            .kill_selected_managed_task()
+            .ok_or("expected kill outcome")?;
+        assert!(killed.is_ok());
+
+        let deleted = state
+            .delete_selected_done_task()
+            .ok_or("expected delete outcome")?;
+        assert!(deleted.is_ok());
+        assert!(state.all_task_entries().is_empty());
+        let _ = summary;
         Ok(())
     }
 }
