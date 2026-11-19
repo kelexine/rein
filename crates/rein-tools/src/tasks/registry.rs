@@ -179,6 +179,19 @@ pub enum TaskNotification {
         /// `true` when this trigger completed the schedule (one-shot or `max_iterations` reached).
         finished: bool,
     },
+    /// Background subagent finished a turn or sent a message to the parent inbox.
+    SubagentMessage {
+        /// Subagent conversation identifier (`subagent-...`).
+        conversation_id: String,
+        /// Subagent role title.
+        role: String,
+        /// Subagent type (`research`, `plan`, `coder`, `personal`, or custom).
+        agent_type: String,
+        /// Message or completion report delivered to the parent session.
+        content: String,
+        /// `true` when the subagent terminated or errored rather than waiting for follow-up.
+        finished: bool,
+    },
 }
 
 /// Result returned by [`TaskRegistry::spawn_bash_task`] after racing `wait_ms_before_async`.

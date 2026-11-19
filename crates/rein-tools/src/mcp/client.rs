@@ -5,9 +5,10 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use rein_policy::Capability;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,9 @@ use serde_json::{Value, json};
 
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::registry::{Tool, ToolError, ToolSchema};
+
+/// Default per-call read timeout for stdio MCP JSON-RPC responses (seconds).
+pub const MCP_EXCHANGE_TIMEOUT_SECS: u64 = 15;
 
 /// Environment variables scrubbed by default when spawning external MCP server subprocesses.
 const SCRUBBED_SECRET_ENV_VARS: &[&str] = &[
@@ -40,7 +44,7 @@ pub struct McpServerConfig {
 struct McpSession {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout_rx: mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl McpSession {
@@ -77,10 +81,29 @@ impl McpSession {
                 tool: config.name.clone(),
                 reason: "failed to capture MCP server stdout".to_owned(),
             })?;
+        let (tx, stdout_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout_rx,
         })
     }
 
@@ -88,23 +111,45 @@ impl McpSession {
         &mut self,
         config: &McpServerConfig,
         line: &str,
+        timeout: Duration,
     ) -> Result<Option<String>, ToolError> {
         if writeln!(self.stdin, "{line}").is_err() || self.stdin.flush().is_err() {
             return Ok(None);
         }
+        let deadline = Instant::now() + timeout;
         loop {
-            let mut response_line = String::new();
-            let bytes = self
-                .stdout
-                .read_line(&mut response_line)
-                .map_err(|source| ToolError::Io {
-                    path: PathBuf::from(&config.command),
-                    source,
-                })?;
-            if bytes == 0 {
-                return Ok(None);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ToolError::InvalidArguments {
+                    tool: config.name.clone(),
+                    reason: format!(
+                        "MCP server '{}' timed out after {}s",
+                        config.name,
+                        timeout.as_secs()
+                    ),
+                });
             }
-            let trimmed = response_line.trim();
+            let msg = match self.stdout_rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(source)) => {
+                    return Err(ToolError::Io {
+                        path: PathBuf::from(&config.command),
+                        source,
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ToolError::InvalidArguments {
+                        tool: config.name.clone(),
+                        reason: format!(
+                            "MCP server '{}' timed out after {}s",
+                            config.name,
+                            timeout.as_secs()
+                        ),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            };
+            let trimmed = msg.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -115,7 +160,7 @@ impl McpSession {
             {
                 continue;
             }
-            return Ok(Some(response_line));
+            return Ok(Some(msg));
         }
     }
 }
@@ -132,6 +177,7 @@ impl Drop for McpSession {
 pub struct McpClient {
     config: McpServerConfig,
     extra_env: BTreeMap<String, String>,
+    timeout: Duration,
     session: Arc<Mutex<Option<McpSession>>>,
     next_id: Arc<AtomicU64>,
 }
@@ -151,9 +197,17 @@ impl McpClient {
         Self {
             config,
             extra_env: BTreeMap::new(),
+            timeout: Duration::from_secs(MCP_EXCHANGE_TIMEOUT_SECS),
             session: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Overrides the JSON-RPC response timeout for this MCP client.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(Duration::from_millis(50));
+        self
     }
 
     /// Passes an explicit environment variable to the spawned MCP server subprocess.
@@ -245,14 +299,25 @@ impl McpClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(active) = guard.as_mut() {
-            if let Some(resp_line) = active.exchange(&self.config, &line)? {
-                return Ok(serde_json::from_str(&resp_line)?);
+            match active.exchange(&self.config, &line, self.timeout) {
+                Ok(Some(resp_line)) => return Ok(serde_json::from_str(&resp_line)?),
+                Ok(None) => *guard = None,
+                Err(err) => {
+                    *guard = None;
+                    return Err(err);
+                }
             }
-            *guard = None;
         }
 
         let mut fresh = McpSession::spawn(&self.config, &self.extra_env)?;
-        let resp_line = fresh.exchange(&self.config, &line)?.unwrap_or_default();
+        let resp_line = match fresh.exchange(&self.config, &line, self.timeout) {
+            Ok(Some(line)) => line,
+            Ok(None) => String::new(),
+            Err(err) => {
+                drop(fresh);
+                return Err(err);
+            }
+        };
         *guard = Some(fresh);
         Ok(serde_json::from_str(&resp_line)?)
     }
@@ -496,5 +561,19 @@ done
         );
         drop(client);
         Ok(())
+    }
+
+    #[test]
+    fn times_out_hung_mcp_server_cleanly() {
+        let client = McpClient::new(McpServerConfig {
+            name: "hung".to_owned(),
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+        })
+        .with_timeout(Duration::from_millis(120));
+        let err = client
+            .list_tools()
+            .expect_err("hung MCP server must time out");
+        assert!(err.to_string().contains("timed out"));
     }
 }

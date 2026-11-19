@@ -5,6 +5,8 @@
 //! Policy-enforced tool registry, coding tools, JSONL memory, native personal tools, and MCP client for Rein.
 #![forbid(unsafe_code)]
 
+/// Structured multiple-choice user clarification tool (`ask_question`).
+pub mod ask;
 /// Sandboxed coding tools (read, write, edit, glob, grep, bash).
 pub mod coding;
 /// Model Context Protocol (MCP) client and policy-gated tool adapter.
@@ -22,8 +24,12 @@ pub mod tasks;
 /// Session and workspace todo checklist tools.
 pub mod todos;
 
+pub use ask::{AskQuestionTool, QuestionAnswer, QuestionHandler, QuestionSpec};
 pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
-pub use mcp::{JsonRpcRequest, JsonRpcResponse, McpClient, McpServerConfig, McpToolAdapter};
+pub use mcp::{
+    CallMcpTool, JsonRpcRequest, JsonRpcResponse, MCP_EXCHANGE_TIMEOUT_SECS, McpCatalog, McpClient,
+    McpServerConfig, McpServerSummary, McpToolAdapter,
+};
 pub use memory::{JsonlMemoryStore, MemoryKind, MemoryRecord, MemoryTool, now_unix_secs};
 pub use mode::{SwitchModeTool, parse_mode_id};
 pub use personal::{

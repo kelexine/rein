@@ -2,19 +2,20 @@
 // Date: 2026-11-14
 // Purpose: Minimalist borderless TUI state driving Core, Policy, Tools, Modes, Slash commands, and Model picker
 
-use std::sync::mpsc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use rein_core::{AvailableModel, ToolCall, ToolOutput, UsageStats};
 use rein_tools::{
-    McpServerConfig, TaskKind, TaskNotification, TaskRegistry, TaskStatus, TodoItem, TodoListState,
-    TodoStatus, TodoStore,
+    McpServerConfig, QuestionAnswer, QuestionSpec, TaskKind, TaskNotification, TaskRegistry,
+    TaskStatus, TodoItem, TodoListState, TodoStatus, TodoStore,
 };
 use serde_json::Value;
 
 use crate::agent::{
     ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, LiveSubagentStatus,
-    SubagentRunState, SubagentTracker, TurnCheckpoint, now_unix_secs,
+    SubagentManager, SubagentRunState, SubagentTracker, TurnCheckpoint, now_unix_secs,
 };
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::config::{ProviderKind, SessionSummary};
@@ -156,6 +157,30 @@ pub struct PendingTaskManager {
     pub selected: usize,
 }
 
+/// Channel payload emitted by `ask_question` to prompt the user via the TUI.
+pub type QuestionPromptRequest = (Vec<QuestionSpec>, mpsc::Sender<Option<Vec<QuestionAnswer>>>);
+/// Shared active-turn sender bridging [`rein_tools::AskQuestionTool`] to the live Ratatui loop.
+pub type SharedQuestionRelay = Arc<Mutex<Option<mpsc::Sender<QuestionPromptRequest>>>>;
+
+/// Active interactive multiple-choice question dialog triggered by `ask_question`.
+#[derive(Debug)]
+pub struct PendingQuestion {
+    /// Ordered list of questions to collect from the user.
+    pub questions: Vec<QuestionSpec>,
+    /// Index of the question currently shown.
+    pub current: usize,
+    /// Highlighted row (`0..options.len()` or `options.len()` = `"Other (custom)..."`).
+    pub cursor: usize,
+    /// Multi-select toggled option indices per question.
+    pub selections: Vec<BTreeSet<usize>>,
+    /// Optional custom `"Other"` text per question.
+    pub custom_inputs: Vec<String>,
+    /// Whether currently typing inside the `"Other"` row.
+    pub editing_other: bool,
+    /// Reply channel returning `Some(answers)` or `None` when cancelled.
+    pub reply_tx: mpsc::Sender<Option<Vec<QuestionAnswer>>>,
+}
+
 /// Active interactive `/rewind` popup opened by `/rewind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRewindPicker {
@@ -207,11 +232,14 @@ pub struct AppState {
     draft_input: String,
     bypass_permissions: bool,
     subagent_tracker: SubagentTracker,
+    subagent_manager: Option<SubagentManager>,
     task_registry: TaskRegistry,
     task_notifications_rx: Option<mpsc::Receiver<TaskNotification>>,
     strip_selected: Option<usize>,
     pending_task_manager: Option<PendingTaskManager>,
     pending_task_details: Option<TaskDetailsView>,
+    pending_question: Option<PendingQuestion>,
+    question_relay: Option<SharedQuestionRelay>,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -295,12 +323,41 @@ impl AppState {
             draft_input: String::new(),
             bypass_permissions: false,
             subagent_tracker: SubagentTracker::new(),
+            subagent_manager: None,
             task_registry: TaskRegistry::new(),
             task_notifications_rx: None,
             strip_selected: None,
             pending_task_manager: None,
             pending_task_details: None,
+            pending_question: None,
+            question_relay: None,
         }
+    }
+
+    /// Attaches the async [`SubagentManager`] for cascading `/tasks` kills and shutdown cleanup.
+    #[must_use]
+    pub fn with_subagent_manager(mut self, manager: SubagentManager) -> Self {
+        self.subagent_manager = Some(manager);
+        self
+    }
+
+    /// Attaches the shared [`SharedQuestionRelay`] bridging `ask_question` tool calls into the TUI.
+    #[must_use]
+    pub fn with_question_relay(mut self, relay: SharedQuestionRelay) -> Self {
+        self.question_relay = Some(relay);
+        self
+    }
+
+    /// Returns a reference to the attached [`SubagentManager`], if configured.
+    #[must_use]
+    pub fn subagent_manager(&self) -> Option<&SubagentManager> {
+        self.subagent_manager.as_ref()
+    }
+
+    /// Returns a reference to the shared [`SharedQuestionRelay`], if configured.
+    #[must_use]
+    pub fn question_relay(&self) -> Option<&SharedQuestionRelay> {
+        self.question_relay.as_ref()
     }
 
     /// Attaches the session [`TaskRegistry`] tracking background bash processes, timers, and crons.
@@ -1408,10 +1465,17 @@ impl AppState {
         let mgr = self.pending_task_manager.as_ref()?;
         let entry = items.get(mgr.selected.min(items.len().saturating_sub(1)))?;
         let res = match entry.kind {
-            TaskTargetKind::Subagent => self
-                .subagent_tracker
-                .kill(&entry.id)
-                .map(|s| format!("killed subagent {}", s.role)),
+            TaskTargetKind::Subagent => {
+                if let Some(sub_mgr) = &self.subagent_manager
+                    && sub_mgr.kill_tree(&entry.id).is_ok()
+                {
+                    Ok(format!("killed subagent tree {}", entry.title))
+                } else {
+                    self.subagent_tracker
+                        .kill(&entry.id)
+                        .map(|s| format!("killed subagent {}", s.role))
+                }
+            }
             TaskTargetKind::Shell | TaskTargetKind::Timer | TaskTargetKind::Cron => self
                 .task_registry
                 .kill_task(&entry.id)
@@ -1539,6 +1603,141 @@ impl AppState {
             && details.return_to_manager
         {
             self.pending_task_manager = Some(PendingTaskManager { selected: 0 });
+        }
+    }
+
+    /// Opens an interactive `ask_question` picker dialog.
+    pub fn open_question_picker(
+        &mut self,
+        questions: Vec<QuestionSpec>,
+        reply_tx: mpsc::Sender<Option<Vec<QuestionAnswer>>>,
+    ) {
+        let len = questions.len();
+        self.pending_question = Some(PendingQuestion {
+            questions,
+            current: 0,
+            cursor: 0,
+            selections: vec![BTreeSet::new(); len],
+            custom_inputs: vec![String::new(); len],
+            editing_other: false,
+            reply_tx,
+        });
+    }
+
+    /// Returns any active `ask_question` dialog state.
+    #[must_use]
+    pub fn pending_question(&self) -> Option<&PendingQuestion> {
+        self.pending_question.as_ref()
+    }
+
+    /// Moves option cursor up/down in the active `ask_question` dialog.
+    pub fn move_question_cursor(&mut self, delta: isize) {
+        let Some(pq) = &mut self.pending_question else {
+            return;
+        };
+        let Some(q) = pq.questions.get(pq.current) else {
+            return;
+        };
+        // Options + 1 final "Other (custom)..." row.
+        let count = q.options.len() + 1;
+        let len = isize::try_from(count).unwrap_or(1);
+        let cur = isize::try_from(pq.cursor.min(count - 1)).unwrap_or(0);
+        pq.cursor = usize::try_from((cur + delta).rem_euclid(len)).unwrap_or(0);
+        pq.editing_other = pq.cursor == q.options.len();
+    }
+
+    /// Toggles the highlighted option (Space in multi-select) or enters `"Other"` typing mode.
+    pub fn toggle_question_option(&mut self) {
+        let Some(pq) = &mut self.pending_question else {
+            return;
+        };
+        let Some(q) = pq.questions.get(pq.current) else {
+            return;
+        };
+        if pq.cursor >= q.options.len() {
+            pq.editing_other = true;
+            return;
+        }
+        let set = &mut pq.selections[pq.current];
+        if q.is_multi_select {
+            if !set.remove(&pq.cursor) {
+                set.insert(pq.cursor);
+            }
+        } else {
+            set.clear();
+            set.insert(pq.cursor);
+        }
+    }
+
+    /// Appends one character to the custom `"Other"` response for the current question.
+    pub fn push_question_other_char(&mut self, ch: char) {
+        let Some(pq) = &mut self.pending_question else {
+            return;
+        };
+        if let Some(q) = pq.questions.get(pq.current)
+            && pq.cursor == q.options.len()
+        {
+            pq.editing_other = true;
+            pq.custom_inputs[pq.current].push(ch);
+        }
+    }
+
+    /// Deletes one character from the custom `"Other"` response for the current question.
+    pub fn pop_question_other_char(&mut self) {
+        let Some(pq) = &mut self.pending_question else {
+            return;
+        };
+        if pq.editing_other {
+            pq.custom_inputs[pq.current].pop();
+        }
+    }
+
+    /// Confirms the current question and either advances or delivers all answers back to `ask_question`.
+    pub fn confirm_question_step(&mut self) {
+        let Some(pq) = &mut self.pending_question else {
+            return;
+        };
+        let Some(q) = pq.questions.get(pq.current) else {
+            return;
+        };
+        if !q.is_multi_select && pq.cursor < q.options.len() && pq.selections[pq.current].is_empty()
+        {
+            pq.selections[pq.current].insert(pq.cursor);
+        }
+        if pq.current + 1 < pq.questions.len() {
+            pq.current += 1;
+            pq.cursor = 0;
+            pq.editing_other = false;
+            return;
+        }
+
+        let Some(done) = self.pending_question.take() else {
+            return;
+        };
+        let answers: Vec<QuestionAnswer> = done
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(idx, q)| {
+                let selected: Vec<String> = done.selections[idx]
+                    .iter()
+                    .filter_map(|&opt_idx| q.options.get(opt_idx).cloned())
+                    .collect();
+                let custom = done.custom_inputs[idx].trim();
+                QuestionAnswer {
+                    question: q.question.clone(),
+                    selected,
+                    custom_text: (!custom.is_empty()).then(|| custom.to_owned()),
+                }
+            })
+            .collect();
+        let _ = done.reply_tx.send(Some(answers));
+    }
+
+    /// Cancels any open `ask_question` dialog cleanly.
+    pub fn cancel_question_picker(&mut self) {
+        if let Some(done) = self.pending_question.take() {
+            let _ = done.reply_tx.send(None);
         }
     }
 

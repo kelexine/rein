@@ -155,6 +155,9 @@ impl PolicyEngine {
             Capability::Task { action, mode } => PolicyDecision::Allow {
                 reason: format!("session task operation '{action}' ({mode:?}) permitted"),
             },
+            Capability::AskUser => PolicyDecision::Allow {
+                reason: "interactive user clarification prompt permitted".to_owned(),
+            },
         }
     }
 

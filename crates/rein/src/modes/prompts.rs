@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use rein_core::ModeId;
+use rein_tools::McpServerSummary;
 
 use crate::modes::Profile;
 
@@ -23,6 +24,10 @@ pub struct RuntimeContext {
     pub project_memory_dir: Option<PathBuf>,
     /// Optional global personal memory vault directory containing `MEMORY.md` and topic files.
     pub personal_memory_dir: Option<PathBuf>,
+    /// Lazy-loaded MCP server summaries (tool names without full JSON schemas).
+    pub mcp_servers: Vec<McpServerSummary>,
+    /// Disk directory where lazy MCP `<server>/<tool>.json` schema files live.
+    pub mcp_schemas_root: Option<PathBuf>,
 }
 
 impl RuntimeContext {
@@ -71,6 +76,18 @@ impl RuntimeContext {
         self.personal_memory_dir = Some(personal_dir.into());
         self
     }
+
+    /// Attaches lazy-loaded MCP server tool summaries and schema directory path.
+    #[must_use]
+    pub fn with_mcp_catalog(
+        mut self,
+        servers: Vec<McpServerSummary>,
+        schemas_root: impl Into<PathBuf>,
+    ) -> Self {
+        self.mcp_servers = servers;
+        self.mcp_schemas_root = Some(schemas_root.into());
+        self
+    }
 }
 
 /// Builds the full system prompt for `mode` by composing shared rules and mode-specific guidance.
@@ -114,6 +131,22 @@ pub fn format_runtime_context(profile: &Profile, runtime: &RuntimeContext) -> St
         lines.push(format!(
             "- Skills available: {} (read the skill's SKILL.md via `read` when activated)",
             formatted.join(", ")
+        ));
+    }
+    if !runtime.mcp_servers.is_empty() {
+        let root_hint = runtime
+            .mcp_schemas_root
+            .as_ref()
+            .map(|p| format!(" (schemas in {}; call via `call_mcp_tool`)", p.display()))
+            .unwrap_or_default();
+        let catalog_desc: Vec<String> = runtime
+            .mcp_servers
+            .iter()
+            .map(|s| format!("{} [{}]", s.server_name, s.tools.join(", ")))
+            .collect();
+        lines.push(format!(
+            "- MCP servers{root_hint}: {}",
+            catalog_desc.join("; ")
         ));
     }
     lines.join("\n")

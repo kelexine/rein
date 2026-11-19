@@ -8,6 +8,10 @@ pub mod runner;
 pub mod snapshot;
 /// Policy-confined sub-agent tool (`agent`), live TUI status tracker, and child runner.
 pub mod subagent;
+/// Asynchronous subagent lifecycle, mailbox messaging, and custom type definitions.
+pub mod subagent_async;
+/// Pure-Rust workspace isolation (`inherit`, `share`, `branch`) without shelling out.
+pub mod workspace_iso;
 
 pub use runner::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, HydratedEvent,
@@ -20,4 +24,11 @@ pub use snapshot::{
 pub use subagent::{
     AgentTool, DEFAULT_SUBAGENT_MAX_ROUNDS, LiveSubagentStatus, ProviderFactory, SubagentEnv,
     SubagentRunState, SubagentSessionState, SubagentTracker,
+};
+pub use subagent_async::{
+    DefineSubagentTool, InvokeSubagentTool, ManageSubagentsTool, SendMessageTool,
+    SubagentDefinition, SubagentManager,
+};
+pub use workspace_iso::{
+    WorkspaceIsolation, cleanup_subagent_workspace, prepare_subagent_workspace,
 };

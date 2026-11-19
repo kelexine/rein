@@ -14,9 +14,9 @@ use crate::agent::{format_relative_age, now_unix_secs};
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
 use crate::ui::app::{
-    PendingApproval, PendingModelPicker, PendingRewindPicker, PendingSessionPicker,
-    PendingTaskManager, RewindStep, TaskDetailsSnapshot, TaskDetailsView, TaskListEntry,
-    TaskTargetKind, is_model_active, model_vendor_group,
+    PendingApproval, PendingModelPicker, PendingQuestion, PendingRewindPicker,
+    PendingSessionPicker, PendingTaskManager, RewindStep, TaskDetailsSnapshot, TaskDetailsView,
+    TaskListEntry, TaskTargetKind, is_model_active, model_vendor_group,
 };
 use crate::ui::entries::render_transcript_lines;
 
@@ -121,6 +121,8 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
 
     if let Some(pending) = state.pending_approval() {
         render_approval_menu(pending, frame, chunks[3]);
+    } else if let Some(pq) = state.pending_question() {
+        render_question_picker(pq, frame, chunks[3]);
     } else if let Some(picker) = state.pending_model_picker() {
         render_model_picker(picker, state.model_name(), frame, chunks[3]);
     } else if let Some(picker) = state.pending_session_picker() {
@@ -166,6 +168,12 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
         } else {
             5
         }
+    } else if let Some(pq) = state.pending_question() {
+        let opt_count = pq
+            .questions
+            .get(pq.current)
+            .map_or(1, |q| q.options.len() + 1);
+        u16::try_from(opt_count.clamp(1, MAX_MODEL_MENU_ROWS) + 1).unwrap_or(3)
     } else if let Some(picker) = state.pending_model_picker() {
         let group_headers = count_model_groups(picker);
         let body_rows = (picker.items.len() + group_headers).clamp(1, MAX_MODEL_MENU_ROWS);
@@ -993,7 +1001,10 @@ fn render_prompt_line(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
         .collect();
     frame.render_widget(Paragraph::new(rendered), area);
 
-    if state.strip_selected().is_some() || state.pending_task_manager().is_some() {
+    if state.strip_selected().is_some()
+        || state.pending_task_manager().is_some()
+        || state.pending_question().is_some()
+    {
         return;
     }
     let cursor_offset_x = u16::try_from(cursor_col).unwrap_or(u16::MAX);
@@ -1192,6 +1203,71 @@ fn render_task_manager(
             Span::styled(item.status_label.clone(), Style::default().fg(status_color)),
         ]));
     }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_question_picker(pq: &PendingQuestion, frame: &mut Frame<'_>, area: Rect) {
+    let Some(q) = pq.questions.get(pq.current) else {
+        return;
+    };
+    let hint = if q.is_multi_select {
+        "[↑/↓ · Space toggle · Enter confirm · Esc cancel]"
+    } else {
+        "[↑/↓ · Enter select · Esc cancel]"
+    };
+    let mut rows = Vec::with_capacity(q.options.len() + 2);
+    rows.push(Line::from(vec![
+        Span::styled(
+            format!(
+                "? ({}/{}) {} ",
+                pq.current + 1,
+                pq.questions.len(),
+                q.question
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+    ]));
+    for (idx, opt) in q.options.iter().enumerate() {
+        let focused = pq.cursor == idx;
+        let chosen = pq.selections[pq.current].contains(&idx);
+        let prefix = match (q.is_multi_select, focused, chosen) {
+            (true, true, true) => "› [x] ",
+            (true, true, false) => "› [ ] ",
+            (true, false, true) => "  [x] ",
+            (true, false, false) => "  [ ] ",
+            (false, true, _) => "› ● ",
+            (false, false, true) => "  ● ",
+            (false, false, false) => "  ○ ",
+        };
+        let style = if focused {
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        } else if chosen {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        rows.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
+    }
+    let other_focused = pq.cursor == q.options.len();
+    let other_text = &pq.custom_inputs[pq.current];
+    let other_label = if other_text.is_empty() {
+        "Other (type custom answer)...".to_owned()
+    } else {
+        format!("Other: {other_text}")
+    };
+    rows.push(Line::from(Span::styled(
+        format!("{} {other_label}", if other_focused { "›" } else { " " }),
+        if other_focused {
+            Style::default().fg(Color::LightBlue)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )));
     frame.render_widget(Paragraph::new(rows), area);
 }
 
@@ -1845,6 +1921,44 @@ mod tests {
         assert!(deleted.is_ok());
         assert!(state.all_task_entries().is_empty());
         let _ = summary;
+        Ok(())
+    }
+
+    #[test]
+    fn renders_and_collects_multi_select_ask_question_dialog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rein_tools::QuestionSpec;
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState::new(Profile::coding(), "policy-gated", "gemini-4-argon-medium");
+        state.open_question_picker(
+            vec![QuestionSpec {
+                question: "Pick target checks".to_owned(),
+                options: vec!["clippy".to_owned(), "cargo test".to_owned()],
+                is_multi_select: true,
+            }],
+            tx,
+        );
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| render_frame(&state, frame))?;
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Pick target checks"));
+        assert!(rendered.contains("clippy"));
+        assert!(rendered.contains("cargo test"));
+
+        state.toggle_question_option();
+        state.move_question_cursor(1);
+        state.toggle_question_option();
+        state.confirm_question_step();
+        let answers = rx.recv()?.ok_or("expected question answers")?;
+        assert_eq!(answers[0].selected, vec!["clippy", "cargo test"]);
         Ok(())
     }
 }

@@ -35,6 +35,7 @@ use crate::config::{
 };
 use crate::memory::AutoDreamCoordinator;
 use crate::modes::Profile;
+use crate::ui::app::QuestionPromptRequest;
 use crate::ui::view::{compute_max_scroll, transcript_viewport};
 use crate::ui::{AppState, render_frame};
 
@@ -168,6 +169,9 @@ pub fn run_tui(
             }
             _ => {}
         }
+    }
+    if let Some(sub_mgr) = app.subagent_manager() {
+        let _ = sub_mgr.kill_all();
     }
     app.subagent_tracker().cancel_all();
     app.task_registry().shutdown_all();
@@ -881,6 +885,12 @@ fn stream_prompt_background(
 
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
+    let (q_tx, q_rx) = mpsc::channel::<QuestionPromptRequest>();
+    if let Some(relay) = app.question_relay()
+        && let Ok(mut guard_relay) = relay.lock()
+    {
+        *guard_relay = Some(q_tx);
+    }
     let cancel = AtomicBool::new(false);
     let mut should_quit = false;
     let mut last_spin = Instant::now();
@@ -903,6 +913,9 @@ fn stream_prompt_background(
 
         while app.is_busy() {
             drain_worker_events(&ev_rx, app);
+            while let Ok((questions, reply_tx)) = q_rx.try_recv() {
+                app.open_question_picker(questions, reply_tx);
+            }
             tick_spinner(&mut last_spin, app);
             let _ = guard.terminal.draw(|f| render_frame(app, f));
             if !app.is_busy() {
@@ -913,6 +926,7 @@ fn stream_prompt_background(
                     Ok(Event::Key(key)) => {
                         if handle_streaming_key(key, app, guard, &ans_tx, &cancel) {
                             should_quit = true;
+                            app.cancel_question_picker();
                             let _ = ans_tx.send(ApprovalDecision {
                                 action: ApprovalAction::Deny,
                                 feedback: None,
@@ -922,7 +936,7 @@ fn stream_prompt_background(
                     }
                     Ok(Event::Paste(text)) => {
                         app.clear_ctrl_c_arm();
-                        if app.pending_approval().is_none() {
+                        if app.pending_approval().is_none() && app.pending_question().is_none() {
                             app.push_input_str(&text);
                         }
                     }
@@ -932,6 +946,12 @@ fn stream_prompt_background(
         }
     });
 
+    if let Some(relay) = app.question_relay()
+        && let Ok(mut guard_relay) = relay.lock()
+    {
+        *guard_relay = None;
+    }
+    app.cancel_question_picker();
     app.set_pending_approval(None);
     app.set_busy(false);
     Ok(should_quit)
@@ -991,6 +1011,20 @@ fn handle_streaming_key(
     app.clear_ctrl_c_arm();
     if is_ctrl_o(key) {
         let _ = app.toggle_expand_outputs();
+        return false;
+    }
+
+    if app.pending_question().is_some() {
+        match key.code {
+            KeyCode::Esc => app.cancel_question_picker(),
+            KeyCode::Up => app.move_question_cursor(-1),
+            KeyCode::Down => app.move_question_cursor(1),
+            KeyCode::Char(' ') => app.toggle_question_option(),
+            KeyCode::Backspace => app.pop_question_other_char(),
+            KeyCode::Enter => app.confirm_question_step(),
+            KeyCode::Char(c) => app.push_question_other_char(c),
+            _ => {}
+        }
         return false;
     }
 
@@ -1277,6 +1311,20 @@ fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
                 sections.push(format!(
                     "- Scheduled task `{task_id}` (`{label}`, trigger #{iteration}, {state}) fired with prompt:\n{prompt}"
                 ));
+            }
+            TaskNotification::SubagentMessage {
+                conversation_id,
+                role,
+                agent_type,
+                content,
+                finished,
+            } => {
+                app.task_registry().notify_external_event(&conversation_id);
+                let state = if finished { "finished" } else { "waiting" };
+                sections.push(format!(
+                    "- Subagent `{conversation_id}` (`{agent_type}: {role}`, state: {state}) sent:\n{content}"
+                ));
+                labels.push(role);
             }
         }
     }

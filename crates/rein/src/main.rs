@@ -8,21 +8,22 @@
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use anyhow::{Context, Result};
 use rein_core::{EventLog, ReplayProvider, Role, SessionEvent, login_with_browser};
 use rein_policy::{AuditLog, PolicyEngine, SandboxStatus, WorkspaceSandbox};
 use rein_tools::{
-    BashTool, CalendarTool, EditTool, EmailTool, GlobTool, GrepTool, JsonlMemoryStore,
-    ManageTaskTool, McpClient, McpToolAdapter, MemoryTool, NotesTool, ReadTool, ScheduleTool,
-    SwitchModeTool, TaskNotification, TaskRegistry, TodoReadTool, TodoStore, TodoWriteTool, Tool,
-    ToolRegistry, WriteTool,
+    AskQuestionTool, BashTool, CalendarTool, CallMcpTool, EditTool, EmailTool, GlobTool, GrepTool,
+    JsonlMemoryStore, ManageTaskTool, McpCatalog, McpClient, MemoryTool, NotesTool, ReadTool,
+    ScheduleTool, SwitchModeTool, TaskNotification, TaskRegistry, TodoReadTool, TodoStore,
+    TodoWriteTool, ToolError, ToolRegistry, WriteTool,
 };
 
 use rein::agent::{
     AgentLoop, AgentTool, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
-    SubagentEnv, SubagentSessionState, SubagentTracker,
+    DefineSubagentTool, InvokeSubagentTool, ManageSubagentsTool, SendMessageTool, SubagentEnv,
+    SubagentManager, SubagentSessionState, SubagentTracker,
 };
 use rein::commands::SlashKind;
 use rein::config::{
@@ -31,6 +32,7 @@ use rein::config::{
     save_provider_selection, write_latest_session_uid,
 };
 use rein::modes::{Profile, RuntimeContext, utc_today_iso};
+use rein::ui::app::SharedQuestionRelay;
 use rein::ui::{AppState, run_tui};
 
 struct HeadlessDenier;
@@ -69,13 +71,15 @@ fn main() -> Result<()> {
     let todo_store = TodoStore::for_session(&loaded.paths.todos_dir, "replay");
     let task_registry = TaskRegistry::new();
     let (task_tx, task_rx) = mpsc::channel::<TaskNotification>();
-    task_registry.set_inbox_tx(task_tx);
+    task_registry.set_inbox_tx(task_tx.clone());
+    let mcp_catalog = McpCatalog::new(loaded.paths.sessions_dir.join("mcp-schemas"));
     let (registry, mcp_tools, mcp_warnings) = build_registry(
         &loaded,
         &sandbox,
         memory.clone(),
         todo_store.clone(),
         task_registry.clone(),
+        mcp_catalog.clone(),
     );
 
     let bypass_permissions = has_bypass_permissions_flag(&args);
@@ -116,7 +120,9 @@ fn main() -> Result<()> {
         memory,
         todo_store,
         task_registry,
+        task_tx,
         task_rx,
+        mcp_catalog,
         initial_profile,
         mcp_tools,
         mcp_warnings,
@@ -187,7 +193,9 @@ fn run_interactive(
     memory: JsonlMemoryStore,
     todo_store: TodoStore,
     task_registry: TaskRegistry,
+    task_tx: mpsc::Sender<TaskNotification>,
     task_rx: mpsc::Receiver<TaskNotification>,
+    mcp_catalog: McpCatalog,
     initial_profile: Profile,
     mcp_tools: Vec<String>,
     mcp_warnings: Vec<String>,
@@ -244,11 +252,12 @@ fn run_interactive(
         .with_memory_dirs(
             &loaded.paths.repo_memory_dir,
             &loaded.paths.global_memory_dir,
-        );
+        )
+        .with_mcp_catalog(mcp_catalog.summaries(), mcp_catalog.schemas_root());
     let subagent_tracker = SubagentTracker::new();
     let subagent_state = Arc::new(RwLock::new(SubagentSessionState::default()));
     let subagent_cancel = Arc::new(AtomicBool::new(false));
-    registry.register(Box::new(AgentTool::new(SubagentEnv {
+    let subagent_env = SubagentEnv {
         sandbox: policy.sandbox().clone(),
         audit_log_path: loaded.paths.audit_log.clone(),
         sessions_dir: loaded.paths.sessions_dir.clone(),
@@ -273,7 +282,45 @@ fn run_interactive(
         tracker: subagent_tracker.clone(),
         cancel: Arc::clone(&subagent_cancel),
         provider_factory: SubagentEnv::config_provider_factory(loaded.config.clone()),
-    })));
+    };
+    let subagent_manager = SubagentManager::new(
+        subagent_env.clone(),
+        Some(task_tx),
+        mcp_catalog.has_servers().then_some(mcp_catalog),
+    );
+    registry.register(Box::new(AgentTool::new(subagent_env)));
+    registry.register(Box::new(InvokeSubagentTool::new(subagent_manager.clone())));
+    registry.register(Box::new(DefineSubagentTool::new(subagent_manager.clone())));
+    registry.register(Box::new(ManageSubagentsTool::new(subagent_manager.clone())));
+    registry.register(Box::new(SendMessageTool::new(subagent_manager.clone())));
+
+    let question_relay: SharedQuestionRelay = Arc::new(Mutex::new(None));
+    let relay_for_tool = Arc::clone(&question_relay);
+    registry.register(Box::new(AskQuestionTool::new(Arc::new(move |questions| {
+        let sender = relay_for_tool
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| ToolError::InvalidArguments {
+                tool: "ask_question".to_owned(),
+                reason: "interactive question UI is unavailable in headless mode".to_owned(),
+            })?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        sender
+            .send((questions, reply_tx))
+            .map_err(|_| ToolError::InvalidArguments {
+                tool: "ask_question".to_owned(),
+                reason: "failed sending question to UI".to_owned(),
+            })?;
+        reply_rx
+            .recv()
+            .ok()
+            .flatten()
+            .ok_or_else(|| ToolError::InvalidArguments {
+                tool: "ask_question".to_owned(),
+                reason: "question cancelled by user".to_owned(),
+            })
+    }))));
 
     let event_log = EventLog::new(&event_log_path);
 
@@ -288,6 +335,8 @@ fn run_interactive(
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_bypass_permissions(bypass_permissions)
         .with_subagent_tracker(subagent_tracker)
+        .with_subagent_manager(subagent_manager)
+        .with_question_relay(question_relay)
         .with_task_registry(task_registry)
         .with_task_notifications(task_rx)
         .with_workspace_label(workspace_label)
@@ -395,6 +444,7 @@ fn build_registry(
     memory: JsonlMemoryStore,
     todo_store: TodoStore,
     task_registry: TaskRegistry,
+    mcp_catalog: McpCatalog,
 ) -> (ToolRegistry, Vec<String>, Vec<String>) {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool::new(sandbox.clone())));
@@ -433,24 +483,16 @@ fn build_registry(
         let client = McpClient::new(server.clone());
         match client.list_tools() {
             Ok(schemas) => {
-                for schema in schemas {
-                    let adapter = if registry.contains(&schema.name) {
-                        let namespaced =
-                            McpToolAdapter::namespaced_name(&server.name, &schema.name);
-                        warnings.push(format!(
-                            "mcp '{}': tool '{}' collided with an existing tool; registered as '{}'",
-                            server.name, schema.name, namespaced
-                        ));
-                        McpToolAdapter::with_registered_name(client.clone(), schema, namespaced)
-                    } else {
-                        McpToolAdapter::new(client.clone(), schema)
-                    };
-                    mcp_names.push(adapter.schema().name);
-                    registry.register(Box::new(adapter));
+                if let Err(err) = mcp_catalog.register_server(client, &schemas) {
+                    warnings.push(format!("mcp '{}': {err}", server.name));
                 }
             }
             Err(err) => warnings.push(format!("mcp '{}': {err}", server.name)),
         }
+    }
+    if mcp_catalog.has_servers() {
+        registry.register(Box::new(CallMcpTool::new(mcp_catalog)));
+        mcp_names.push("call_mcp_tool".to_owned());
     }
     (registry, mcp_names, warnings)
 }

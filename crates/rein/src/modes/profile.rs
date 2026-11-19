@@ -23,6 +23,11 @@ pub const CODING_TOOLS: &[&str] = &[
     "todo_read",
     "switch_mode",
     "agent",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "ask_question",
 ];
 
 /// Tool names enabled in the read-only Plan profile.
@@ -38,6 +43,11 @@ pub const PLAN_TOOLS: &[&str] = &[
     "todo_read",
     "switch_mode",
     "agent",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "ask_question",
 ];
 
 /// Tool names enabled in the Personal profile.
@@ -52,6 +62,11 @@ pub const PERSONAL_TOOLS: &[&str] = &[
     "todo_read",
     "switch_mode",
     "agent",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "ask_question",
 ];
 
 /// A self-contained mode profile keeping `rein-core` completely mode-agnostic.

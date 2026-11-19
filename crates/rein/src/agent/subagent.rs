@@ -39,6 +39,8 @@ pub type ProviderFactory = Arc<dyn Fn(Option<&str>) -> (Box<dyn Provider>, Strin
 pub enum SubagentRunState {
     /// Currently executing rounds.
     Running,
+    /// Completed current turn and asleep waiting for `send_message` follow-ups.
+    Waiting,
     /// Finished successfully.
     Completed,
     /// Exited with an error.
@@ -51,7 +53,7 @@ impl SubagentRunState {
     /// Returns `true` when this sub-agent has reached a terminal state.
     #[must_use]
     pub fn is_done(self) -> bool {
-        !matches!(self, Self::Running)
+        !matches!(self, Self::Running | Self::Waiting)
     }
 
     /// Lowercase status label shown in the TUI.
@@ -59,6 +61,7 @@ impl SubagentRunState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Killed => "killed",
@@ -145,6 +148,37 @@ impl SubagentTracker {
                 let excess = entry.output_lines.len() - 500;
                 entry.output_lines.drain(..excess);
             }
+        }
+    }
+
+    /// Marks sub-agent `id` as sleeping (`Waiting`) after finishing a turn while awaiting `send_message`.
+    pub fn set_waiting(&self, id: &str, report_text: &str) {
+        if let Ok(mut guard) = self.records.lock()
+            && let Some(entry) = guard.iter_mut().find(|s| s.id == id)
+        {
+            if entry.cancel_flag.load(Ordering::Acquire) {
+                entry.run_state = SubagentRunState::Killed;
+                entry.status = "killed".to_owned();
+                entry.finished_unix_secs = Some(now_unix_secs());
+                return;
+            }
+            entry.run_state = SubagentRunState::Waiting;
+            entry.status = "waiting".to_owned();
+            if !report_text.trim().is_empty() {
+                entry
+                    .output_lines
+                    .extend(report_text.lines().map(str::to_owned));
+            }
+        }
+    }
+
+    /// Marks sub-agent `id` as transitioning back into `Running` on a new message.
+    pub fn set_running(&self, id: &str, activity: impl Into<String>) {
+        if let Ok(mut guard) = self.records.lock()
+            && let Some(entry) = guard.iter_mut().find(|s| s.id == id)
+        {
+            entry.run_state = SubagentRunState::Running;
+            entry.status = activity.into();
         }
     }
 
@@ -477,8 +511,7 @@ impl Tool for AgentTool {
         let model_override = arguments.get("model").and_then(Value::as_str);
         let (mut provider, model_label) = (self.env.provider_factory)(model_override);
 
-        let seq = SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let sub_id = format!("subagent-{}-{seq}", std::process::id());
+        let sub_id = next_subagent_id();
         let _ = std::fs::create_dir_all(&self.env.sessions_dir);
         let log_path = self.env.sessions_dir.join(format!("{sub_id}.jsonl"));
 
@@ -571,7 +604,12 @@ fn extract_non_empty_prompt(arguments: &Value) -> Result<&str, ToolError> {
         })
 }
 
-fn build_subagent_profile(
+pub(crate) fn next_subagent_id() -> String {
+    let seq = SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("subagent-{}-{seq}", std::process::id())
+}
+
+pub(crate) fn build_subagent_profile(
     target_mode: ModeId,
     agent_type: &str,
     role: &str,
@@ -579,26 +617,44 @@ fn build_subagent_profile(
 ) -> Profile {
     let mut profile =
         Profile::for_mode(target_mode).with_allowed_commands(allowed_commands.to_vec());
-    // Strip `agent`, `switch_mode`, and `todo_write` from child sub-agents so they cannot recurse,
-    // escalate modes, or overwrite the parent orchestrator's todo checklist.
-    profile
-        .allowed_tools
-        .retain(|t| t != "agent" && t != "switch_mode" && t != "todo_write");
+    // Strip orchestrator/interactive tools from child sub-agents by default so they cannot
+    // recurse unconditionally, escalate modes, or overwrite the parent orchestrator's todo checklist.
+    profile.allowed_tools.retain(|t| {
+        !matches!(
+            t.as_str(),
+            "agent"
+                | "invoke_subagent"
+                | "define_subagent"
+                | "manage_subagents"
+                | "switch_mode"
+                | "todo_write"
+                | "ask_question"
+                | "manage_task"
+                | "schedule"
+        )
+    });
     profile.system_prompt.push_str(&format!(
-        "\n\n## Sub-Agent Confinement\n- You are running as an isolated `{agent_type}` sub-agent with role **{role}**.\n- You cannot spawn sub-agents or switch modes. Focus strictly on your assigned task and return a clear, evidence-backed report to the parent agent."
+        "\n\n## Sub-Agent Confinement\n- You are running as an isolated `{agent_type}` sub-agent with role **{role}**.\n- You cannot switch modes or overwrite the parent todo list. Focus strictly on your assigned task and return a clear, evidence-backed report."
     ));
     profile
 }
 
-fn build_child_registry(env: &SubagentEnv) -> ToolRegistry {
+pub(crate) fn build_child_registry(env: &SubagentEnv) -> ToolRegistry {
+    build_child_registry_for_sandbox(env, &env.sandbox)
+}
+
+pub(crate) fn build_child_registry_for_sandbox(
+    env: &SubagentEnv,
+    sandbox: &WorkspaceSandbox,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadTool::new(env.sandbox.clone())));
-    registry.register(Box::new(WriteTool::new(env.sandbox.clone())));
-    registry.register(Box::new(EditTool::new(env.sandbox.clone())));
-    registry.register(Box::new(GlobTool::new(env.sandbox.clone())));
-    registry.register(Box::new(GrepTool::new(env.sandbox.clone())));
+    registry.register(Box::new(ReadTool::new(sandbox.clone())));
+    registry.register(Box::new(WriteTool::new(sandbox.clone())));
+    registry.register(Box::new(EditTool::new(sandbox.clone())));
+    registry.register(Box::new(GlobTool::new(sandbox.clone())));
+    registry.register(Box::new(GrepTool::new(sandbox.clone())));
     registry.register(Box::new(
-        BashTool::new(env.sandbox.clone()).with_output_dir(&env.bash_outputs_dir),
+        BashTool::new(sandbox.clone()).with_output_dir(&env.bash_outputs_dir),
     ));
     registry.register(Box::new(MemoryTool::new(env.memory.clone())));
     registry.register(Box::new(NotesTool::new(&env.notes_file)));
@@ -612,16 +668,16 @@ fn build_child_registry(env: &SubagentEnv) -> ToolRegistry {
     registry
 }
 
-fn short_model_display(label: &str) -> String {
+pub(crate) fn short_model_display(label: &str) -> String {
     let bare = label.rsplit('/').next().unwrap_or(label);
     bare.to_owned()
 }
 
-struct SubagentPrompter {
-    id: String,
-    tracker: SubagentTracker,
-    parent_cancel: Arc<AtomicBool>,
-    sub_cancel: Arc<AtomicBool>,
+pub(crate) struct SubagentPrompter {
+    pub(crate) id: String,
+    pub(crate) tracker: SubagentTracker,
+    pub(crate) parent_cancel: Arc<AtomicBool>,
+    pub(crate) sub_cancel: Arc<AtomicBool>,
 }
 
 impl SubagentPrompter {

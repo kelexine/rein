@@ -95,4 +95,6 @@ pub enum Capability {
         /// Read or write access mode.
         mode: AccessMode,
     },
+    /// Interactive multiple-choice prompt asking the user clarifying questions (`ask_question`).
+    AskUser,
 }

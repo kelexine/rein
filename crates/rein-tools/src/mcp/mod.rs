@@ -4,8 +4,11 @@
 
 /// Stdio MCP client and tool adapter implementation.
 pub mod client;
+/// Lazy MCP schema disk catalog and `call_mcp_tool` dispatcher.
+pub mod lazy;
 /// JSON-RPC 2.0 request and response envelopes for MCP servers.
 pub mod protocol;
 
-pub use client::{McpClient, McpServerConfig, McpToolAdapter};
+pub use client::{MCP_EXCHANGE_TIMEOUT_SECS, McpClient, McpServerConfig, McpToolAdapter};
+pub use lazy::{CallMcpTool, McpCatalog, McpServerSummary};
 pub use protocol::{JsonRpcRequest, JsonRpcResponse};
