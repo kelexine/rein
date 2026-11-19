@@ -17,6 +17,8 @@ pub mod mode;
 pub mod personal;
 /// Tool trait, schema, and policy-gated registry.
 pub mod registry;
+/// Background shell tasks, one-shot timers, cron schedules, and `manage_task` / `schedule` tools.
+pub mod tasks;
 /// Session and workspace todo checklist tools.
 pub mod todos;
 
@@ -28,4 +30,8 @@ pub use personal::{
     CalendarEvent, CalendarTool, EmailMessage, EmailStatus, EmailTool, NoteEntry, NotesTool,
 };
 pub use registry::{Tool, ToolError, ToolRegistry, ToolSchema};
+pub use tasks::{
+    BashSpawnOutcome, CronSchedule, ManageTaskTool, ScheduleTool, TaskKind, TaskNotification,
+    TaskRegistry, TaskStatus, TaskSummary, TimerCondition,
+};
 pub use todos::{TodoItem, TodoListState, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};

@@ -4,19 +4,18 @@
 
 use std::path::PathBuf;
 
-use rein_policy::{
-    Capability, SandboxSpec, ShellClassifier, WorkspaceSandbox, default_sandbox_read_only_paths,
-    default_sandbox_read_write_paths, run_sandboxed_command,
-};
+use rein_policy::{Capability, SandboxSpec, WorkspaceSandbox, run_sandboxed_command};
 use serde_json::{Value, json};
 
 use crate::registry::{Tool, ToolError, ToolSchema};
+use crate::tasks::{BashSpawnOutcome, TaskRegistry};
 
-/// Executes bash commands via `rein --sandbox-child` under Landlock, driven by [`ShellClassifier`].
+/// Executes policy-gated bash commands with full inherited shell configs and streamed output files.
 #[derive(Debug, Clone)]
 pub struct BashTool {
     sandbox: WorkspaceSandbox,
     output_dir: Option<PathBuf>,
+    task_registry: Option<TaskRegistry>,
 }
 
 impl BashTool {
@@ -27,6 +26,7 @@ impl BashTool {
         Self {
             sandbox,
             output_dir,
+            task_registry: None,
         }
     }
 
@@ -36,13 +36,20 @@ impl BashTool {
         self.output_dir = Some(dir.into());
         self
     }
+
+    /// Attaches a [`TaskRegistry`] enabling `wait_ms_before_async` auto-backgrounding and `is_daemon` execution.
+    #[must_use]
+    pub fn with_task_registry(mut self, registry: TaskRegistry) -> Self {
+        self.task_registry = Some(registry);
+        self
+    }
 }
 
 impl Tool for BashTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "bash".to_owned(),
-            description: "Execute a bash command inside the Linux Landlock sandbox (accepts either 'command' via bash -c or 'program' + 'args', streams output with no fixed timeout). Use read/glob/grep for file inspection and bash for builds, tests, and git.".to_owned(),
+            description: "Execute a bash command in the workspace (accepts either 'command' via bash -c or 'program' + 'args', inheriting user shell configs with no execution timeout). Commands exceeding wait_ms_before_async (500-10000ms) or with is_daemon=true auto-background into TaskRegistry and wake the session on completion.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -54,6 +61,14 @@ impl Tool for BashTool {
                     "args": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "wait_ms_before_async": {
+                        "type": "integer",
+                        "description": "Milliseconds (500-10000, default 10000) to wait synchronously before promoting to a background task."
+                    },
+                    "is_daemon": {
+                        "type": "boolean",
+                        "description": "Set true for long-running servers/watchers that should immediately start in the background."
                     }
                 }
             }),
@@ -67,23 +82,67 @@ impl Tool for BashTool {
 
     fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
         let (program, args) = parse_command(arguments)?;
-        let classification =
-            ShellClassifier::classify_with_sandbox(&program, &args, Some(&self.sandbox));
-        let read_only_workspace = classification.is_read_only();
+        let label = format_command_label(arguments, &program, &args);
         let spec = SandboxSpec {
             workspace_root: self.sandbox.root().to_path_buf(),
-            read_only_workspace,
-            read_only_paths: default_sandbox_read_only_paths(self.sandbox.root()),
-            read_write_paths: default_sandbox_read_write_paths(
-                self.sandbox.root(),
-                read_only_workspace,
-            ),
             program,
             args,
             output_dir: self.output_dir.clone(),
         };
+        if let Some(registry) = &self.task_registry {
+            let wait_ms = arguments
+                .get("wait_ms_before_async")
+                .and_then(Value::as_u64);
+            let is_daemon = arguments
+                .get("is_daemon")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return match registry.spawn_bash_task(spec, label, wait_ms, is_daemon)? {
+                BashSpawnOutcome::Completed {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                    log_path,
+                } => Ok(serde_json::to_string(&json!({
+                    "status_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "truncated": truncated,
+                    "output_file": log_path,
+                }))?),
+                BashSpawnOutcome::Backgrounded {
+                    task_id,
+                    is_daemon,
+                    partial_output,
+                    log_path,
+                } => Ok(serde_json::to_string(&json!({
+                    "status": "backgrounded",
+                    "task_id": task_id,
+                    "is_daemon": is_daemon,
+                    "partial_output": partial_output,
+                    "output_file": log_path,
+                }))?),
+            };
+        }
         let output = run_sandboxed_command(&spec)?;
         Ok(serde_json::to_string(&output)?)
+    }
+}
+
+fn format_command_label(arguments: &Value, program: &str, args: &[String]) -> String {
+    if let Some(cmd) = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return cmd.to_owned();
+    }
+    if args.is_empty() {
+        program.to_owned()
+    } else {
+        format!("{program} {}", args.join(" "))
     }
 }
 
