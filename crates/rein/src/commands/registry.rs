@@ -54,6 +54,8 @@ pub enum BuiltinAction {
     Resume,
     /// Rewinds conversation history and optionally workspace code to a previous turn.
     Rewind,
+    /// Opens the interactive `/tasks` manager to inspect, kill (`k`), or delete (`x`) tasks and subagents.
+    Tasks,
     /// Exits Rein cleanly.
     Quit,
 }
@@ -198,6 +200,11 @@ impl SlashRegistry {
                 BuiltinAction::Rewind,
             ),
             builtin(
+                "tasks",
+                "Manage background tasks & subagents (k: kill, x: delete done)",
+                BuiltinAction::Tasks,
+            ),
+            builtin(
                 "exit",
                 "Exit Rein (or press Ctrl+C twice within 2s)",
                 BuiltinAction::Quit,
@@ -254,7 +261,11 @@ impl SlashRegistry {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let raw_name = parts.next().unwrap_or_default().trim();
         let args = parts.next().unwrap_or_default().trim().to_owned();
-        let lookup = if raw_name == "quit" { "exit" } else { raw_name };
+        let lookup = match raw_name {
+            "quit" => "exit",
+            "task" => "tasks",
+            other => other,
+        };
 
         match self.commands.iter().find(|c| c.name == lookup) {
             Some(command) => SlashResolution::Matched { command, args },

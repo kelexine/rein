@@ -208,8 +208,9 @@ fn coding_mode_section() -> &'static str {
     "## Coding Workflow\n\
      - Locate and inspect before modifying: prefer `glob`, `grep`, and `read` over `bash` file commands to inspect definitions, callers, and tests; parallelize independent read-only tool calls when useful.\n\
      - Delegate focused research or parallel audits using the `agent` tool (`type: \"research\"` or `\"coder\"`); emit multiple `agent` calls in a single turn to run sub-agents concurrently.\n\
+     - Long-running `bash` commands (exceeding `wait_ms_before_async` or with `is_daemon: true`) and `schedule` timers/crons run asynchronously in the background with no execution timeout; use `manage_task` (`list`, `status`, `send_input`, `kill`) to inspect or interact with them, and feel free to finish your turn cleanly so Rein wakes you back up when they complete or fire.\n\
      - Prefer targeted `edit` changes on existing files over rewriting whole files with `write`; keep edits minimal without unrequested abstractions or speculative refactors.\n\
-     - Prioritize security: validate untrusted input, keep path/shell handling strict, and never hardcode secrets or bypass the Landlock sandbox.\n\
+     - Prioritize security: validate untrusted input, keep path/shell handling strict, and never hardcode secrets or bypass policy checks.\n\
      - Complete all unblocked work cleanly instead of stopping early for unnecessary check-ins; use `todo_write` to track multi-step tasks.\n\
      - Verify builds, linters, and tests via `bash` after final edits and summarize the exact scope and observed results."
 }
@@ -244,7 +245,7 @@ mod tests {
         assert!(prompt.contains("Communication Style"));
         assert!(prompt.contains("Memory Hygiene"));
         assert!(prompt.contains("Coding Workflow"));
-        assert!(prompt.contains("Landlock sandbox"));
+        assert!(prompt.contains("bypass policy checks"));
         assert!(!prompt.contains("notes"));
         assert!(!prompt.contains("email"));
     }
