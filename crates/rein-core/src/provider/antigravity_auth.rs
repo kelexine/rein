@@ -299,7 +299,7 @@ pub fn refresh_access_token(
     let (client_id, client_secret) = resolve_oauth_client();
     let resp = agent
         .post(OAUTH_TOKEN_URL)
-        .send_form(&[
+        .send_form([
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
             ("refresh_token", refresh_token),
@@ -308,7 +308,8 @@ pub fn refresh_access_token(
         .map_err(|err| CoreError::Provider(format!("Antigravity OAuth refresh error: {err}")))?;
 
     let body = resp
-        .into_string()
+        .into_body()
+        .read_to_string()
         .map_err(|err| CoreError::Provider(format!("OAuth refresh read failed: {err}")))?;
     let parsed: OAuthTokenResponse = serde_json::from_str(&body)?;
     Ok((parsed.access_token, parsed.expires_in))
@@ -350,10 +351,10 @@ pub fn login_with_browser_until(
         .spawn();
 
     let code = wait_for_oauth_callback(&listener, &state, cancel)?;
-    let agent = ureq::Agent::new();
+    let agent = ureq::Agent::new_with_defaults();
     let token_resp = agent
         .post(OAUTH_TOKEN_URL)
-        .send_form(&[
+        .send_form([
             ("code", code.as_str()),
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
@@ -362,7 +363,7 @@ pub fn login_with_browser_until(
         ])
         .map_err(|err| CoreError::Provider(format!("OAuth token exchange failed: {err}")))?;
 
-    let token_body = token_resp.into_string().map_err(|err| {
+    let token_body = token_resp.into_body().read_to_string().map_err(|err| {
         CoreError::Provider(format!("failed reading OAuth token response: {err}"))
     })?;
     let parsed: OAuthTokenResponse = serde_json::from_str(&token_body)?;
@@ -489,10 +490,10 @@ fn write_html_response(stream: &mut TcpStream, status: &str, message: &str) -> s
 fn fetch_userinfo_email(agent: &ureq::Agent, access_token: &str) -> Option<String> {
     let resp = agent
         .get(OAUTH_USERINFO_URL)
-        .set("Authorization", &format!("Bearer {access_token}"))
+        .header("Authorization", &format!("Bearer {access_token}"))
         .call()
         .ok()?;
-    let body = resp.into_string().ok()?;
+    let body = resp.into_body().read_to_string().ok()?;
     let parsed: Value = serde_json::from_str(&body).ok()?;
     parsed
         .get("email")

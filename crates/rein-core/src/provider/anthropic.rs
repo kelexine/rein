@@ -61,9 +61,12 @@ impl AnthropicProvider {
     /// Creates an [`AnthropicProvider`] with the given configuration.
     #[must_use]
     pub fn new(config: AnthropicConfig) -> Self {
+        let cfg = ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build();
         Self {
             config,
-            agent: ureq::Agent::new(),
+            agent: ureq::Agent::new_with_config(cfg),
         }
     }
 
@@ -127,12 +130,14 @@ impl Provider for AnthropicProvider {
         let resp = self
             .agent
             .get(&url)
-            .set("x-api-key", &api_key)
-            .set("anthropic-version", ANTHROPIC_API_VERSION)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
             .call()
-            .map_err(format_ureq_error)?;
+            .map_err(format_ureq_error)
+            .and_then(ensure_ok_response)?;
         let body = resp
-            .into_string()
+            .into_body()
+            .read_to_string()
             .map_err(|err| CoreError::Provider(format!("Anthropic models read error: {err}")))?;
         let val: Value = serde_json::from_str(&body)?;
         Ok(parse_anthropic_models(&val))
@@ -174,11 +179,12 @@ impl Provider for AnthropicProvider {
         std::thread::spawn(move || {
             let res = agent
                 .post(&endpoint)
-                .set("x-api-key", &api_key)
-                .set("anthropic-version", ANTHROPIC_API_VERSION)
-                .set("content-type", "application/json")
-                .send_string(&payload)
-                .map_err(format_ureq_error);
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION)
+                .header("content-type", "application/json")
+                .send(&payload)
+                .map_err(format_ureq_error)
+                .and_then(ensure_ok_response);
             let _ = tx.send(res);
         });
         let response = loop {
@@ -196,7 +202,7 @@ impl Provider for AnthropicProvider {
             }
         };
 
-        let reader = BufReader::new(response.into_reader());
+        let reader = BufReader::new(response.into_body().into_reader());
         let mut acc = SseEventAccumulator::new();
         acc.read_stream_cancellable_owned(reader, cancel, on_event)
     }
@@ -237,26 +243,33 @@ fn parse_anthropic_models(val: &Value) -> Vec<AvailableModel> {
         .collect()
 }
 
-fn format_ureq_error(err: ureq::Error) -> CoreError {
-    match err {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| body.trim().to_owned());
-            if detail.is_empty() {
-                CoreError::Provider(format!("Anthropic HTTP {code}"))
-            } else {
-                CoreError::Provider(format!("Anthropic HTTP {code}: {detail}"))
-            }
-        }
-        other => CoreError::Provider(format!("Anthropic transport error: {other}")),
+fn ensure_ok_response(
+    resp: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, CoreError> {
+    let code = resp.status().as_u16();
+    if (200..300).contains(&code) {
+        return Ok(resp);
     }
+    let body = resp.into_body().read_to_string().unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.trim().to_owned());
+    if detail.is_empty() {
+        Err(CoreError::Provider(format!("Anthropic HTTP {code}")))
+    } else {
+        Err(CoreError::Provider(format!(
+            "Anthropic HTTP {code}: {detail}"
+        )))
+    }
+}
+
+fn format_ureq_error(err: ureq::Error) -> CoreError {
+    CoreError::Provider(format!("Anthropic transport error: {err}"))
 }
 
 fn encode_anthropic_messages(messages: &[Message]) -> Vec<Value> {

@@ -2025,7 +2025,7 @@ mod tests {
     use rein_core::AvailableModel;
 
     #[test]
-    fn renders_citadel_owl_header_and_slash_menu() -> std::io::Result<()> {
+    fn renders_citadel_owl_header_and_slash_menu() -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(Profile::coding(), "landlock v11", "claude-sonnet-5-5")
@@ -2051,7 +2051,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_four_option_approval_menu_with_tab_feedback() -> std::io::Result<()> {
+    fn renders_four_option_approval_menu_with_tab_feedback()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::agent::ApprovalRequest;
 
         let backend = TestBackend::new(90, 22);
@@ -2084,7 +2085,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_model_picker_with_server_quota_and_busy_spinner() -> std::io::Result<()> {
+    fn renders_model_picker_with_server_quota_and_busy_spinner()
+    -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(100, 22);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(
@@ -2133,7 +2135,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_max_scroll_matches_word_wrapped_paragraph_bottom() -> std::io::Result<()> {
+    fn compute_max_scroll_matches_word_wrapped_paragraph_bottom()
+    -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(40, 14);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(Profile::coding(), "off", "antigravity/claude-sonnet-5-5");
@@ -2160,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_interactive_resume_session_picker() -> std::io::Result<()> {
+    fn renders_interactive_resume_session_picker() -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(
@@ -2205,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_plan_mode_and_multiline_prompt_box() -> std::io::Result<()> {
+    fn renders_plan_mode_and_multiline_prompt_box() -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(Profile::plan(), "landlock v11", "antigravity/gemini-4");
@@ -2228,7 +2231,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_dynamic_todo_bar_above_prompt_and_collapses_when_cleared() -> std::io::Result<()> {
+    fn renders_dynamic_todo_bar_above_prompt_and_collapses_when_cleared()
+    -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut state = AppState::new(Profile::coding(), "landlock v11", "claude-sonnet-5-5");
@@ -2278,7 +2282,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_live_subagent_bar_and_status_count_when_active() -> std::io::Result<()> {
+    fn renders_live_subagent_bar_and_status_count_when_active()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::agent::{LiveSubagentStatus, SubagentRunState, SubagentTracker, now_unix_secs};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;

@@ -88,13 +88,18 @@ pub struct AntigravityProvider {
     call_seq: u64,
 }
 
+type UreqResponse = ureq::http::Response<ureq::Body>;
+
 impl AntigravityProvider {
     /// Creates an [`AntigravityProvider`] with the given configuration.
     #[must_use]
     pub fn new(config: AntigravityConfig) -> Self {
+        let cfg = ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build();
         Self {
             config,
-            agent: ureq::Agent::new(),
+            agent: ureq::Agent::new_with_config(cfg),
             cached_tokens: None,
             token_file_path: None,
             resolved_project: None,
@@ -348,11 +353,12 @@ impl AntigravityProvider {
             && let Ok(resp) = self
                 .agent
                 .post(&url)
-                .set("Authorization", &format!("Bearer {access_token}"))
-                .set("Content-Type", "application/json")
-                .set("User-Agent", ANTIGRAVITY_USER_AGENT)
-                .send_string(&payload.to_string())
-            && let Ok(body) = resp.into_string()
+                .header("Authorization", &format!("Bearer {access_token}"))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", ANTIGRAVITY_USER_AGENT)
+                .send(&payload.to_string())
+            && resp.status().is_success()
+            && let Ok(body) = resp.into_body().read_to_string()
             && let Ok(parsed) = serde_json::from_str::<Value>(&body)
         {
             if let Some(tier) = parsed.pointer("/paidTier/id").and_then(Value::as_str)
@@ -390,13 +396,19 @@ impl AntigravityProvider {
         }
     }
 
-    fn send_get(&self, url: &str, access_token: &str) -> Result<ureq::Response, Box<ureq::Error>> {
-        self.agent
+    fn send_get(
+        &self,
+        url: &str,
+        access_token: &str,
+    ) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
+        let resp = self
+            .agent
             .get(url)
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .set("User-Agent", ANTIGRAVITY_USER_AGENT)
+            .header("Authorization", &format!("Bearer {access_token}"))
+            .header("User-Agent", ANTIGRAVITY_USER_AGENT)
             .call()
-            .map_err(Box::new)
+            .map_err(classify_transport_error)?;
+        check_response_status(resp)
     }
 
     fn post_stream_cancellable(
@@ -405,9 +417,9 @@ impl AntigravityProvider {
         access_token: &str,
         payload: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, Result<Box<ureq::Error>, CoreError>> {
+    ) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Err(CoreError::Cancelled));
+            return Err((None, false, CoreError::Cancelled));
         }
         let agent = self.agent.clone();
         let url_owned = url.to_owned();
@@ -417,25 +429,28 @@ impl AntigravityProvider {
         std::thread::spawn(move || {
             let res = agent
                 .post(&url_owned)
-                .set("Authorization", &format!("Bearer {token_owned}"))
-                .set("Content-Type", "application/json")
-                .set("User-Agent", ANTIGRAVITY_USER_AGENT)
-                .send_string(&payload_owned)
-                .map_err(Box::new);
+                .header("Authorization", &format!("Bearer {token_owned}"))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", ANTIGRAVITY_USER_AGENT)
+                .send(&payload_owned);
             let _ = tx.send(res);
         });
         loop {
             if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(Err(CoreError::Cancelled));
+                return Err((None, false, CoreError::Cancelled));
             }
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Ok(resp)) => return Ok(resp),
-                Ok(Err(err)) => return Err(Ok(err)),
+                Ok(Ok(resp)) => return check_response_status(resp),
+                Ok(Err(err)) => return Err(classify_transport_error(err)),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Err(CoreError::Provider(
-                        "Antigravity HTTP request worker terminated unexpectedly".to_owned(),
-                    )));
+                    return Err((
+                        None,
+                        false,
+                        CoreError::Provider(
+                            "Antigravity HTTP request worker terminated unexpectedly".to_owned(),
+                        ),
+                    ));
                 }
             }
         }
@@ -447,24 +462,19 @@ impl AntigravityProvider {
         access_token: &mut String,
         payload: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
+    ) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
         if let Err(err) = validate_antigravity_url(url) {
             return Err((None, false, err));
         }
         match self.post_stream_cancellable(url, access_token, payload, cancel) {
             Ok(resp) => Ok(resp),
-            Err(Err(core_err)) => Err((None, false, core_err)),
-            Err(Ok(err)) if matches!(&*err, ureq::Error::Status(401, _)) => {
+            Err((Some(401), _, _)) => {
                 *access_token = self
                     .try_refresh_token()
                     .map_err(|e| (Some(401), false, e))?;
-                match self.post_stream_cancellable(url, access_token, payload, cancel) {
-                    Ok(resp) => Ok(resp),
-                    Err(Err(core_err)) => Err((None, false, core_err)),
-                    Err(Ok(e)) => Err(classify_http_error(*e)),
-                }
+                self.post_stream_cancellable(url, access_token, payload, cancel)
             }
-            Err(Ok(err)) => Err(classify_http_error(*err)),
+            Err(err) => Err(err),
         }
     }
 
@@ -482,19 +492,18 @@ impl AntigravityProvider {
         }
         let resp = match self.send_get(&url, access_token) {
             Ok(r) => r,
-            Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
+            Err((Some(401), _, _)) => {
                 *access_token = self.try_refresh_token().ok()?;
                 self.send_get(&url, access_token).ok()?
             }
-            Err(err) => {
-                let (_, scope_missing, _) = classify_http_error(*err);
+            Err((_, scope_missing, _)) => {
                 if scope_missing {
                     self.aicode_scope_blocked = true;
                 }
                 return None;
             }
         };
-        let body = resp.into_string().ok()?;
+        let body = resp.into_body().read_to_string().ok()?;
         let parsed: Value = serde_json::from_str(&body).ok()?;
         if let Some(ent) = parsed.get("entitlement").filter(|v| !v.is_null()) {
             self.aicode_entitlement = Some(ent.clone());
@@ -519,7 +528,7 @@ impl Provider for AntigravityProvider {
         let (mut models, mut wire_map) =
             match self.post_with_refresh(&url, &mut access_token, &payload, &never) {
                 Ok(resp) => {
-                    let body = resp.into_string().map_err(|err| {
+                    let body = resp.into_body().read_to_string().map_err(|err| {
                         CoreError::Provider(format!("Antigravity models read error: {err}"))
                     })?;
                     let parsed: Value = serde_json::from_str(&body)?;
@@ -633,7 +642,7 @@ impl AntigravityProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, CoreError> {
+    ) -> Result<UreqResponse, CoreError> {
         match self.post_aicode_stream(
             ai_base,
             access_token,
@@ -669,7 +678,7 @@ impl AntigravityProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, CoreError> {
+    ) -> Result<UreqResponse, CoreError> {
         let v1_payload = serde_json::to_string(&self.build_request_body(
             project_id,
             system_prompt,
@@ -704,7 +713,7 @@ impl AntigravityProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
+    ) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
         let ai_payload =
             serde_json::to_string(&self.build_aicode_request_body(system_prompt, messages, tools))
                 .map_err(|err| (None, false, CoreError::from(err)))?;
@@ -721,7 +730,7 @@ impl AntigravityProvider {
         access_token: &mut String,
         payload: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
+    ) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
         let base = self.config.base_url.trim_end_matches('/');
         let is_default_base = base == DEFAULT_ANTIGRAVITY_BASE_URL;
         let url = format!("{base}/v1internal:streamGenerateContent?alt=sse");
@@ -739,11 +748,11 @@ impl AntigravityProvider {
 
     fn read_sse_events(
         &mut self,
-        response: ureq::Response,
+        response: UreqResponse,
         cancel: &std::sync::atomic::AtomicBool,
         on_event: &mut dyn FnMut(&ProviderStreamEvent),
     ) -> Result<Vec<ProviderStreamEvent>, CoreError> {
-        let reader = BufReader::new(response.into_reader());
+        let reader = BufReader::new(response.into_body().into_reader());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in reader.lines() {
@@ -804,32 +813,37 @@ fn build_generation_config(
     })
 }
 
-fn classify_http_error(err: ureq::Error) -> (Option<u16>, bool, CoreError) {
-    match err {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let scope_missing = body.contains("ACCESS_TOKEN_SCOPE_INSUFFICIENT");
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| body.trim().to_owned());
-            let core_err = if detail.is_empty() {
-                CoreError::Provider(format!("Antigravity HTTP {code}"))
-            } else {
-                CoreError::Provider(format!("Antigravity HTTP {code}: {detail}"))
-            };
-            (Some(code), scope_missing, core_err)
-        }
-        other => (
-            None,
-            false,
-            CoreError::Provider(format!("Antigravity transport error: {other}")),
-        ),
+fn check_response_status(
+    resp: UreqResponse,
+) -> Result<UreqResponse, (Option<u16>, bool, CoreError)> {
+    let code = resp.status().as_u16();
+    if (200..300).contains(&code) {
+        return Ok(resp);
     }
+    let body = resp.into_body().read_to_string().unwrap_or_default();
+    let scope_missing = body.contains("ACCESS_TOKEN_SCOPE_INSUFFICIENT");
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.trim().to_owned());
+    let core_err = if detail.is_empty() {
+        CoreError::Provider(format!("Antigravity HTTP {code}"))
+    } else {
+        CoreError::Provider(format!("Antigravity HTTP {code}: {detail}"))
+    };
+    Err((Some(code), scope_missing, core_err))
+}
+
+fn classify_transport_error(err: ureq::Error) -> (Option<u16>, bool, CoreError) {
+    (
+        None,
+        false,
+        CoreError::Provider(format!("Antigravity transport error: {err}")),
+    )
 }
 
 fn encode_antigravity_contents(
