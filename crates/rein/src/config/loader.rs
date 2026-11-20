@@ -573,6 +573,8 @@ pub struct UiSettings {
     pub editor_mode: String,
     /// Show contextual hints in the footer/empty state.
     pub show_tips: bool,
+    /// Controls when follow-up messages typed while busy are sent (`"send_immediately"` or `"queue"`).
+    pub queued_messages: String,
 }
 
 impl Default for UiSettings {
@@ -587,6 +589,7 @@ impl Default for UiSettings {
             default_permission_mode: "policy-gated".to_owned(),
             editor_mode: "normal".to_owned(),
             show_tips: true,
+            queued_messages: "send_immediately".to_owned(),
         }
     }
 }

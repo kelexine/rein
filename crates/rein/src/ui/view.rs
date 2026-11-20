@@ -147,6 +147,10 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         && chunks[3].height > 0
     {
         render_mention_menu(&mention_matches, state.mention_selected(), frame, chunks[3]);
+    } else if (!state.queued_messages().is_empty() || !state.steering_pending().is_empty())
+        && chunks[3].height > 0
+    {
+        render_queued_messages(state, frame, chunks[3]);
     } else if chunks[3].height > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
@@ -210,6 +214,9 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
         let vis = mention_matches.len().min(MAX_MODEL_MENU_ROWS);
         let extra = usize::from(mention_matches.len() > MAX_MODEL_MENU_ROWS);
         u16::try_from(vis + extra).unwrap_or(0)
+    } else if !state.queued_messages().is_empty() || !state.steering_pending().is_empty() {
+        let rows = state.queued_messages().len() + state.steering_pending().len() * 2;
+        u16::try_from(rows.min(MAX_MENU_ROWS)).unwrap_or(0)
     } else {
         u16::try_from(slash_count.min(MAX_MENU_ROWS)).unwrap_or(0)
     }
@@ -1423,6 +1430,11 @@ fn render_status_bar(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
             "↑/↓: select task · enter: view · esc: prompt".to_owned(),
             Style::default().fg(Color::LightBlue),
         )
+    } else if state.is_busy() && !state.queued_messages().is_empty() {
+        (
+            "↑: edit queued · alt+m: send now · esc: stop".to_owned(),
+            Style::default().fg(Color::DarkGray),
+        )
     } else if state.is_busy() {
         (
             format!("{toggle_label} · esc: stop · ctrl+c x2: exit"),
@@ -1555,6 +1567,34 @@ fn mode_color(mode: ModeId) -> Color {
         ModeId::Plan => Color::LightMagenta,
         ModeId::Personal => Color::Rgb(115, 210, 125),
     }
+}
+
+fn render_queued_messages(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    for msg in state.steering_pending() {
+        lines.push(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+            Span::styled(msg.clone(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "  └ Sending to agent…",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    for (display, _) in state.queued_messages() {
+        lines.push(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(Color::Gray)),
+            Span::styled(display.clone(), Style::default().fg(Color::White)),
+            Span::styled(
+                " (alt+m to send immediately)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_mention_menu(

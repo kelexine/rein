@@ -102,6 +102,9 @@ pub trait ApprovalPrompter {
 
     /// Notified immediately when `switch_mode` changes the active profile mid-turn.
     fn on_mode_switched(&mut self, _profile: &Profile) {}
+
+    /// Notified when a mid-turn steering message from the user is injected into the conversation.
+    fn on_steer_delivered(&mut self, _display: &str) {}
 }
 
 /// Coordinates the single-process agent turn loop across Core, Policy, Tools, and Modes.
@@ -121,6 +124,7 @@ pub struct AgentLoop {
     runtime_context: RuntimeContext,
     subagent_state: Option<Arc<RwLock<SubagentSessionState>>>,
     subagent_cancel: Option<Arc<AtomicBool>>,
+    steer_rx: Option<std::sync::mpsc::Receiver<(String, String)>>,
 }
 
 impl AgentLoop {
@@ -150,7 +154,38 @@ impl AgentLoop {
             runtime_context: RuntimeContext::new(),
             subagent_state: None,
             subagent_cancel: None,
+            steer_rx: None,
         }
+    }
+
+    /// Attaches a mid-turn steering receiver `(display, resolved_prompt)` for the active turn.
+    pub fn set_steer_receiver(&mut self, rx: std::sync::mpsc::Receiver<(String, String)>) {
+        self.steer_rx = Some(rx);
+    }
+
+    /// Clears any attached mid-turn steering receiver.
+    pub fn clear_steer_receiver(&mut self) {
+        self.steer_rx = None;
+    }
+
+    fn drain_steer_messages(&mut self, prompter: &mut dyn ApprovalPrompter) -> Result<bool> {
+        let Some(rx) = &self.steer_rx else {
+            return Ok(false);
+        };
+        let mut drained = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            drained.push(item);
+        }
+        if drained.is_empty() {
+            return Ok(false);
+        }
+        for (display, prompt_for_model) in drained {
+            let msg = Message::new(Role::User, prompt_for_model);
+            record_full_message(self.full_transcript_path.as_deref(), &msg)?;
+            self.history.push(msg);
+            prompter.on_steer_delivered(&display);
+        }
+        Ok(true)
     }
 
     /// Attaches shared policy and cancellation handles so spawned `agent` sub-agents stay confined to active session policy.
@@ -574,6 +609,9 @@ impl AgentLoop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(CoreError::Cancelled.into());
             }
+            if round > 0 {
+                let _ = self.drain_steer_messages(prompter)?;
+            }
             let assembled = ContextBuilder::new(self.modes.active(), &self.memory)
                 .with_runtime_context(&self.runtime_context)
                 .build(&self.history, &self.registry)
@@ -646,6 +684,9 @@ impl AgentLoop {
                 record_full_message(self.full_transcript_path.as_deref(), &msg)?;
                 self.history.push(msg);
                 self.sync_subagent_state();
+                if self.drain_steer_messages(prompter)? {
+                    continue;
+                }
                 return Ok(final_text);
             }
             execute_tool_batch(

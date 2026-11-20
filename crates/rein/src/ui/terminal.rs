@@ -78,6 +78,7 @@ enum WorkerEvent {
     Quota(u8),
     ModeSwitched(Box<Profile>),
     AskConfirm(ApprovalRequest),
+    SteerDelivered(String),
     Note(String),
     Finished(Result<()>),
 }
@@ -122,6 +123,12 @@ impl ApprovalPrompter for ChannelPrompter {
         let _ = self
             .tx
             .send(WorkerEvent::ModeSwitched(Box::new(profile.clone())));
+    }
+
+    fn on_steer_delivered(&mut self, display: &str) {
+        let _ = self
+            .tx
+            .send(WorkerEvent::SteerDelivered(display.to_owned()));
     }
 }
 
@@ -914,89 +921,123 @@ fn compact_background(
 }
 
 fn stream_prompt_background(
-    display_label: String,
-    prompt_for_model: String,
+    mut display_label: String,
+    mut prompt_for_model: String,
     agent: &mut AgentLoop,
     provider: &mut dyn Provider,
     app: &mut AppState,
     guard: &mut TerminalGuard,
 ) -> Result<bool> {
-    app.push_user_turn(display_label);
-    app.set_busy_status("Thinking…");
-    app.set_busy(true);
-    guard.terminal.draw(|f| render_frame(app, f))?;
-
-    let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
-    let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
-    let (q_tx, q_rx) = mpsc::channel::<QuestionPromptRequest>();
-    if let Some(relay) = app.question_relay()
-        && let Ok(mut guard_relay) = relay.lock()
-    {
-        *guard_relay = Some(q_tx);
-    }
-    let cancel = AtomicBool::new(false);
+    let workspace_root = agent.policy().sandbox().root().to_path_buf();
     let mut should_quit = false;
-    let mut last_spin = Instant::now();
 
-    std::thread::scope(|scope| {
-        let cancel_ref = &cancel;
-        scope.spawn(move || {
-            let mut prompter = ChannelPrompter {
-                tx: ev_tx.clone(),
-                confirm_rx: ans_rx,
-            };
-            let res = agent
-                .run_user_prompt_cancellable(&prompt_for_model, provider, &mut prompter, cancel_ref)
-                .map(|_| ());
-            if let Some(quota) = provider.active_model_quota() {
-                let _ = ev_tx.send(WorkerEvent::Quota(quota));
-            }
-            let _ = ev_tx.send(WorkerEvent::Finished(res));
-        });
+    loop {
+        app.push_user_turn(display_label);
+        app.set_busy_status("Thinking…");
+        app.set_busy(true);
+        guard.terminal.draw(|f| render_frame(app, f))?;
 
-        while app.is_busy() {
-            drain_worker_events(&ev_rx, app);
-            while let Ok((questions, reply_tx)) = q_rx.try_recv() {
-                app.open_question_picker(questions, reply_tx);
-            }
-            tick_spinner(&mut last_spin, app);
-            let _ = guard.terminal.draw(|f| render_frame(app, f));
-            if !app.is_busy() {
-                break;
-            }
-            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if handle_streaming_key(key, app, guard, &ans_tx, &cancel) {
-                            should_quit = true;
-                            app.cancel_question_picker();
-                            let _ = ans_tx.send(ApprovalDecision {
-                                action: ApprovalAction::Deny,
-                                feedback: None,
-                            });
-                            break;
+        let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
+        let (ans_tx, ans_rx) = mpsc::channel::<ApprovalDecision>();
+        let (q_tx, q_rx) = mpsc::channel::<QuestionPromptRequest>();
+        let (steer_tx, steer_rx) = mpsc::channel::<(String, String)>();
+        agent.set_steer_receiver(steer_rx);
+        if let Some(relay) = app.question_relay()
+            && let Ok(mut guard_relay) = relay.lock()
+        {
+            *guard_relay = Some(q_tx);
+        }
+        let cancel = AtomicBool::new(false);
+        let mut last_spin = Instant::now();
+        let agent_ref: &mut AgentLoop = agent;
+        let provider_ref: &mut dyn Provider = provider;
+
+        std::thread::scope(|scope| {
+            let cancel_ref = &cancel;
+            scope.spawn(move || {
+                let mut prompter = ChannelPrompter {
+                    tx: ev_tx.clone(),
+                    confirm_rx: ans_rx,
+                };
+                let res = agent_ref
+                    .run_user_prompt_cancellable(
+                        &prompt_for_model,
+                        provider_ref,
+                        &mut prompter,
+                        cancel_ref,
+                    )
+                    .map(|_| ());
+                if let Some(quota) = provider_ref.active_model_quota() {
+                    let _ = ev_tx.send(WorkerEvent::Quota(quota));
+                }
+                let _ = ev_tx.send(WorkerEvent::Finished(res));
+            });
+
+            while app.is_busy() {
+                drain_worker_events(&ev_rx, app);
+                while let Ok((questions, reply_tx)) = q_rx.try_recv() {
+                    app.open_question_picker(questions, reply_tx);
+                }
+                tick_spinner(&mut last_spin, app);
+                let _ = guard.terminal.draw(|f| render_frame(app, f));
+                if !app.is_busy() {
+                    break;
+                }
+                if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+                    match event::read() {
+                        Ok(Event::Key(key)) => {
+                            if handle_streaming_key(
+                                key,
+                                app,
+                                guard,
+                                &ans_tx,
+                                &cancel,
+                                &steer_tx,
+                                &workspace_root,
+                            ) {
+                                should_quit = true;
+                                app.cancel_question_picker();
+                                let _ = ans_tx.send(ApprovalDecision {
+                                    action: ApprovalAction::Deny,
+                                    feedback: None,
+                                });
+                                break;
+                            }
                         }
-                    }
-                    Ok(Event::Paste(text)) => {
-                        app.clear_ctrl_c_arm();
-                        if app.pending_approval().is_none() && app.pending_question().is_none() {
-                            app.push_input_str(&text);
+                        Ok(Event::Paste(text)) => {
+                            app.clear_ctrl_c_arm();
+                            if app.pending_approval().is_none() && app.pending_question().is_none()
+                            {
+                                app.push_input_str(&text);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-    });
+        });
 
-    if let Some(relay) = app.question_relay()
-        && let Ok(mut guard_relay) = relay.lock()
-    {
-        *guard_relay = None;
+        agent.clear_steer_receiver();
+        app.clear_steering_pending();
+        if let Some(relay) = app.question_relay()
+            && let Ok(mut guard_relay) = relay.lock()
+        {
+            *guard_relay = None;
+        }
+        app.cancel_question_picker();
+        app.set_pending_approval(None);
+        app.set_busy(false);
+
+        if should_quit || cancel.load(Ordering::Acquire) {
+            break;
+        }
+        if let Some((next_display, next_prompt)) = app.take_next_queued_message() {
+            display_label = next_display;
+            prompt_for_model = next_prompt;
+            continue;
+        }
+        break;
     }
-    app.cancel_question_picker();
-    app.set_pending_approval(None);
-    app.set_busy(false);
     Ok(should_quit)
 }
 
@@ -1022,6 +1063,7 @@ fn drain_worker_events(ev_rx: &Receiver<WorkerEvent>, app: &mut AppState) {
                 app.push_system_note(format!("mode: {mode:?}"));
             }
             WorkerEvent::AskConfirm(req) => app.set_pending_approval(Some(req)),
+            WorkerEvent::SteerDelivered(display) => app.mark_steering_delivered(&display),
             WorkerEvent::Note(note) => app.push_system_note(note),
             WorkerEvent::Finished(res) => {
                 if let Err(err) = res {
@@ -1043,6 +1085,8 @@ fn handle_streaming_key(
     guard: &mut TerminalGuard,
     ans_tx: &Sender<ApprovalDecision>,
     cancel: &AtomicBool,
+    steer_tx: &Sender<(String, String)>,
+    workspace_root: &std::path::Path,
 ) -> bool {
     if is_ctrl_c(key) {
         if app.arm_or_confirm_ctrl_c(Instant::now()) {
@@ -1179,9 +1223,22 @@ fn handle_streaming_key(
         app.push_input_char('\n');
         return false;
     }
+    if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::ALT) {
+        if let Some((display, resolved)) = app.take_next_queued_message() {
+            app.push_steering_pending(display.clone());
+            if steer_tx.send((display.clone(), resolved.clone())).is_err() {
+                app.enqueue_queued_message(display, resolved);
+            }
+        }
+        return false;
+    }
     match key.code {
         KeyCode::Up => {
-            if !app.move_cursor_vertical(-1) {
+            if app.input().is_empty()
+                && let Some(queued) = app.pop_last_queued_for_edit()
+            {
+                app.set_input(queued);
+            } else if !app.move_cursor_vertical(-1) {
                 app.navigate_history(-1);
             }
         }
@@ -1209,6 +1266,22 @@ fn handle_streaming_key(
         KeyCode::Backspace => app.pop_input_char(),
         KeyCode::Delete => app.delete_input_char(),
         KeyCode::Char(c) => app.push_input_char(c),
+        KeyCode::Enter => {
+            let raw = app.take_input();
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let display = trimmed.to_owned();
+                let resolved = resolve_mentions_for_prompt(trimmed, workspace_root);
+                if app.ui_settings().queued_messages == "queue" {
+                    app.enqueue_queued_message(display, resolved);
+                } else {
+                    app.push_steering_pending(display.clone());
+                    if steer_tx.send((display.clone(), resolved.clone())).is_err() {
+                        app.enqueue_queued_message(display, resolved);
+                    }
+                }
+            }
+        }
         _ => {}
     }
     false

@@ -351,6 +351,8 @@ pub struct AppState {
     pending_config_modal: Option<PendingConfigModal>,
     plugin_manager: Option<PluginManager>,
     pending_plugins_modal: Option<PendingPluginsModal>,
+    queued_messages: Vec<(String, String)>,
+    steering_pending: Vec<String>,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -451,6 +453,8 @@ impl AppState {
             pending_config_modal: None,
             plugin_manager: None,
             pending_plugins_modal: None,
+            queued_messages: Vec::new(),
+            steering_pending: Vec::new(),
         }
     }
 
@@ -2371,6 +2375,16 @@ impl AppState {
                 repo_overridden: false,
             },
             ConfigSettingRow {
+                key: "queued_messages",
+                label: "Queued Messages",
+                value: if self.ui_settings.queued_messages == "queue" {
+                    "Queue".to_owned()
+                } else {
+                    "Send Immediately".to_owned()
+                },
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
                 key: "show_tips",
                 label: "Show tips",
                 value: on_off(self.ui_settings.show_tips),
@@ -2439,6 +2453,13 @@ impl AppState {
                     "normal".to_owned()
                 };
             }
+            "queued_messages" => {
+                self.ui_settings.queued_messages = if self.ui_settings.queued_messages == "queue" {
+                    "send_immediately".to_owned()
+                } else {
+                    "queue".to_owned()
+                };
+            }
             "show_tips" => self.ui_settings.show_tips = !self.ui_settings.show_tips,
             "model" => return Some((key, true)),
             _ => {}
@@ -2476,6 +2497,59 @@ impl AppState {
     /// Closes `/plugins` modal.
     pub fn close_plugins_modal(&mut self) {
         self.pending_plugins_modal = None;
+    }
+
+    // ── Queued / Steering Messages ───────────────────────────────────────────
+
+    /// Enqueues a `(display, resolved_prompt)` follow-up message while the model is busy.
+    pub fn enqueue_queued_message(&mut self, display: String, resolved_prompt: String) {
+        self.queued_messages.push((display, resolved_prompt));
+    }
+
+    /// Pops the oldest queued message for immediate steering (`Alt+M`) or post-turn execution.
+    pub fn take_next_queued_message(&mut self) -> Option<(String, String)> {
+        if self.queued_messages.is_empty() {
+            None
+        } else {
+            Some(self.queued_messages.remove(0))
+        }
+    }
+
+    /// Pops the most recently queued message back into the input box for editing (`Up`).
+    pub fn pop_last_queued_for_edit(&mut self) -> Option<String> {
+        self.queued_messages.pop().map(|(display, _)| display)
+    }
+
+    /// Returns queued follow-up messages `(display, resolved_prompt)`.
+    #[must_use]
+    pub fn queued_messages(&self) -> &[(String, String)] {
+        &self.queued_messages
+    }
+
+    /// Records a steering message currently being delivered (`Sending to agent...`).
+    pub fn push_steering_pending(&mut self, display: String) {
+        self.steering_pending.push(display);
+    }
+
+    /// Marks the oldest pending steering message as delivered into the active turn.
+    pub fn mark_steering_delivered(&mut self, display: &str) {
+        if let Some(pos) = self.steering_pending.iter().position(|s| s == display) {
+            self.steering_pending.remove(pos);
+        } else if !self.steering_pending.is_empty() {
+            self.steering_pending.remove(0);
+        }
+        self.push_user_turn(display);
+    }
+
+    /// Clears any undelivered steering-pending indicators (e.g. when a turn ends).
+    pub fn clear_steering_pending(&mut self) {
+        self.steering_pending.clear();
+    }
+
+    /// Returns steering messages currently waiting to be injected into the active turn.
+    #[must_use]
+    pub fn steering_pending(&self) -> &[String] {
+        &self.steering_pending
     }
 }
 
