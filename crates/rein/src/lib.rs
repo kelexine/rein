@@ -15,5 +15,7 @@ pub mod config;
 pub mod memory;
 /// Mode profiles, context strategy, and runtime switcher.
 pub mod modes;
+/// Claude-compatible plugin and marketplace manager (`~/.rein/plugins`).
+pub mod plugins;
 /// In-process Ratatui terminal interface.
 pub mod ui;

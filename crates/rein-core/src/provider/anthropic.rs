@@ -168,14 +168,33 @@ impl Provider for AnthropicProvider {
         })?;
         let body = self.build_request_body(system_prompt, messages, tools);
         let payload = serde_json::to_string(&body)?;
-        let response = self
-            .agent
-            .post(&self.config.endpoint)
-            .set("x-api-key", &api_key)
-            .set("anthropic-version", ANTHROPIC_API_VERSION)
-            .set("content-type", "application/json")
-            .send_string(&payload)
-            .map_err(format_ureq_error)?;
+        let agent = self.agent.clone();
+        let endpoint = self.config.endpoint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = agent
+                .post(&endpoint)
+                .set("x-api-key", &api_key)
+                .set("anthropic-version", ANTHROPIC_API_VERSION)
+                .set("content-type", "application/json")
+                .send_string(&payload)
+                .map_err(format_ureq_error);
+            let _ = tx.send(res);
+        });
+        let response = loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(CoreError::Cancelled);
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(res) => break res?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CoreError::Provider(
+                        "Anthropic HTTP request worker terminated unexpectedly".to_owned(),
+                    ));
+                }
+            }
+        };
 
         let reader = BufReader::new(response.into_reader());
         let mut acc = SseEventAccumulator::new();

@@ -19,9 +19,13 @@ use crate::agent::{
     now_unix_secs,
 };
 use crate::commands::{SlashCommand, SlashRegistry};
-use crate::config::{ProviderKind, SessionSummary};
+use crate::config::{ProviderKind, SessionSummary, UiSettings};
 use crate::modes::Profile;
+use crate::plugins::PluginManager;
 use crate::ui::entries::{ToolRunState, TranscriptEntry};
+use crate::ui::mentions::{
+    MentionCandidate, active_mention_query, collect_mention_candidates, filter_mention_candidates,
+};
 
 /// Active interactive 4-option permission prompt with inline `Tab` feedback editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +186,103 @@ pub struct PendingQuestion {
     pub reply_tx: mpsc::Sender<Option<Vec<QuestionAnswer>>>,
 }
 
+/// Tabs inside the `/config` interactive modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigTab {
+    /// Interactive toggleable settings.
+    Settings,
+    /// Session, provider, sandbox, and config-path status.
+    Status,
+    /// Effective configuration & repo override summary.
+    Config,
+    /// Token usage & quota summary.
+    Usage,
+}
+
+impl ConfigTab {
+    /// Ordered tabs for `←/→` switching.
+    pub const ALL: [Self; 4] = [Self::Settings, Self::Status, Self::Config, Self::Usage];
+
+    /// Display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "Settings",
+            Self::Status => "Status",
+            Self::Config => "Config",
+            Self::Usage => "Usage",
+        }
+    }
+}
+
+/// Interactive `/config` modal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConfigModal {
+    /// Active tab.
+    pub tab: ConfigTab,
+    /// Search filter query on `Settings` / `Config`.
+    pub search: String,
+    /// Whether typing in the search bar.
+    pub searching: bool,
+    /// Highlighted row index.
+    pub selected: usize,
+}
+
+/// Tabs inside the `/plugins` interactive modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginsTab {
+    /// Browse plugins from registered git marketplaces.
+    Discover,
+    /// Installed plugins (`enabled` / `disabled`).
+    Installed,
+    /// Configured git marketplaces (`add` / `refresh` / `remove`).
+    Marketplaces,
+    /// Plugin load or parse diagnostics.
+    Errors,
+}
+
+impl PluginsTab {
+    /// Ordered tabs for `←/→` switching.
+    pub const ALL: [Self; 4] = [
+        Self::Discover,
+        Self::Installed,
+        Self::Marketplaces,
+        Self::Errors,
+    ];
+
+    /// Display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Discover => "Discover",
+            Self::Installed => "Installed",
+            Self::Marketplaces => "Marketplaces",
+            Self::Errors => "Errors",
+        }
+    }
+}
+
+/// Interactive `/plugins` modal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPluginsModal {
+    /// Active tab.
+    pub tab: PluginsTab,
+    /// Live search query.
+    pub search: String,
+    /// Whether typing inside `Search plugins...`.
+    pub searching: bool,
+    /// Whether typing inside `Add marketplace (owner/repo or git URL)...`.
+    pub adding_marketplace: bool,
+    /// Marketplace add input buffer.
+    pub marketplace_input: String,
+    /// Highlighted row index.
+    pub selected: usize,
+    /// Optional marketplace filter (`Ctrl+S` on Discover).
+    pub marketplace_filter: Option<String>,
+    /// Transient status or error banner shown inside the modal.
+    pub status_notice: Option<String>,
+}
+
 /// Active interactive `/rewind` popup opened by `/rewind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRewindPicker {
@@ -242,6 +343,14 @@ pub struct AppState {
     pending_task_details: Option<TaskDetailsView>,
     pending_question: Option<PendingQuestion>,
     question_relay: Option<SharedQuestionRelay>,
+    mention_candidates: Vec<MentionCandidate>,
+    mention_selected: usize,
+    mention_dismissed_at: Option<usize>,
+    ui_settings: UiSettings,
+    repo_override_keys: Vec<String>,
+    pending_config_modal: Option<PendingConfigModal>,
+    plugin_manager: Option<PluginManager>,
+    pending_plugins_modal: Option<PendingPluginsModal>,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -334,6 +443,14 @@ impl AppState {
             pending_task_details: None,
             pending_question: None,
             question_relay: None,
+            mention_candidates: Vec::new(),
+            mention_selected: 0,
+            mention_dismissed_at: None,
+            ui_settings: UiSettings::default(),
+            repo_override_keys: Vec::new(),
+            pending_config_modal: None,
+            plugin_manager: None,
+            pending_plugins_modal: None,
         }
     }
 
@@ -356,6 +473,45 @@ impl AppState {
     pub fn with_question_relay(mut self, relay: SharedQuestionRelay) -> Self {
         self.question_relay = Some(relay);
         self
+    }
+
+    /// Attaches initial [`UiSettings`] and repo override keys for `/config`.
+    #[must_use]
+    pub fn with_ui_settings(
+        mut self,
+        settings: UiSettings,
+        repo_override_keys: Vec<String>,
+    ) -> Self {
+        self.expand_outputs = settings.verbose_output;
+        self.auto_scroll = settings.auto_scroll;
+        self.ui_settings = settings;
+        self.repo_override_keys = repo_override_keys;
+        self
+    }
+
+    /// Attaches the [`PluginManager`] for `/plugins` and `@` mention discovery.
+    #[must_use]
+    pub fn with_plugin_manager(mut self, manager: PluginManager) -> Self {
+        self.plugin_manager = Some(manager);
+        self
+    }
+
+    /// Returns a reference to the attached [`PluginManager`], if configured.
+    #[must_use]
+    pub fn plugin_manager(&self) -> Option<&PluginManager> {
+        self.plugin_manager.as_ref()
+    }
+
+    /// Returns current [`UiSettings`].
+    #[must_use]
+    pub fn ui_settings(&self) -> &UiSettings {
+        &self.ui_settings
+    }
+
+    /// Returns repo config keys overriding global settings.
+    #[must_use]
+    pub fn repo_override_keys(&self) -> &[String] {
+        &self.repo_override_keys
     }
 
     /// Returns a reference to the attached [`SubagentManager`], if configured.
@@ -619,6 +775,12 @@ impl AppState {
     #[must_use]
     pub fn slash_registry(&self) -> &SlashRegistry {
         &self.slash_registry
+    }
+
+    /// Replaces the loaded [`SlashRegistry`] (for live plugin command reload).
+    pub fn set_slash_registry(&mut self, registry: SlashRegistry) {
+        self.slash_registry = registry;
+        self.slash_selected = 0;
     }
 
     /// Returns pre-approved shell commands from global + repo `commands.json`.
@@ -2006,6 +2168,315 @@ fn logical_line_ranges(text: &str) -> Vec<(usize, usize)> {
     }
     ranges.push((start, text.len()));
     ranges
+}
+
+/// Single row displayed in `/config` Settings/Config tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSettingRow {
+    /// Stable setting identifier.
+    pub key: &'static str,
+    /// Human-readable label.
+    pub label: &'static str,
+    /// Formatted current value.
+    pub value: String,
+    /// Whether this key is overridden in `<workspace>/.rein/config.json`.
+    pub repo_overridden: bool,
+}
+
+impl AppState {
+    // ── @ Mentions ───────────────────────────────────────────────────────────
+
+    /// Refreshes cached `@` autocomplete candidates from `cwd`, agents, plugins, and MCP servers.
+    pub fn refresh_mention_candidates(&mut self, cwd: &std::path::Path) {
+        let mut extra_agents = Vec::new();
+        if let Some(sub_mgr) = &self.subagent_manager {
+            for def in sub_mgr.list_definitions() {
+                extra_agents.push((def.name, def.description));
+            }
+        }
+        let mut plugins_list = Vec::new();
+        if let Some(pm) = &self.plugin_manager {
+            let bundle = pm.collect_enabled_components();
+            for ag in bundle.agents {
+                extra_agents.push((ag.name, ag.description));
+            }
+            for rec in pm.installed_plugins() {
+                if rec.enabled {
+                    plugins_list.push((rec.name, rec.description));
+                }
+            }
+        }
+        let mcp_names: Vec<String> = self.mcp_servers.iter().map(|s| s.name.clone()).collect();
+        self.mention_candidates = collect_mention_candidates(
+            cwd,
+            self.ui_settings.respect_gitignore_picker,
+            &extra_agents,
+            &plugins_list,
+            &mcp_names,
+        );
+        self.mention_selected = 0;
+    }
+
+    /// Returns active `@query` matches when the `@` popup should be shown.
+    #[must_use]
+    pub fn active_mention_matches(&self) -> Option<(usize, String, Vec<&MentionCandidate>)> {
+        if self.busy || self.input.starts_with('/') {
+            return None;
+        }
+        let (at_idx, query) = active_mention_query(&self.input, self.input_cursor)?;
+        if self.mention_dismissed_at == Some(at_idx) {
+            return None;
+        }
+        let matches = filter_mention_candidates(&self.mention_candidates, &query);
+        if matches.is_empty() {
+            return None;
+        }
+        Some((at_idx, query, matches))
+    }
+
+    /// Returns the highlighted `@` candidate index.
+    #[must_use]
+    pub fn mention_selected(&self) -> usize {
+        self.mention_selected
+    }
+
+    /// Moves the `@` popup selection up or down with wrap-around.
+    pub fn move_mention_selection(&mut self, delta: isize) {
+        let count = self.active_mention_matches().map_or(0, |(_, _, m)| m.len());
+        if count == 0 {
+            self.mention_selected = 0;
+            return;
+        }
+        let len = count as isize;
+        let current = (self.mention_selected.min(count - 1)) as isize;
+        self.mention_selected = (current + delta).rem_euclid(len) as usize;
+    }
+
+    /// Inserts the highlighted `@` candidate into the input buffer and advances the cursor.
+    pub fn accept_selected_mention(&mut self) -> bool {
+        let Some((at_idx, _, matches)) = self.active_mention_matches() else {
+            return false;
+        };
+        let Some(chosen) = matches.get(self.mention_selected).copied() else {
+            return false;
+        };
+        let insert = format!("@{} ", chosen.insert_text);
+        let tail = self.input[self.input_cursor..].to_owned();
+        self.input.truncate(at_idx);
+        self.input.push_str(&insert);
+        self.input_cursor = self.input.len();
+        self.input.push_str(&tail);
+        self.mention_selected = 0;
+        self.mention_dismissed_at = None;
+        true
+    }
+
+    /// Dismisses the `@` popup at the current `@` token position.
+    pub fn dismiss_mention_popup(&mut self) {
+        if let Some((at_idx, _)) = active_mention_query(&self.input, self.input_cursor) {
+            self.mention_dismissed_at = Some(at_idx);
+        }
+    }
+
+    /// Clears `@` dismissal if the cursor is no longer on that `@` token.
+    pub fn sync_mention_dismissal(&mut self) {
+        if let Some(dismissed) = self.mention_dismissed_at {
+            match active_mention_query(&self.input, self.input_cursor) {
+                Some((at_idx, _)) if at_idx == dismissed => {}
+                _ => self.mention_dismissed_at = None,
+            }
+        }
+    }
+
+    // ── /config modal ────────────────────────────────────────────────────────
+
+    /// Opens the interactive `/config` modal.
+    pub fn open_config_modal(&mut self) {
+        self.pending_config_modal = Some(PendingConfigModal {
+            tab: ConfigTab::Settings,
+            search: String::new(),
+            searching: false,
+            selected: 0,
+        });
+    }
+
+    /// Returns the active `/config` modal state.
+    #[must_use]
+    pub fn pending_config_modal(&self) -> Option<&PendingConfigModal> {
+        self.pending_config_modal.as_ref()
+    }
+
+    /// Mutable access to `/config` modal state.
+    pub fn pending_config_modal_mut(&mut self) -> Option<&mut PendingConfigModal> {
+        self.pending_config_modal.as_mut()
+    }
+
+    /// Closes `/config` modal.
+    pub fn close_config_modal(&mut self) {
+        self.pending_config_modal = None;
+    }
+
+    /// Returns filtered setting rows for `/config`.
+    #[must_use]
+    pub fn config_setting_rows(&self) -> Vec<ConfigSettingRow> {
+        let on_off = |b: bool| if b { "on" } else { "off" }.to_owned();
+        let has_override = |k: &str| self.repo_override_keys.iter().any(|r| r == k);
+        let all = vec![
+            ConfigSettingRow {
+                key: "auto_compact",
+                label: "Auto-compact",
+                value: on_off(self.ui_settings.auto_compact),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "thinking_mode",
+                label: "Thinking mode",
+                value: on_off(self.ui_settings.thinking_mode),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "verbose_output",
+                label: "Verbose output",
+                value: on_off(self.ui_settings.verbose_output),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "show_turn_duration",
+                label: "Show turn duration",
+                value: on_off(self.ui_settings.show_turn_duration),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "auto_scroll",
+                label: "Auto-scroll",
+                value: on_off(self.ui_settings.auto_scroll),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "respect_gitignore_picker",
+                label: "Respect .gitignore in file picker",
+                value: on_off(self.ui_settings.respect_gitignore_picker),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "default_permission_mode",
+                label: "Default permission mode",
+                value: self.ui_settings.default_permission_mode.clone(),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "editor_mode",
+                label: "Editor mode",
+                value: self.ui_settings.editor_mode.clone(),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "show_tips",
+                label: "Show tips",
+                value: on_off(self.ui_settings.show_tips),
+                repo_overridden: false,
+            },
+            ConfigSettingRow {
+                key: "model",
+                label: "Model",
+                value: format!("{} >", self.model_name),
+                repo_overridden: has_override("model"),
+            },
+        ];
+        let query = self
+            .pending_config_modal
+            .as_ref()
+            .map(|m| m.search.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if query.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|r| {
+                    r.label.to_ascii_lowercase().contains(&query)
+                        || r.value.to_ascii_lowercase().contains(&query)
+                })
+                .collect()
+        }
+    }
+
+    /// Toggles or cycles the selected `/config` setting and returns `(key, open_model_picker)`.
+    pub fn activate_selected_config_setting(&mut self) -> Option<(&'static str, bool)> {
+        let rows = self.config_setting_rows();
+        let sel = self.pending_config_modal.as_ref()?.selected;
+        let row = rows.get(sel)?;
+        let key = row.key;
+        match key {
+            "auto_compact" => self.ui_settings.auto_compact = !self.ui_settings.auto_compact,
+            "thinking_mode" => self.ui_settings.thinking_mode = !self.ui_settings.thinking_mode,
+            "verbose_output" => {
+                self.ui_settings.verbose_output = !self.ui_settings.verbose_output;
+                self.expand_outputs = self.ui_settings.verbose_output;
+            }
+            "show_turn_duration" => {
+                self.ui_settings.show_turn_duration = !self.ui_settings.show_turn_duration;
+            }
+            "auto_scroll" => {
+                self.ui_settings.auto_scroll = !self.ui_settings.auto_scroll;
+                self.auto_scroll = self.ui_settings.auto_scroll;
+            }
+            "respect_gitignore_picker" => {
+                self.ui_settings.respect_gitignore_picker =
+                    !self.ui_settings.respect_gitignore_picker;
+            }
+            "default_permission_mode" => {
+                self.ui_settings.default_permission_mode =
+                    if self.ui_settings.default_permission_mode == "policy-gated" {
+                        "auto-bypass".to_owned()
+                    } else {
+                        "policy-gated".to_owned()
+                    };
+            }
+            "editor_mode" => {
+                self.ui_settings.editor_mode = if self.ui_settings.editor_mode == "normal" {
+                    "vi".to_owned()
+                } else {
+                    "normal".to_owned()
+                };
+            }
+            "show_tips" => self.ui_settings.show_tips = !self.ui_settings.show_tips,
+            "model" => return Some((key, true)),
+            _ => {}
+        }
+        Some((key, false))
+    }
+
+    // ── /plugins modal ───────────────────────────────────────────────────────
+
+    /// Opens the interactive `/plugins` modal.
+    pub fn open_plugins_modal(&mut self) {
+        self.pending_plugins_modal = Some(PendingPluginsModal {
+            tab: PluginsTab::Discover,
+            search: String::new(),
+            searching: false,
+            adding_marketplace: false,
+            marketplace_input: String::new(),
+            selected: 0,
+            marketplace_filter: None,
+            status_notice: None,
+        });
+    }
+
+    /// Returns the active `/plugins` modal state.
+    #[must_use]
+    pub fn pending_plugins_modal(&self) -> Option<&PendingPluginsModal> {
+        self.pending_plugins_modal.as_ref()
+    }
+
+    /// Mutable access to `/plugins` modal state.
+    pub fn pending_plugins_modal_mut(&mut self) -> Option<&mut PendingPluginsModal> {
+        self.pending_plugins_modal.as_mut()
+    }
+
+    /// Closes `/plugins` modal.
+    pub fn close_plugins_modal(&mut self) {
+        self.pending_plugins_modal = None;
+    }
 }
 
 #[cfg(test)]

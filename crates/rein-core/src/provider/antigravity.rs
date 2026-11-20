@@ -399,19 +399,46 @@ impl AntigravityProvider {
             .map_err(Box::new)
     }
 
-    fn post_stream(
+    fn post_stream_cancellable(
         &self,
         url: &str,
         access_token: &str,
         payload: &str,
-    ) -> Result<ureq::Response, Box<ureq::Error>> {
-        self.agent
-            .post(url)
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .set("Content-Type", "application/json")
-            .set("User-Agent", ANTIGRAVITY_USER_AGENT)
-            .send_string(payload)
-            .map_err(Box::new)
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ureq::Response, Result<Box<ureq::Error>, CoreError>> {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Err(CoreError::Cancelled));
+        }
+        let agent = self.agent.clone();
+        let url_owned = url.to_owned();
+        let token_owned = access_token.to_owned();
+        let payload_owned = payload.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = agent
+                .post(&url_owned)
+                .set("Authorization", &format!("Bearer {token_owned}"))
+                .set("Content-Type", "application/json")
+                .set("User-Agent", ANTIGRAVITY_USER_AGENT)
+                .send_string(&payload_owned)
+                .map_err(Box::new);
+            let _ = tx.send(res);
+        });
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Err(CoreError::Cancelled));
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Err(err)) => return Err(Ok(err)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Err(CoreError::Provider(
+                        "Antigravity HTTP request worker terminated unexpectedly".to_owned(),
+                    )));
+                }
+            }
+        }
     }
 
     fn post_with_refresh(
@@ -419,20 +446,25 @@ impl AntigravityProvider {
         url: &str,
         access_token: &mut String,
         payload: &str,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
         if let Err(err) = validate_antigravity_url(url) {
             return Err((None, false, err));
         }
-        match self.post_stream(url, access_token, payload) {
+        match self.post_stream_cancellable(url, access_token, payload, cancel) {
             Ok(resp) => Ok(resp),
-            Err(err) if matches!(&*err, ureq::Error::Status(401, _)) => {
+            Err(Err(core_err)) => Err((None, false, core_err)),
+            Err(Ok(err)) if matches!(&*err, ureq::Error::Status(401, _)) => {
                 *access_token = self
                     .try_refresh_token()
                     .map_err(|e| (Some(401), false, e))?;
-                self.post_stream(url, access_token, payload)
-                    .map_err(|e| classify_http_error(*e))
+                match self.post_stream_cancellable(url, access_token, payload, cancel) {
+                    Ok(resp) => Ok(resp),
+                    Err(Err(core_err)) => Err((None, false, core_err)),
+                    Err(Ok(e)) => Err(classify_http_error(*e)),
+                }
             }
-            Err(err) => Err(classify_http_error(*err)),
+            Err(Ok(err)) => Err(classify_http_error(*err)),
         }
     }
 
@@ -483,8 +515,9 @@ impl Provider for AntigravityProvider {
         let url = format!("{base}/v1internal:fetchAvailableModels");
         let payload = json!({ "project": project_id }).to_string();
 
+        let never = std::sync::atomic::AtomicBool::new(false);
         let (mut models, mut wire_map) =
-            match self.post_with_refresh(&url, &mut access_token, &payload) {
+            match self.post_with_refresh(&url, &mut access_token, &payload, &never) {
                 Ok(resp) => {
                     let body = resp.into_string().map_err(|err| {
                         CoreError::Provider(format!("Antigravity models read error: {err}"))
@@ -571,6 +604,7 @@ impl Provider for AntigravityProvider {
                 system_prompt,
                 messages,
                 tools,
+                cancel,
             )?
         } else {
             self.stream_v1internal_with_fallback(
@@ -580,6 +614,7 @@ impl Provider for AntigravityProvider {
                 system_prompt,
                 messages,
                 tools,
+                cancel,
             )?
         };
 
@@ -588,6 +623,7 @@ impl Provider for AntigravityProvider {
 }
 
 impl AntigravityProvider {
+    #[allow(clippy::too_many_arguments)]
     fn stream_aicode_with_fallback(
         &mut self,
         ai_base: &str,
@@ -596,8 +632,16 @@ impl AntigravityProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ureq::Response, CoreError> {
-        match self.post_aicode_stream(ai_base, access_token, system_prompt, messages, tools) {
+        match self.post_aicode_stream(
+            ai_base,
+            access_token,
+            system_prompt,
+            messages,
+            tools,
+            cancel,
+        ) {
             Ok(resp) => Ok(resp),
             Err((status, scope_missing, err))
                 if scope_missing || matches!(status, Some(400 | 404)) =>
@@ -608,13 +652,14 @@ impl AntigravityProvider {
                     messages,
                     tools,
                 ))?;
-                self.post_v1internal_with_fallback(access_token, &v1_payload)
+                self.post_v1internal_with_fallback(access_token, &v1_payload, cancel)
                     .or(Err(err))
             }
             Err((_, _, err)) => Err(err),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stream_v1internal_with_fallback(
         &mut self,
         aicode_base: Option<&str>,
@@ -623,6 +668,7 @@ impl AntigravityProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ureq::Response, CoreError> {
         let v1_payload = serde_json::to_string(&self.build_request_body(
             project_id,
@@ -630,14 +676,21 @@ impl AntigravityProvider {
             messages,
             tools,
         ))?;
-        match self.post_v1internal_with_fallback(access_token, &v1_payload) {
+        match self.post_v1internal_with_fallback(access_token, &v1_payload, cancel) {
             Ok(resp) => Ok(resp),
             Err((Some(404), _, err)) if !self.aicode_scope_blocked => {
                 let Some(ai_base) = aicode_base else {
                     return Err(err);
                 };
-                self.post_aicode_stream(ai_base, access_token, system_prompt, messages, tools)
-                    .map_err(|(_, _, ai_err)| ai_err)
+                self.post_aicode_stream(
+                    ai_base,
+                    access_token,
+                    system_prompt,
+                    messages,
+                    tools,
+                    cancel,
+                )
+                .map_err(|(_, _, ai_err)| ai_err)
             }
             Err((_, _, err)) => Err(err),
         }
@@ -650,12 +703,13 @@ impl AntigravityProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
         let ai_payload =
             serde_json::to_string(&self.build_aicode_request_body(system_prompt, messages, tools))
                 .map_err(|err| (None, false, CoreError::from(err)))?;
         let ai_url = format!("{ai_base}/v1alpha:streamGenerateContent?alt=sse");
-        let res = self.post_with_refresh(&ai_url, access_token, &ai_payload);
+        let res = self.post_with_refresh(&ai_url, access_token, &ai_payload, cancel);
         if let Err((_, true, _)) = res {
             self.aicode_scope_blocked = true;
         }
@@ -666,17 +720,18 @@ impl AntigravityProvider {
         &mut self,
         access_token: &mut String,
         payload: &str,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ureq::Response, (Option<u16>, bool, CoreError)> {
         let base = self.config.base_url.trim_end_matches('/');
         let is_default_base = base == DEFAULT_ANTIGRAVITY_BASE_URL;
         let url = format!("{base}/v1internal:streamGenerateContent?alt=sse");
-        match self.post_with_refresh(&url, access_token, payload) {
+        match self.post_with_refresh(&url, access_token, payload, cancel) {
             Ok(resp) => Ok(resp),
             Err((Some(404), _, _)) if is_default_base => {
                 let fallback_url = format!(
                     "{FALLBACK_ANTIGRAVITY_BASE_URL}/v1internal:streamGenerateContent?alt=sse"
                 );
-                self.post_with_refresh(&fallback_url, access_token, payload)
+                self.post_with_refresh(&fallback_url, access_token, payload, cancel)
             }
             Err(other) => Err(other),
         }

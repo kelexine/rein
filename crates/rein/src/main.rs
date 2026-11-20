@@ -25,13 +25,14 @@ use rein::agent::{
     DefineSubagentTool, InvokeSubagentTool, ManageSubagentsTool, SendMessageTool, SubagentEnv,
     SubagentManager, SubagentSessionState, SubagentTracker, SwarmManager, SwarmTool,
 };
-use rein::commands::SlashKind;
+use rein::commands::{CommandSource, SlashCommand, SlashKind};
 use rein::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
-    generate_session_uid, list_sessions, provider_startup_notice, resolve_resume_session,
-    save_provider_selection, write_latest_session_uid,
+    generate_session_uid, list_sessions, provider_startup_notice, read_repo_override_keys,
+    resolve_resume_session, save_provider_selection, write_latest_session_uid,
 };
 use rein::modes::{Profile, RuntimeContext, utc_today_iso};
+use rein::plugins::PluginManager;
 use rein::ui::app::SharedQuestionRelay;
 use rein::ui::{AppState, run_tui};
 
@@ -236,13 +237,29 @@ fn run_interactive(
     }
     todo_store.set_session_uid(&session_uid);
 
-    let slash_registry = rein::commands::load_slash_registry(&loaded.paths)?;
-    let skill_names: Vec<String> = slash_registry
+    let plugin_manager = PluginManager::new(loaded.paths.global_dir.join("plugins"));
+    let plugin_bundle = plugin_manager.collect_enabled_components();
+
+    let mut slash_registry = rein::commands::load_slash_registry(&loaded.paths)?;
+    for cmd in plugin_bundle.commands {
+        slash_registry.register(SlashCommand {
+            name: cmd.name,
+            description: cmd.description,
+            source: CommandSource::Plugin,
+            kind: SlashKind::PluginCommand {
+                template: cmd.template,
+            },
+        });
+    }
+    let mut skill_names: Vec<String> = slash_registry
         .all()
         .iter()
         .filter(|entry| matches!(entry.kind, SlashKind::Skill { .. }))
         .map(|entry| entry.name.clone())
         .collect();
+    for sk in plugin_bundle.skills {
+        skill_names.push(sk.name);
+    }
     let workspace_label = collapse_home_path(workspace_root);
     let runtime_context = RuntimeContext::new()
         .with_workspace_label(&workspace_label)
@@ -335,6 +352,7 @@ fn run_interactive(
         .with_extra_tools(mcp_tools)
         .with_runtime_context(runtime_context);
     let bypass_permissions = agent.policy().is_bypass_permissions();
+    let repo_overrides = read_repo_override_keys(&loaded.paths.repo_config);
     let mut app = AppState::new(agent.active_profile().clone(), sandbox_label, model_label)
         .with_bypass_permissions(bypass_permissions)
         .with_subagent_tracker(subagent_tracker)
@@ -349,7 +367,9 @@ fn run_interactive(
         .with_slash_registry(slash_registry)
         .with_configured_commands(loaded.allowed_commands)
         .with_mcp_servers(loaded.config.mcp_servers.clone())
-        .with_todo_store(todo_store);
+        .with_todo_store(todo_store)
+        .with_ui_settings(loaded.config.settings.clone(), repo_overrides)
+        .with_plugin_manager(plugin_manager);
 
     if should_hydrate {
         app.extend_hydrated(agent.hydrate_structured()?);

@@ -14,11 +14,13 @@ use crate::agent::{format_relative_age, now_unix_secs};
 use crate::commands::SlashCommand;
 use crate::ui::AppState;
 use crate::ui::app::{
-    PendingApproval, PendingModelPicker, PendingQuestion, PendingRewindPicker,
-    PendingSessionPicker, PendingTaskManager, RewindStep, TaskDetailsSnapshot, TaskDetailsView,
-    TaskListEntry, TaskTargetKind, is_model_active, model_vendor_group,
+    ConfigTab, PendingApproval, PendingConfigModal, PendingModelPicker, PendingPluginsModal,
+    PendingQuestion, PendingRewindPicker, PendingSessionPicker, PendingTaskManager, PluginsTab,
+    RewindStep, TaskDetailsSnapshot, TaskDetailsView, TaskListEntry, TaskTargetKind,
+    is_model_active, model_vendor_group,
 };
 use crate::ui::entries::render_transcript_lines;
+use crate::ui::mentions::{MentionCandidate, MentionKind};
 
 const MAX_MENU_ROWS: usize = 6;
 const MAX_MODEL_MENU_ROWS: usize = 10;
@@ -137,6 +139,14 @@ pub fn render_frame(state: &AppState, frame: &mut Frame<'_>) {
         render_rewind_picker(picker, frame, chunks[3]);
     } else if let Some(mgr) = state.pending_task_manager() {
         render_task_manager(mgr, &state.all_task_entries(), frame, chunks[3]);
+    } else if let Some(cfg_modal) = state.pending_config_modal() {
+        render_config_modal(state, cfg_modal, frame, chunks[3]);
+    } else if let Some(plug_modal) = state.pending_plugins_modal() {
+        render_plugins_modal(state, plug_modal, frame, chunks[3]);
+    } else if let Some((_, _, mention_matches)) = state.active_mention_matches()
+        && chunks[3].height > 0
+    {
+        render_mention_menu(&mention_matches, state.mention_selected(), frame, chunks[3]);
     } else if chunks[3].height > 0 {
         render_slash_menu(&matches, state.slash_selected(), frame, chunks[3]);
     }
@@ -192,6 +202,14 @@ fn compute_popup_rows(state: &AppState, slash_count: usize) -> u16 {
     } else if state.pending_task_manager().is_some() {
         let count = state.all_task_entries().len().clamp(1, MAX_MENU_ROWS);
         u16::try_from(count + 1).unwrap_or(2)
+    } else if state.pending_config_modal().is_some() {
+        15
+    } else if state.pending_plugins_modal().is_some() {
+        16
+    } else if let Some((_, _, mention_matches)) = state.active_mention_matches() {
+        let vis = mention_matches.len().min(MAX_MODEL_MENU_ROWS);
+        let extra = usize::from(mention_matches.len() > MAX_MODEL_MENU_ROWS);
+        u16::try_from(vis + extra).unwrap_or(0)
     } else {
         u16::try_from(slash_count.min(MAX_MENU_ROWS)).unwrap_or(0)
     }
@@ -1537,6 +1555,425 @@ fn mode_color(mode: ModeId) -> Color {
         ModeId::Plan => Color::LightMagenta,
         ModeId::Personal => Color::Rgb(115, 210, 125),
     }
+}
+
+fn render_mention_menu(
+    matches: &[&MentionCandidate],
+    selected: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    if area.height == 0 || matches.is_empty() {
+        return;
+    }
+    let max_rows = usize::from(area.height).min(MAX_MODEL_MENU_ROWS);
+    let total = matches.len();
+    let has_more = total > max_rows;
+    let body_rows = if has_more && max_rows > 1 {
+        max_rows - 1
+    } else {
+        max_rows
+    };
+    let start = if selected >= body_rows {
+        (selected + 1 - body_rows).min(total.saturating_sub(body_rows))
+    } else {
+        0
+    };
+    let end = (start + body_rows).min(total);
+    let mut lines = Vec::with_capacity(body_rows + 1);
+
+    for (idx, item) in matches[start..end].iter().enumerate() {
+        let abs = start + idx;
+        let is_sel = abs == selected;
+        let prefix = if is_sel { "> " } else { "  " };
+        let icon = match item.kind {
+            MentionKind::Directory => "+ ",
+            MentionKind::File => "  ",
+            MentionKind::Agent => "* ",
+            MentionKind::Plugin | MentionKind::Mcp => "+ ",
+        };
+        let label_style = if is_sel {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if item.kind == MentionKind::Agent {
+            Style::default().fg(Color::LightMagenta)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans = vec![
+            Span::styled(prefix, label_style),
+            Span::styled(icon, Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<32}", item.label), label_style),
+        ];
+        if !item.description.is_empty() && item.kind != MentionKind::File {
+            spans.push(Span::styled(
+                format!(" {}", item.description),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if has_more && total > end {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more", total - end),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_config_modal(
+    state: &AppState,
+    modal: &PendingConfigModal,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let mut tab_spans = vec![Span::styled(
+        "Config  ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for tab in ConfigTab::ALL {
+        let active = tab == modal.tab;
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        tab_spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        tab_spans.push(Span::raw(" "));
+    }
+    let mut lines = vec![Line::from(tab_spans)];
+
+    match modal.tab {
+        ConfigTab::Settings | ConfigTab::Config => {
+            let search_label = if modal.searching {
+                format!("> Search settings: {}_", modal.search)
+            } else if modal.search.is_empty() {
+                "  / Search settings...".to_owned()
+            } else {
+                format!("  Filter: {} (/ to edit)", modal.search)
+            };
+            lines.push(Line::from(Span::styled(
+                search_label,
+                Style::default().fg(if modal.searching {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            )));
+            let rows = state.config_setting_rows();
+            let visible_cap = usize::from(area.height).saturating_sub(3).max(1);
+            let start = if modal.selected >= visible_cap {
+                modal.selected + 1 - visible_cap
+            } else {
+                0
+            };
+            for (idx, row) in rows.iter().skip(start).take(visible_cap).enumerate() {
+                let abs = start + idx;
+                let is_sel = abs == modal.selected;
+                let marker = if is_sel { "> " } else { "  " };
+                let key_style = if is_sel {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let mut spans = vec![
+                    Span::styled(marker, key_style),
+                    Span::styled(format!("{:<38}", row.label), key_style),
+                    Span::styled(row.value.clone(), Style::default().fg(Color::Yellow)),
+                ];
+                if row.repo_overridden {
+                    spans.push(Span::styled(
+                        "  [repo override]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            if rows.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (no matching settings)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        ConfigTab::Status => {
+            let overrides = if state.repo_override_keys().is_empty() {
+                "none".to_owned()
+            } else {
+                state.repo_override_keys().join(", ")
+            };
+            for (k, v) in [
+                ("Session", state.session_id().to_owned()),
+                ("Workspace", state.workspace_label().to_owned()),
+                ("Model", state.model_name().to_owned()),
+                ("Mode", mode_name(state.active_profile().mode).to_owned()),
+                ("Sandbox", state.sandbox_summary().to_owned()),
+                (
+                    "Global config",
+                    "~/.rein/config.json (default write target)".to_owned(),
+                ),
+                ("Repo overrides", overrides),
+            ] {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<18}", k), Style::default().fg(Color::Gray)),
+                    Span::styled(v, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        ConfigTab::Usage => {
+            let u = state.usage_totals();
+            let quota = state
+                .model_quota()
+                .map_or_else(|| "n/a".to_owned(), |q| format!("{q}% remaining"));
+            for (k, v) in [
+                ("Input tokens", u.input_tokens.to_string()),
+                ("Output tokens", u.output_tokens.to_string()),
+                (
+                    "Total tokens",
+                    (u.input_tokens + u.output_tokens).to_string(),
+                ),
+                ("Model quota", quota),
+                ("Active tasks", state.all_task_entries().len().to_string()),
+            ] {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<18}", k), Style::default().fg(Color::Gray)),
+                    Span::styled(v, Style::default().fg(Color::Cyan)),
+                ]));
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  [↑/↓ navigate · ←/→ tabs · Space/Enter toggle · / search · Esc close]",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_plugins_modal(
+    state: &AppState,
+    modal: &PendingPluginsModal,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let mut tab_spans = vec![Span::styled(
+        "Plugins  ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for tab in PluginsTab::ALL {
+        let active = tab == modal.tab;
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        tab_spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        tab_spans.push(Span::raw(" "));
+    }
+    let mut lines = vec![Line::from(tab_spans)];
+
+    if modal.adding_marketplace {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "> Add marketplace (owner/repo or git URL): {}_",
+                modal.marketplace_input
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        let search_line = if modal.searching {
+            format!("> Search plugins: {}_", modal.search)
+        } else if modal.search.is_empty() {
+            "  / Search plugins...".to_owned()
+        } else {
+            format!("  Filter: {} (/ to edit)", modal.search)
+        };
+        lines.push(Line::from(Span::styled(
+            search_line,
+            Style::default().fg(if modal.searching {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )));
+    }
+
+    if let Some(notice) = &modal.status_notice {
+        lines.push(Line::from(Span::styled(
+            format!("  {notice}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let visible_cap = usize::from(area.height)
+        .saturating_sub(lines.len() + 1)
+        .max(1);
+    let q = modal.search.trim().to_ascii_lowercase();
+
+    if let Some(pm) = state.plugin_manager() {
+        match modal.tab {
+            PluginsTab::Discover => {
+                let mut catalog = pm.discover_catalog(modal.marketplace_filter.as_deref());
+                if !q.is_empty() {
+                    catalog.retain(|p| {
+                        p.name.to_ascii_lowercase().contains(&q)
+                            || p.description.to_ascii_lowercase().contains(&q)
+                    });
+                }
+                if catalog.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  No cached marketplace plugins yet — press 'r' to git-clone/sync marketplace.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    let start = if modal.selected >= visible_cap {
+                        modal.selected + 1 - visible_cap
+                    } else {
+                        0
+                    };
+                    for (idx, p) in catalog.iter().skip(start).take(visible_cap).enumerate() {
+                        let abs = start + idx;
+                        let is_sel = abs == modal.selected;
+                        let check = if p.installed {
+                            if p.enabled { "[x]" } else { "[-]" }
+                        } else {
+                            "[ ]"
+                        };
+                        let marker = if is_sel { "> " } else { "  " };
+                        let style = if is_sel {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{marker}{check} "), style),
+                            Span::styled(format!("{:<24}", p.name), style),
+                            Span::styled(
+                                format!(" {}  ", p.marketplace),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(p.description.clone(), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
+            }
+            PluginsTab::Installed => {
+                let mut inst = pm.installed_plugins();
+                if !q.is_empty() {
+                    inst.retain(|p| {
+                        p.name.to_ascii_lowercase().contains(&q)
+                            || p.description.to_ascii_lowercase().contains(&q)
+                    });
+                }
+                if inst.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  No plugins installed. Switch to Discover and press Enter/Space.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    let start = if modal.selected >= visible_cap {
+                        modal.selected + 1 - visible_cap
+                    } else {
+                        0
+                    };
+                    for (idx, p) in inst.iter().skip(start).take(visible_cap).enumerate() {
+                        let abs = start + idx;
+                        let is_sel = abs == modal.selected;
+                        let check = if p.enabled { "[on]" } else { "[off]" };
+                        let marker = if is_sel { "> " } else { "  " };
+                        let style = if is_sel {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{marker}{check} "), style),
+                            Span::styled(format!("{:<24}", p.name), style),
+                            Span::styled(
+                                format!(" {}  ", p.marketplace),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(p.description.clone(), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
+            }
+            PluginsTab::Marketplaces => {
+                let mps = pm.list_marketplaces();
+                for (idx, mp) in mps.iter().take(visible_cap).enumerate() {
+                    let is_sel = idx == modal.selected;
+                    let marker = if is_sel { "> " } else { "  " };
+                    let style = if is_sel {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let synced = if mp.last_synced_secs == 0 {
+                        "not synced".to_owned()
+                    } else {
+                        format!(
+                            "synced {}",
+                            format_relative_age(mp.last_synced_secs, now_unix_secs())
+                        )
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::styled(format!("{:<26}", mp.name), style),
+                        Span::styled(format!("{synced:<16}"), Style::default().fg(Color::Yellow)),
+                        Span::styled(mp.url.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+            PluginsTab::Errors => {
+                let bundle = pm.collect_enabled_components();
+                if bundle.errors.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  No plugin load errors.",
+                        Style::default().fg(Color::Green),
+                    )));
+                } else {
+                    for err in bundle.errors.iter().take(visible_cap) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  ! {err}"),
+                            Style::default().fg(Color::Red),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  [↑/↓ nav · ←/→ tabs · Space/Enter install/toggle · r git sync · a add repo · x remove · / search · Esc close]",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]

@@ -10,6 +10,8 @@ pub mod entries;
 pub mod highlight;
 /// Markdown parser and styled terminal line renderer.
 pub mod markdown;
+/// `@` mention autocomplete (CWD files, agents, plugins, MCP) and prompt resolution.
+pub mod mentions;
 /// Raw terminal RAII guard and interactive event loop.
 pub mod terminal;
 /// Ratatui layout and frame renderer.

@@ -546,6 +546,49 @@ pub struct ReinConfig {
     /// Optional background AutoDream memory consolidation settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dream: Option<DreamConfig>,
+    /// Interactive UI and runtime preferences managed via `/config`.
+    #[serde(default)]
+    pub settings: UiSettings,
+}
+
+/// Interactive UI & runtime preferences persisted in `~/.rein/config.json` via `/config`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Automatically compact long conversation histories.
+    pub auto_compact: bool,
+    /// Enable extended thinking / reasoning tokens when supported by the model.
+    pub thinking_mode: bool,
+    /// Expand tool output blocks by default in the transcript.
+    pub verbose_output: bool,
+    /// Show elapsed duration on completed turns.
+    pub show_turn_duration: bool,
+    /// Automatically scroll transcript to bottom on new output.
+    pub auto_scroll: bool,
+    /// Respect `.gitignore` rules inside the `@` file picker.
+    pub respect_gitignore_picker: bool,
+    /// Default permission policy (`"policy-gated"` or `"auto-bypass"`).
+    pub default_permission_mode: String,
+    /// Input editor mode (`"normal"` or `"vi"`).
+    pub editor_mode: String,
+    /// Show contextual hints in the footer/empty state.
+    pub show_tips: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            auto_compact: true,
+            thinking_mode: true,
+            verbose_output: false,
+            show_turn_duration: true,
+            auto_scroll: true,
+            respect_gitignore_picker: true,
+            default_permission_mode: "policy-gated".to_owned(),
+            editor_mode: "normal".to_owned(),
+            show_tips: true,
+        }
+    }
 }
 
 impl ReinConfig {
@@ -577,6 +620,7 @@ impl ReinConfig {
             maildir: self.maildir.clone(),
             mcp_servers: self.mcp_servers.clone(),
             dream: repo.dream.clone().or_else(|| self.dream.clone()),
+            settings: self.settings.clone(),
         }
     }
 
@@ -656,6 +700,34 @@ pub fn save_provider_selection(
     std::fs::write(config_path, format!("{encoded}\n"))
         .with_context(|| format!("failed to write config '{}'", config_path.display()))?;
     Ok(())
+}
+
+/// Persists [`UiSettings`] into the global `config.json` (`~/.rein/config.json`).
+pub fn save_global_settings(config_path: &Path, settings: &UiSettings) -> Result<()> {
+    let mut cfg: ReinConfig = if config_path.exists() {
+        read_json_file(config_path)?
+    } else {
+        ReinConfig::global_starter()
+    };
+    cfg.settings = settings.clone();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config dir '{}'", parent.display()))?;
+    }
+    let encoded = serde_json::to_string_pretty(&cfg).context("failed to serialize config JSON")?;
+    std::fs::write(config_path, format!("{encoded}\n"))
+        .with_context(|| format!("failed to write config '{}'", config_path.display()))?;
+    Ok(())
+}
+
+/// Returns top-level keys explicitly present in `<workspace>/.rein/config.json`.
+#[must_use]
+pub fn read_repo_override_keys(repo_config_path: &Path) -> Vec<String> {
+    std::fs::read_to_string(repo_config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()))
+        .unwrap_or_default()
 }
 
 /// Instantiates the active [`Provider`] and status-bar display label (`<provider>/<model>`).

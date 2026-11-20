@@ -13,16 +13,19 @@ pub enum CommandSource {
     User,
     /// Loaded from `<workspace>/.rein/skills/`.
     Repo,
+    /// Loaded from an enabled plugin under `~/.rein/plugins/`.
+    Plugin,
 }
 
 impl CommandSource {
-    /// Returns the short menu badge (`user` or `repo`) for skills.
+    /// Returns the short menu badge (`user`, `repo`, or `plugin`) for skills/plugins.
     #[must_use]
     pub fn badge(self) -> Option<&'static str> {
         match self {
             Self::Builtin => None,
             Self::User => Some("user"),
             Self::Repo => Some("repo"),
+            Self::Plugin => Some("plugin"),
         }
     }
 }
@@ -56,6 +59,10 @@ pub enum BuiltinAction {
     Rewind,
     /// Opens the interactive `/tasks` manager to inspect, kill (`k`), or delete (`x`) tasks and subagents.
     Tasks,
+    /// Opens the interactive `/config` settings and status modal.
+    Config,
+    /// Opens the interactive `/plugins` marketplace and installed-plugin manager.
+    Plugins,
     /// Exits Rein cleanly.
     Quit,
 }
@@ -69,6 +76,11 @@ pub enum SlashKind {
     Skill {
         /// Path to the skill's `SKILL.md` file.
         skill_md_path: PathBuf,
+    },
+    /// Prompt-template command loaded from an enabled plugin's `commands/*.md`.
+    PluginCommand {
+        /// Markdown prompt template body.
+        template: String,
     },
 }
 
@@ -102,6 +114,13 @@ impl SlashCommand {
                     Some(base)
                 } else {
                     Some(format!("{base}\n\nTask: {trimmed}"))
+                }
+            }
+            SlashKind::PluginCommand { template } => {
+                if trimmed.is_empty() {
+                    Some(template.clone())
+                } else {
+                    Some(format!("{template}\n\nArguments: {trimmed}"))
                 }
             }
         }
@@ -205,6 +224,16 @@ impl SlashRegistry {
                 BuiltinAction::Tasks,
             ),
             builtin(
+                "config",
+                "Manage settings, status, and runtime preferences",
+                BuiltinAction::Config,
+            ),
+            builtin(
+                "plugins",
+                "Discover, install, and manage plugins & marketplaces",
+                BuiltinAction::Plugins,
+            ),
+            builtin(
                 "exit",
                 "Exit Rein (or press Ctrl+C twice within 2s)",
                 BuiltinAction::Quit,
@@ -264,6 +293,7 @@ impl SlashRegistry {
         let lookup = match raw_name {
             "quit" => "exit",
             "task" => "tasks",
+            "plugin" => "plugins",
             other => other,
         };
 

@@ -161,6 +161,15 @@ impl SubagentManager {
         Ok(format!("delivered message to {recipient}"))
     }
 
+    /// Returns all custom [`SubagentDefinition`] entries registered in this session.
+    #[must_use]
+    pub fn list_definitions(&self) -> Vec<SubagentDefinition> {
+        self.inner
+            .lock()
+            .map(|g| g.definitions.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Lists all tracked async subagents and their current states.
     #[must_use]
     pub fn list(&self) -> Vec<Value> {

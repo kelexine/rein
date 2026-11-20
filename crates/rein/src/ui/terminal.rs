@@ -27,15 +27,16 @@ use rein_tools::TaskNotification;
 use crate::agent::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
 };
-use crate::commands::{BuiltinAction, SlashKind, SlashResolution};
+use crate::commands::{BuiltinAction, CommandSource, SlashCommand, SlashKind, SlashResolution};
 use crate::config::{
     ProviderKind, ReinConfig, ReinPaths, apply_provider_switch, build_provider,
-    generate_session_uid, list_sessions, resolve_model_target, save_provider_selection,
-    write_latest_session_uid,
+    generate_session_uid, list_sessions, resolve_model_target, save_global_settings,
+    save_provider_selection, write_latest_session_uid,
 };
 use crate::memory::AutoDreamCoordinator;
 use crate::modes::Profile;
-use crate::ui::app::QuestionPromptRequest;
+use crate::ui::app::{ConfigTab, PluginsTab, QuestionPromptRequest};
+use crate::ui::mentions::resolve_mentions_for_prompt;
 use crate::ui::view::{compute_max_scroll, transcript_viewport};
 use crate::ui::{AppState, render_frame};
 
@@ -217,6 +218,12 @@ fn handle_idle_key(
     if app.pending_rewind_picker().is_some() {
         return handle_rewind_picker_key(key, agent, app);
     }
+    if app.pending_config_modal().is_some() {
+        return handle_config_modal_key(key, provider, config, paths, app, guard);
+    }
+    if app.pending_plugins_modal().is_some() {
+        return handle_plugins_modal_key(key, app, guard);
+    }
     if app.strip_selected().is_some() {
         match key.code {
             KeyCode::Up => {
@@ -240,7 +247,11 @@ fn handle_idle_key(
             }
         }
     }
+    let mention_open = app.active_mention_matches().is_some();
     if key.code == KeyCode::Esc {
+        if mention_open {
+            app.dismiss_mention_popup();
+        }
         return Ok(false);
     }
 
@@ -250,6 +261,9 @@ fn handle_idle_key(
         return Ok(false);
     }
     match key.code {
+        KeyCode::Tab if mention_open => {
+            let _ = app.accept_selected_mention();
+        }
         KeyCode::Tab if slash_open => {
             if let Some(sel) = app.selected_slash() {
                 let completed = format!("/{} ", sel.name);
@@ -264,6 +278,8 @@ fn handle_idle_key(
             let _ = agent.toggle_mode()?;
             app.set_active_profile(agent.active_profile().clone());
         }
+        KeyCode::Up if mention_open => app.move_mention_selection(-1),
+        KeyCode::Down if mention_open => app.move_mention_selection(1),
         KeyCode::Up if slash_open => app.move_slash_selection(-1),
         KeyCode::Down if slash_open => app.move_slash_selection(1),
         KeyCode::Up => {
@@ -282,15 +298,36 @@ fn handle_idle_key(
                 }
             }
         }
-        KeyCode::Left => app.move_cursor_left(),
-        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Left => {
+            app.move_cursor_left();
+            app.sync_mention_dismissal();
+        }
+        KeyCode::Right => {
+            app.move_cursor_right();
+            app.sync_mention_dismissal();
+        }
         KeyCode::Home => app.move_cursor_home(),
         KeyCode::End => app.move_cursor_end(),
         KeyCode::PageUp => scroll_page(app, guard, -1)?,
         KeyCode::PageDown => scroll_page(app, guard, 1)?,
-        KeyCode::Backspace => app.pop_input_char(),
-        KeyCode::Delete => app.delete_input_char(),
-        KeyCode::Char(c) => app.push_input_char(c),
+        KeyCode::Backspace => {
+            app.pop_input_char();
+            app.sync_mention_dismissal();
+        }
+        KeyCode::Delete => {
+            app.delete_input_char();
+            app.sync_mention_dismissal();
+        }
+        KeyCode::Char(c) => {
+            app.push_input_char(c);
+            if c == '@' {
+                app.refresh_mention_candidates(agent.policy().sandbox().root());
+            }
+            app.sync_mention_dismissal();
+        }
+        KeyCode::Enter if mention_open => {
+            let _ = app.accept_selected_mention();
+        }
         KeyCode::Enter => return handle_enter(agent, provider, config, paths, app, guard),
         _ => {}
     }
@@ -422,9 +459,10 @@ fn handle_enter(
         return dispatch_slash(trimmed, agent, provider, config, paths, app, guard);
     }
     app.task_registry().notify_external_event("user");
+    let prompt_for_model = resolve_mentions_for_prompt(trimmed, agent.policy().sandbox().root());
     stream_prompt_background(
         trimmed.to_owned(),
-        trimmed.to_owned(),
+        prompt_for_model,
         agent,
         provider.as_mut(),
         app,
@@ -451,7 +489,7 @@ fn dispatch_slash(
             SlashKind::Builtin(action) => {
                 run_builtin_action(*action, &args, agent, provider, config, paths, app, guard)
             }
-            SlashKind::Skill { .. } => {
+            SlashKind::Skill { .. } | SlashKind::PluginCommand { .. } => {
                 let prompt = command
                     .expand_skill_prompt(&args)
                     .unwrap_or_else(|| raw.to_owned());
@@ -562,6 +600,8 @@ fn run_builtin_action(
             }
         }
         BuiltinAction::Tasks => app.open_task_manager(),
+        BuiltinAction::Config => app.open_config_modal(),
+        BuiltinAction::Plugins => app.open_plugins_modal(),
     }
     Ok(false)
 }
@@ -1131,8 +1171,7 @@ fn handle_streaming_key(
     }
 
     if key.code == KeyCode::Esc {
-        cancel.store(true, Ordering::Relaxed);
-        app.subagent_tracker().cancel_all();
+        cancel.store(true, Ordering::Release);
         app.set_busy_status("Stopping…");
         return false;
     }
@@ -1338,4 +1377,449 @@ fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
         sections.join("\n\n")
     );
     Some((display, prompt_for_model))
+}
+
+fn handle_config_modal_key(
+    key: KeyEvent,
+    provider: &mut Box<dyn Provider>,
+    config: &mut ReinConfig,
+    paths: &ReinPaths,
+    app: &mut AppState,
+    guard: &mut TerminalGuard,
+) -> Result<bool> {
+    let searching = app.pending_config_modal().is_some_and(|m| m.searching);
+    if searching {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                if let Some(m) = app.pending_config_modal_mut() {
+                    m.searching = false;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(m) = app.pending_config_modal_mut() {
+                    m.search.pop();
+                    m.selected = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(m) = app.pending_config_modal_mut() {
+                    m.search.push(c);
+                    m.selected = 0;
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_config_modal(),
+        KeyCode::Char('/') => {
+            if let Some(m) = app.pending_config_modal_mut() {
+                m.searching = true;
+            }
+        }
+        KeyCode::Left | KeyCode::BackTab => {
+            if let Some(m) = app.pending_config_modal_mut() {
+                let idx = ConfigTab::ALL.iter().position(|&t| t == m.tab).unwrap_or(0);
+                let prev = (idx + ConfigTab::ALL.len() - 1) % ConfigTab::ALL.len();
+                m.tab = ConfigTab::ALL[prev];
+                m.selected = 0;
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if let Some(m) = app.pending_config_modal_mut() {
+                let idx = ConfigTab::ALL.iter().position(|&t| t == m.tab).unwrap_or(0);
+                let next = (idx + 1) % ConfigTab::ALL.len();
+                m.tab = ConfigTab::ALL[next];
+                m.selected = 0;
+            }
+        }
+        KeyCode::Up => {
+            let count = app.config_setting_rows().len();
+            if let Some(m) = app.pending_config_modal_mut()
+                && count > 0
+            {
+                m.selected = (m.selected + count - 1) % count;
+            }
+        }
+        KeyCode::Down => {
+            let count = app.config_setting_rows().len();
+            if let Some(m) = app.pending_config_modal_mut()
+                && count > 0
+            {
+                m.selected = (m.selected + 1) % count;
+            }
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            if let Some(m) = app.pending_config_modal()
+                && matches!(m.tab, ConfigTab::Settings | ConfigTab::Config)
+                && let Some((_, open_model)) = app.activate_selected_config_setting()
+            {
+                if open_model {
+                    app.close_config_modal();
+                    return run_model_command("", provider, config, paths, app, guard);
+                }
+                config.settings = app.ui_settings().clone();
+                if let Err(err) = save_global_settings(&paths.global_config, &config.settings) {
+                    app.push_error_note(format!("failed to save global settings: {err}"));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_plugins_modal_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    guard: &mut TerminalGuard,
+) -> Result<bool> {
+    let (searching, adding) = app
+        .pending_plugins_modal()
+        .map_or((false, false), |m| (m.searching, m.adding_marketplace));
+
+    if adding {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.adding_marketplace = false;
+                    m.marketplace_input.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.marketplace_input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.marketplace_input.push(c);
+                }
+            }
+            KeyCode::Enter => {
+                let spec = app
+                    .pending_plugins_modal()
+                    .map(|m| m.marketplace_input.trim().to_owned())
+                    .unwrap_or_default();
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.adding_marketplace = false;
+                    m.marketplace_input.clear();
+                }
+                if !spec.is_empty()
+                    && let Some(pm) = app.plugin_manager().cloned()
+                {
+                    let notice = match pm.add_marketplace(&spec) {
+                        Ok(mp) => format!("added marketplace '{}' ({})", mp.name, mp.url),
+                        Err(e) => format!("add failed: {e}"),
+                    };
+                    if let Some(m) = app.pending_plugins_modal_mut() {
+                        m.status_notice = Some(notice);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if searching {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.searching = false;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.search.pop();
+                    m.selected = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.search.push(c);
+                    m.selected = 0;
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let Some(pm) = app.plugin_manager().cloned() {
+            let names: Vec<String> = pm.list_marketplaces().into_iter().map(|m| m.name).collect();
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                m.marketplace_filter = match &m.marketplace_filter {
+                    None => names.first().cloned(),
+                    Some(cur) => {
+                        let idx = names.iter().position(|n| n == cur).unwrap_or(0);
+                        names.get(idx + 1).cloned()
+                    }
+                };
+                m.selected = 0;
+            }
+        }
+        return Ok(false);
+    }
+
+    let Some(pm) = app.plugin_manager().cloned() else {
+        if key.code == KeyCode::Esc {
+            app.close_plugins_modal();
+        }
+        return Ok(false);
+    };
+
+    let tab = app
+        .pending_plugins_modal()
+        .map_or(PluginsTab::Discover, |m| m.tab);
+    let q = app
+        .pending_plugins_modal()
+        .map(|m| m.search.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mp_filter = app
+        .pending_plugins_modal()
+        .and_then(|m| m.marketplace_filter.clone());
+
+    let item_count = match tab {
+        PluginsTab::Discover => pm
+            .discover_catalog(mp_filter.as_deref())
+            .into_iter()
+            .filter(|p| {
+                q.is_empty()
+                    || p.name.to_ascii_lowercase().contains(&q)
+                    || p.description.to_ascii_lowercase().contains(&q)
+            })
+            .count(),
+        PluginsTab::Installed => pm
+            .installed_plugins()
+            .into_iter()
+            .filter(|p| {
+                q.is_empty()
+                    || p.name.to_ascii_lowercase().contains(&q)
+                    || p.description.to_ascii_lowercase().contains(&q)
+            })
+            .count(),
+        PluginsTab::Marketplaces => pm.list_marketplaces().len(),
+        PluginsTab::Errors => pm.collect_enabled_components().errors.len(),
+    };
+
+    match key.code {
+        KeyCode::Esc => app.close_plugins_modal(),
+        KeyCode::Char('/') => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                m.searching = true;
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                m.adding_marketplace = true;
+                m.marketplace_input.clear();
+            }
+        }
+        KeyCode::Left | KeyCode::BackTab => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                let idx = PluginsTab::ALL
+                    .iter()
+                    .position(|&t| t == m.tab)
+                    .unwrap_or(0);
+                m.tab = PluginsTab::ALL[(idx + PluginsTab::ALL.len() - 1) % PluginsTab::ALL.len()];
+                m.selected = 0;
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                let idx = PluginsTab::ALL
+                    .iter()
+                    .position(|&t| t == m.tab)
+                    .unwrap_or(0);
+                m.tab = PluginsTab::ALL[(idx + 1) % PluginsTab::ALL.len()];
+                m.selected = 0;
+            }
+        }
+        KeyCode::Up if item_count > 0 => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                m.selected = (m.selected + item_count - 1) % item_count;
+            }
+        }
+        KeyCode::Down if item_count > 0 => {
+            if let Some(m) = app.pending_plugins_modal_mut() {
+                m.selected = (m.selected + 1) % item_count;
+            }
+        }
+        KeyCode::Char('r') => {
+            let target_mp = if tab == PluginsTab::Marketplaces {
+                let sel = app.pending_plugins_modal().map_or(0, |m| m.selected);
+                pm.list_marketplaces().get(sel).map(|m| m.name.clone())
+            } else {
+                mp_filter.or_else(|| pm.list_marketplaces().first().map(|m| m.name.clone()))
+            };
+            if let Some(mp_name) = target_mp {
+                app.set_busy_status(format!("git syncing {mp_name}…"));
+                app.set_busy(true);
+                guard.terminal.draw(|f| render_frame(app, f))?;
+                let notice = match pm.refresh_marketplace(&mp_name) {
+                    Ok(n) => format!("synced '{mp_name}' ({n} plugins indexed)"),
+                    Err(e) => format!("git sync failed: {e}"),
+                };
+                app.set_busy(false);
+                if let Some(m) = app.pending_plugins_modal_mut() {
+                    m.status_notice = Some(notice);
+                }
+            }
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            let sel = app.pending_plugins_modal().map_or(0, |m| m.selected);
+            let mut reload_cmds = false;
+            let notice = match tab {
+                PluginsTab::Discover => {
+                    let catalog: Vec<_> = pm
+                        .discover_catalog(mp_filter.as_deref())
+                        .into_iter()
+                        .filter(|p| {
+                            q.is_empty()
+                                || p.name.to_ascii_lowercase().contains(&q)
+                                || p.description.to_ascii_lowercase().contains(&q)
+                        })
+                        .collect();
+                    if let Some(entry) = catalog.get(sel) {
+                        if entry.installed {
+                            match pm.toggle_plugin_enabled(&entry.name) {
+                                Ok(en) => {
+                                    reload_cmds = true;
+                                    format!(
+                                        "{} {}",
+                                        entry.name,
+                                        if en { "enabled" } else { "disabled" }
+                                    )
+                                }
+                                Err(e) => e,
+                            }
+                        } else {
+                            app.set_busy_status(format!("Installing {} via git…", entry.name));
+                            app.set_busy(true);
+                            guard.terminal.draw(|f| render_frame(app, f))?;
+                            let res = pm.install_plugin(entry);
+                            app.set_busy(false);
+                            match res {
+                                Ok(rec) => {
+                                    reload_cmds = true;
+                                    format!(
+                                        "installed '{}' (restart or use commands/agents)",
+                                        rec.name
+                                    )
+                                }
+                                Err(e) => format!("install failed: {e}"),
+                            }
+                        }
+                    } else {
+                        "no plugin selected".to_owned()
+                    }
+                }
+                PluginsTab::Installed => {
+                    let inst: Vec<_> = pm
+                        .installed_plugins()
+                        .into_iter()
+                        .filter(|p| {
+                            q.is_empty()
+                                || p.name.to_ascii_lowercase().contains(&q)
+                                || p.description.to_ascii_lowercase().contains(&q)
+                        })
+                        .collect();
+                    if let Some(rec) = inst.get(sel) {
+                        match pm.toggle_plugin_enabled(&rec.name) {
+                            Ok(en) => {
+                                reload_cmds = true;
+                                format!("{} {}", rec.name, if en { "enabled" } else { "disabled" })
+                            }
+                            Err(e) => e,
+                        }
+                    } else {
+                        "no plugin selected".to_owned()
+                    }
+                }
+                PluginsTab::Marketplaces => {
+                    if let Some(mp) = pm.list_marketplaces().get(sel) {
+                        app.set_busy_status(format!("git syncing {}…", mp.name));
+                        app.set_busy(true);
+                        guard.terminal.draw(|f| render_frame(app, f))?;
+                        let res = pm.refresh_marketplace(&mp.name);
+                        app.set_busy(false);
+                        match res {
+                            Ok(n) => format!("synced '{}' ({n} plugins)", mp.name),
+                            Err(e) => format!("git sync failed: {e}"),
+                        }
+                    } else {
+                        "no marketplace selected".to_owned()
+                    }
+                }
+                PluginsTab::Errors => String::new(),
+            };
+            if reload_cmds {
+                let bundle = pm.collect_enabled_components();
+                let mut reg = app.slash_registry().clone();
+                for cmd in bundle.commands {
+                    reg.register(SlashCommand {
+                        name: cmd.name,
+                        description: cmd.description,
+                        source: CommandSource::Plugin,
+                        kind: SlashKind::PluginCommand {
+                            template: cmd.template,
+                        },
+                    });
+                }
+                app.set_slash_registry(reg);
+            }
+            if !notice.is_empty()
+                && let Some(m) = app.pending_plugins_modal_mut()
+            {
+                m.status_notice = Some(notice);
+            }
+        }
+        KeyCode::Char('x') => {
+            let sel = app.pending_plugins_modal().map_or(0, |m| m.selected);
+            let notice = match tab {
+                PluginsTab::Installed => {
+                    let inst: Vec<_> = pm
+                        .installed_plugins()
+                        .into_iter()
+                        .filter(|p| {
+                            q.is_empty()
+                                || p.name.to_ascii_lowercase().contains(&q)
+                                || p.description.to_ascii_lowercase().contains(&q)
+                        })
+                        .collect();
+                    if let Some(rec) = inst.get(sel) {
+                        match pm.uninstall_plugin(&rec.name) {
+                            Ok(()) => format!("uninstalled '{}'", rec.name),
+                            Err(e) => e,
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+                PluginsTab::Marketplaces => {
+                    if let Some(mp) = pm.list_marketplaces().get(sel) {
+                        match pm.remove_marketplace(&mp.name) {
+                            Ok(()) => format!("removed marketplace '{}'", mp.name),
+                            Err(e) => e,
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            };
+            if !notice.is_empty()
+                && let Some(m) = app.pending_plugins_modal_mut()
+            {
+                m.status_notice = Some(notice);
+                m.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
 }
