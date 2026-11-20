@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// `ReadOnly < WorkspaceWrite < OutsideWrite < Network < Exec < Unknown`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EffectLevel {
-    /// Pure read-only inspection; runs directly in a read-only Landlock sandbox.
+    /// Pure read-only inspection; auto-allowed inside the workspace boundary.
     ReadOnly,
     /// Writes, modifies, or deletes files inside the workspace boundary.
     WorkspaceWrite,

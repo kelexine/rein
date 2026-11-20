@@ -3,7 +3,7 @@
 // Purpose: Public exports for policy engine, classifier, capabilities, sandbox, and JSONL audit log
 
 //! Sandbox-first capability, permission engine, command classifier, and JSONL audit layer for Rein.
-// Crate-wide unsafe prohibition; `sandbox::linux` is the sole `#[allow(unsafe_code)]` FFI module for Landlock/prctl syscalls.
+// Crate-wide unsafe prohibition; `sandbox::linux` is the sole `#[allow(unsafe_code)]` FFI module for POSIX process-group, prctl, and local-time syscalls.
 #![deny(unsafe_code)]
 
 /// Append-only JSONL audit logging.
@@ -14,7 +14,7 @@ pub mod capability;
 pub mod classifier;
 /// Policy evaluation engine and rule sets.
 pub mod engine;
-/// Workspace path confinement and kernel Landlock sandbox boundary.
+/// Workspace path confinement and process-group execution helpers.
 pub mod sandbox;
 
 pub use audit::{AuditEntry, AuditLog};

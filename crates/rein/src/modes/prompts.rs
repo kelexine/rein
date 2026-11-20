@@ -14,7 +14,7 @@ use crate::modes::Profile;
 pub struct RuntimeContext {
     /// Collapsed or full workspace root path label.
     pub workspace_label: String,
-    /// Active Landlock or fallback sandbox status string.
+    /// Active sandbox execution status string (`policy-gated`, `sandbox off`, etc.).
     pub sandbox_label: String,
     /// Optional YYYY-MM-DD date string for temporal grounding.
     pub current_date: Option<String>,

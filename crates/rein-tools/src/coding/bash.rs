@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Classifier-driven BashTool executing commands inside a Landlock sandbox with streamed output files
+// Purpose: Classifier-driven BashTool executing policy-gated commands with streamed output files
 
 use std::path::PathBuf;
 

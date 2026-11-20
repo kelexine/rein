@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use rein_core::{EventLog, ModeId, Provider, ToolCall, ToolOutput};
+use rein_core::{EventLog, Message, ModeId, Provider, ToolCall, ToolOutput};
 use rein_policy::{
     AuditLog, Capability, PolicyEngine, PolicyRuleSet, SandboxStatus, WorkspaceSandbox,
     local_time_parts,
@@ -301,8 +301,10 @@ pub struct SubagentSessionState {
     pub bypass_permissions: bool,
     /// Merged `commands.json` allowlist patterns from the parent session.
     pub allowed_commands: Vec<String>,
-    /// Detected kernel Landlock sandbox status from the parent session.
+    /// Detected sandbox execution status from the parent session.
     pub sandbox_status: SandboxStatus,
+    /// Snapshot of the coordinator conversation history used for `swarm` `fork: "coordinator"`.
+    pub coordinator_history: Vec<Message>,
 }
 
 impl Default for SubagentSessionState {
@@ -316,6 +318,7 @@ impl Default for SubagentSessionState {
             sandbox_status: SandboxStatus::Unavailable {
                 reason: "unprobed".to_owned(),
             },
+            coordinator_history: Vec::new(),
         }
     }
 }

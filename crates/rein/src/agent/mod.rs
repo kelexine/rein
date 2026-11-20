@@ -10,6 +10,8 @@ pub mod snapshot;
 pub mod subagent;
 /// Asynchronous subagent lifecycle, mailbox messaging, and custom type definitions.
 pub mod subagent_async;
+/// Collaborative multi-agent swarm message board and worker lifecycle.
+pub mod swarm;
 /// Pure-Rust workspace isolation (`inherit`, `share`, `branch`) without shelling out.
 pub mod workspace_iso;
 
@@ -26,8 +28,12 @@ pub use subagent::{
     SubagentRunState, SubagentSessionState, SubagentTracker,
 };
 pub use subagent_async::{
-    DefineSubagentTool, InvokeSubagentTool, ManageSubagentsTool, SendMessageTool,
-    SubagentDefinition, SubagentManager,
+    DefineSubagentTool, InvokeSubagentRequest, InvokeSubagentTool, ManageSubagentsTool,
+    SendMessageTool, SubagentDefinition, SubagentManager,
+};
+pub use swarm::{
+    SwarmAddRequest, SwarmBoardPost, SwarmManager, SwarmMemberState, SwarmTool,
+    validate_worker_name,
 };
 pub use workspace_iso::{
     WorkspaceIsolation, cleanup_subagent_workspace, prepare_subagent_workspace,

@@ -175,7 +175,15 @@ impl AgentLoop {
             guard.bypass_permissions = self.policy.is_bypass_permissions();
             guard.allowed_commands = self.allowed_commands.clone();
             guard.sandbox_status = self.policy.sandbox_status().clone();
+            guard.coordinator_history = self.history.clone();
         }
+    }
+
+    /// Seeds initial conversation history (used by `swarm` `fork` workers).
+    #[must_use]
+    pub fn with_seed_history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
+        self
     }
 
     /// Attaches dynamic runtime metadata injected into assembled turn system prompts.
@@ -637,6 +645,7 @@ impl AgentLoop {
                 final_text = msg.content.clone();
                 record_full_message(self.full_transcript_path.as_deref(), &msg)?;
                 self.history.push(msg);
+                self.sync_subagent_state();
                 return Ok(final_text);
             }
             execute_tool_batch(

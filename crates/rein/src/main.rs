@@ -23,7 +23,7 @@ use rein_tools::{
 use rein::agent::{
     AgentLoop, AgentTool, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest,
     DefineSubagentTool, InvokeSubagentTool, ManageSubagentsTool, SendMessageTool, SubagentEnv,
-    SubagentManager, SubagentSessionState, SubagentTracker,
+    SubagentManager, SubagentSessionState, SubagentTracker, SwarmManager, SwarmTool,
 };
 use rein::commands::SlashKind;
 use rein::config::{
@@ -283,16 +283,19 @@ fn run_interactive(
         cancel: Arc::clone(&subagent_cancel),
         provider_factory: SubagentEnv::config_provider_factory(loaded.config.clone()),
     };
+    let mcp_catalog_opt = mcp_catalog.has_servers().then_some(mcp_catalog);
     let subagent_manager = SubagentManager::new(
         subagent_env.clone(),
-        Some(task_tx),
-        mcp_catalog.has_servers().then_some(mcp_catalog),
+        Some(task_tx.clone()),
+        mcp_catalog_opt.clone(),
     );
+    let swarm_manager = SwarmManager::new(subagent_env.clone(), Some(task_tx), mcp_catalog_opt);
     registry.register(Box::new(AgentTool::new(subagent_env)));
     registry.register(Box::new(InvokeSubagentTool::new(subagent_manager.clone())));
     registry.register(Box::new(DefineSubagentTool::new(subagent_manager.clone())));
     registry.register(Box::new(ManageSubagentsTool::new(subagent_manager.clone())));
     registry.register(Box::new(SendMessageTool::new(subagent_manager.clone())));
+    registry.register(Box::new(SwarmTool::new(swarm_manager.clone())));
 
     let question_relay: SharedQuestionRelay = Arc::new(Mutex::new(None));
     let relay_for_tool = Arc::clone(&question_relay);
@@ -336,6 +339,7 @@ fn run_interactive(
         .with_bypass_permissions(bypass_permissions)
         .with_subagent_tracker(subagent_tracker)
         .with_subagent_manager(subagent_manager)
+        .with_swarm_manager(swarm_manager)
         .with_question_relay(question_relay)
         .with_task_registry(task_registry)
         .with_task_notifications(task_rx)

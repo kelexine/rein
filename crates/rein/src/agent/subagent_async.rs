@@ -40,7 +40,7 @@ pub struct SubagentDefinition {
     pub enable_write_tools: bool,
     /// Allow `call_mcp_tool` when MCP catalog has servers.
     pub enable_mcp_tools: bool,
-    /// Allow nested `invoke_subagent` / `manage_subagents` up to [`MAX_SUBAGENT_DEPTH`].
+    /// Allow nested `invoke_subagent` / `manage_subagents` up to the maximum subagent nesting depth (`2`).
     pub enable_subagent_tools: bool,
 }
 

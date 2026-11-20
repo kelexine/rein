@@ -2,7 +2,7 @@
 // Date: 2026-11-14
 // Purpose: Public exports for sandboxed coding mode tools (read, write, edit, search, and bash)
 
-/// Classifier-driven, Landlock-sandboxed bash execution tool.
+/// Classifier-driven, policy-gated bash execution tool.
 pub mod bash;
 /// Exact string-replacement file editing tool.
 pub mod edit;

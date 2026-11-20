@@ -28,10 +28,10 @@ pub enum PolicyError {
         /// Attempted target path.
         attempted: PathBuf,
     },
-    /// Kernel sandboxing (Landlock) is unavailable on the host OS/kernel.
+    /// Sandbox execution mode is unavailable on the host OS.
     #[error("kernel sandbox unavailable: {0}")]
     SandboxUnavailable(String),
-    /// Failed to apply Landlock or `PR_SET_NO_NEW_PRIVS` in the child process.
+    /// Failed to configure or manage a sandboxed child process.
     #[error("failed to apply kernel sandbox: {0}")]
     SandboxApply(String),
 }

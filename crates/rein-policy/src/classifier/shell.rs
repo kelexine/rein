@@ -83,7 +83,7 @@ impl ShellClassifier {
         acc
     }
 
-    /// Returns `true` when the entire command consists of safe `git` repository operations (without `git config`, dangerous `-c` keys, or output file redirections), allowing `.git` index/ref writes in Landlock.
+    /// Returns `true` when the entire command consists of safe `git` repository operations (without `git config`, dangerous `-c` keys, or output file redirections).
     #[must_use]
     pub fn allows_git_writes(
         program: &str,

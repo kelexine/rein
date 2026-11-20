@@ -173,6 +173,9 @@ pub fn run_tui(
     if let Some(sub_mgr) = app.subagent_manager() {
         let _ = sub_mgr.kill_all();
     }
+    if let Some(sw_mgr) = app.swarm_manager() {
+        sw_mgr.kill_all();
+    }
     app.subagent_tracker().cancel_all();
     app.task_registry().shutdown_all();
     Ok(())

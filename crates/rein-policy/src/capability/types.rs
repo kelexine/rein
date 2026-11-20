@@ -23,9 +23,9 @@ pub enum AccessMode {
 pub enum PersonalResource {
     /// Personal markdown/JSONL notes.
     Notes,
-    /// Native `.ics` / CalDAV calendar events.
+    /// Local JSONL and `.ics` calendar events.
     Calendar,
-    /// Native IMAP/SMTP email messages.
+    /// Local JSONL spool and read-only Maildir email messages.
     Email,
 }
 

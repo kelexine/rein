@@ -1,12 +1,12 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: Fast user-space path canonicalization pre-check (paired with Landlock enforcement)
+// Purpose: User-space path canonicalization, symlink confinement, and protected-path pre-checks
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::engine::PolicyError;
 
-/// Fast user-space pre-check for workspace confinement; Landlock provides kernel enforcement.
+/// User-space workspace path confinement and protected-path pre-check.
 #[derive(Debug, Clone)]
 pub struct WorkspaceSandbox {
     root: PathBuf,

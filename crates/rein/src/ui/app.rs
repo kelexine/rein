@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use crate::agent::{
     ApprovalAction, ApprovalDecision, ApprovalRequest, HydratedEvent, LiveSubagentStatus,
-    SubagentManager, SubagentRunState, SubagentTracker, TurnCheckpoint, now_unix_secs,
+    SubagentManager, SubagentRunState, SubagentTracker, SwarmManager, TurnCheckpoint,
+    now_unix_secs,
 };
 use crate::commands::{SlashCommand, SlashRegistry};
 use crate::config::{ProviderKind, SessionSummary};
@@ -233,6 +234,7 @@ pub struct AppState {
     bypass_permissions: bool,
     subagent_tracker: SubagentTracker,
     subagent_manager: Option<SubagentManager>,
+    swarm_manager: Option<SwarmManager>,
     task_registry: TaskRegistry,
     task_notifications_rx: Option<mpsc::Receiver<TaskNotification>>,
     strip_selected: Option<usize>,
@@ -324,6 +326,7 @@ impl AppState {
             bypass_permissions: false,
             subagent_tracker: SubagentTracker::new(),
             subagent_manager: None,
+            swarm_manager: None,
             task_registry: TaskRegistry::new(),
             task_notifications_rx: None,
             strip_selected: None,
@@ -341,6 +344,13 @@ impl AppState {
         self
     }
 
+    /// Attaches the [`SwarmManager`] for `/tasks` worker kills and shutdown cleanup.
+    #[must_use]
+    pub fn with_swarm_manager(mut self, manager: SwarmManager) -> Self {
+        self.swarm_manager = Some(manager);
+        self
+    }
+
     /// Attaches the shared [`SharedQuestionRelay`] bridging `ask_question` tool calls into the TUI.
     #[must_use]
     pub fn with_question_relay(mut self, relay: SharedQuestionRelay) -> Self {
@@ -352,6 +362,12 @@ impl AppState {
     #[must_use]
     pub fn subagent_manager(&self) -> Option<&SubagentManager> {
         self.subagent_manager.as_ref()
+    }
+
+    /// Returns a reference to the attached [`SwarmManager`], if configured.
+    #[must_use]
+    pub fn swarm_manager(&self) -> Option<&SwarmManager> {
+        self.swarm_manager.as_ref()
     }
 
     /// Returns a reference to the shared [`SharedQuestionRelay`], if configured.
@@ -1466,7 +1482,15 @@ impl AppState {
         let entry = items.get(mgr.selected.min(items.len().saturating_sub(1)))?;
         let res = match entry.kind {
             TaskTargetKind::Subagent => {
-                if let Some(sub_mgr) = &self.subagent_manager
+                if let Some(worker_name) = entry
+                    .title
+                    .strip_prefix("Agent(swarm: ")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    && let Some(sw_mgr) = &self.swarm_manager
+                    && sw_mgr.kill_worker("coordinator", worker_name).is_ok()
+                {
+                    Ok(format!("killed swarm worker {worker_name}"))
+                } else if let Some(sub_mgr) = &self.subagent_manager
                     && sub_mgr.kill_tree(&entry.id).is_ok()
                 {
                     Ok(format!("killed subagent tree {}", entry.title))

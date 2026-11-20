@@ -27,6 +27,7 @@ pub const CODING_TOOLS: &[&str] = &[
     "define_subagent",
     "manage_subagents",
     "send_message",
+    "swarm",
     "ask_question",
 ];
 
@@ -47,6 +48,7 @@ pub const PLAN_TOOLS: &[&str] = &[
     "define_subagent",
     "manage_subagents",
     "send_message",
+    "swarm",
     "ask_question",
 ];
 
@@ -66,6 +68,7 @@ pub const PERSONAL_TOOLS: &[&str] = &[
     "define_subagent",
     "manage_subagents",
     "send_message",
+    "swarm",
     "ask_question",
 ];
 

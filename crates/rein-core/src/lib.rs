@@ -9,7 +9,7 @@
 pub mod event;
 /// Message, role, mode identifier, memory scope, and tool call structures.
 pub mod message;
-/// Model provider trait, Anthropic backend, and deterministic replay provider.
+/// Model provider trait, Anthropic and Antigravity backends, and deterministic replay provider.
 pub mod provider;
 /// Compile-time typestate turn loop enforcing policy gating before tool execution.
 pub mod state;

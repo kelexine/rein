@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-14
-// Purpose: PolicyEngine evaluating capabilities against kernel sandbox status, classifier, allowlists, and audit log
+// Purpose: PolicyEngine evaluating capabilities against sandbox status, classifier, allowlists, and audit log
 
 use rein_core::{MemoryScope, ModeId};
 
@@ -24,7 +24,7 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Constructs a [`PolicyEngine`] and probes kernel Landlock availability at creation.
+    /// Constructs a [`PolicyEngine`] and probes the active [`SandboxStatus`] at creation.
     #[must_use]
     pub fn new(rules: PolicyRuleSet, sandbox: WorkspaceSandbox, audit: AuditLog) -> Self {
         Self::with_sandbox_status(rules, sandbox, probe_kernel_sandbox(), audit)
@@ -85,7 +85,7 @@ impl PolicyEngine {
         &self.sandbox
     }
 
-    /// Returns the detected kernel [`SandboxStatus`].
+    /// Returns the detected [`SandboxStatus`].
     #[must_use]
     pub fn sandbox_status(&self) -> &SandboxStatus {
         &self.sandbox_status
