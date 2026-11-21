@@ -30,7 +30,9 @@ impl HttpMethod {
             Some("DELETE") => Ok(Self::Delete),
             Some(other) => Err(ToolError::InvalidArguments {
                 tool: "web_fetch".to_owned(),
-                reason: format!("unsupported HTTP method '{other}' (expected GET, POST, PUT, DELETE)"),
+                reason: format!(
+                    "unsupported HTTP method '{other}' (expected GET, POST, PUT, DELETE)"
+                ),
             }),
         }
     }
@@ -96,7 +98,9 @@ fn parse_fetch_args(arguments: &Value) -> Result<FetchArgs, ToolError> {
                 _ => {
                     return Err(ToolError::InvalidArguments {
                         tool: "web_fetch".to_owned(),
-                        reason: "each header entry must contain non-empty 'name' and 'value' strings".to_owned(),
+                        reason:
+                            "each header entry must contain non-empty 'name' and 'value' strings"
+                                .to_owned(),
                     });
                 }
             }
@@ -352,8 +356,14 @@ mod tests {
     #[test]
     fn validates_url_scheme_and_method() {
         let tool = WebFetchTool::new();
-        assert!(tool.required_capability(&json!({"url": "file:///etc/passwd"})).is_err());
-        assert!(tool.required_capability(&json!({"url": "not-a-url"})).is_err());
+        assert!(
+            tool.required_capability(&json!({"url": "file:///etc/passwd"}))
+                .is_err()
+        );
+        assert!(
+            tool.required_capability(&json!({"url": "not-a-url"}))
+                .is_err()
+        );
         assert!(
             tool.required_capability(&json!({"url": "https://example.com", "method": "PATCH"}))
                 .is_err()
