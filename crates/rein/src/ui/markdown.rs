@@ -1,12 +1,23 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-15
-// Purpose: Markdown block and inline parser rendering styled Ratatui lines for assistant turns
+// Purpose: Markdown block and inline parser rendering styled, word-wrapped Ratatui lines for assistant turns
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+const BG_CODE: Color = Color::Rgb(24, 26, 36);
+const BG_INLINE_CODE: Color = Color::Rgb(34, 38, 52);
+const FG_INLINE_CODE: Color = Color::Rgb(125, 207, 255);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnAlign {
+    Left,
+    Center,
+    Right,
+}
+
 /// Renders Markdown `source` into styled Ratatui [`Line`]s with `● ` on the first line
-/// and `  ` hanging indentation on subsequent lines, inspired by Claude Code's terminal UI.
+/// and `  ` hanging indentation on subsequent lines.
 #[must_use]
 pub fn render_assistant_markdown(source: &str, max_width: u16) -> Vec<Line<'static>> {
     let inner_width = max_width.saturating_sub(2).max(20);
@@ -34,10 +45,11 @@ pub fn render_assistant_markdown(source: &str, max_width: u16) -> Vec<Line<'stat
     out
 }
 
-/// Renders Markdown blocks into standalone styled [`Line`]s without leading bullet prefixes.
+/// Renders Markdown blocks into standalone styled, word-wrapped [`Line`]s without leading bullet prefixes.
 #[must_use]
 pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>> {
     let raw_lines: Vec<&str> = source.lines().collect();
+    let width = usize::from(max_width.max(20));
     let mut out = Vec::new();
     let mut i = 0usize;
 
@@ -46,15 +58,20 @@ pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            if !out.is_empty() {
+            if !out.is_empty() && !out.last().is_some_and(|l: &Line<'_>| l.spans.is_empty()) {
                 out.push(Line::default());
             }
             i += 1;
             continue;
         }
 
-        if let Some(lang) = parse_fence_open(trimmed) {
-            i = consume_code_block(&raw_lines, i + 1, lang, &mut out);
+        if let Some((fence_ch, fence_len, lang)) = parse_fence_open(trimmed) {
+            i = consume_code_block(&raw_lines, i + 1, fence_ch, fence_len, lang, &mut out);
+            continue;
+        }
+
+        if trimmed.starts_with("<think>") {
+            i = consume_thought_block(&raw_lines, i, width, &mut out);
             continue;
         }
 
@@ -73,33 +90,26 @@ pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>
             continue;
         }
 
-        if let Some(heading) = render_heading_line(trimmed) {
-            out.push(heading);
+        if let Some(heading_lines) = render_heading_lines(trimmed, width) {
+            out.extend(heading_lines);
             i += 1;
             continue;
         }
 
-        if let Some(quote) = trimmed.strip_prefix('>') {
-            let quote_body = quote.strip_prefix(' ').unwrap_or(quote);
-            let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-            spans.extend(parse_inline_spans(
-                quote_body,
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            out.push(Line::from(spans));
+        if trimmed.starts_with('>') {
+            out.extend(render_blockquote_line(trimmed, width));
             i += 1;
             continue;
         }
 
-        if let Some(list_line) = render_list_line(line) {
-            out.push(list_line);
+        if let Some(list_lines) = render_list_lines(line, width) {
+            out.extend(list_lines);
             i += 1;
             continue;
         }
 
-        out.push(Line::from(parse_inline_spans(trimmed, Style::default())));
+        let spans = parse_inline_spans(trimmed, Style::default());
+        out.extend(wrap_styled_spans(&spans, width, &[]));
         i += 1;
     }
 
@@ -109,26 +119,99 @@ pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>
     out
 }
 
-fn parse_fence_open(trimmed: &str) -> Option<&str> {
-    let rest = trimmed.strip_prefix("```")?;
-    Some(rest.trim())
+fn parse_fence_open(trimmed: &str) -> Option<(char, usize, &str)> {
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|c| *c == first).count();
+    if count < 3 {
+        return None;
+    }
+    let rest = trimmed[count..].trim();
+    if first == '`' && rest.contains('`') {
+        return None;
+    }
+    Some((first, count, rest))
+}
+
+fn is_fence_close(trimmed: &str, fence_ch: char, min_len: usize) -> bool {
+    let count = trimmed.chars().take_while(|c| *c == fence_ch).count();
+    count >= min_len && trimmed[count..].trim().is_empty()
 }
 
 fn consume_code_block(
     lines: &[&str],
     mut idx: usize,
+    fence_ch: char,
+    fence_len: usize,
     lang: &str,
     out: &mut Vec<Line<'static>>,
 ) -> usize {
+    if !lang.is_empty() {
+        out.push(Line::from(Span::styled(
+            lang.to_owned(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
     let mut state = super::highlight::HighlightState::default();
     while idx < lines.len() {
         let raw = lines[idx];
-        if raw.trim().starts_with("```") {
+        if is_fence_close(raw.trim(), fence_ch, fence_len) {
             idx += 1;
             break;
         }
-        out.push(super::highlight::highlight_code_line(raw, lang, &mut state));
+        let highlighted = super::highlight::highlight_code_line(raw, lang, &mut state);
+        let mut styled_spans: Vec<Span<'static>> = highlighted
+            .spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.bg(BG_CODE)))
+            .collect();
+        if styled_spans.is_empty() {
+            styled_spans.push(Span::styled(" ", Style::default().bg(BG_CODE)));
+        }
+        out.push(Line::from(styled_spans));
         idx += 1;
+    }
+    idx
+}
+
+fn consume_thought_block(
+    lines: &[&str],
+    start: usize,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) -> usize {
+    let thought_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let prefix = [Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+    let mut idx = start;
+    while idx < lines.len() {
+        let mut text = lines[idx].trim();
+        if idx == start {
+            text = text.strip_prefix("<think>").unwrap_or(text).trim_start();
+        }
+        let closed = if let Some(before) = text.strip_suffix("</think>") {
+            text = before.trim_end();
+            true
+        } else if let Some(pos) = text.find("</think>") {
+            text = text[..pos].trim_end();
+            true
+        } else {
+            false
+        };
+
+        if !text.is_empty() {
+            let spans = parse_inline_spans(text, thought_style);
+            out.extend(wrap_styled_spans(&spans, width, &prefix));
+        }
+        idx += 1;
+        if closed {
+            break;
+        }
     }
     idx
 }
@@ -138,10 +221,11 @@ fn is_horizontal_rule(trimmed: &str) -> bool {
     clean.len() >= 3
         && (clean.chars().all(|c| c == '-')
             || clean.chars().all(|c| c == '*')
-            || clean.chars().all(|c| c == '_'))
+            || clean.chars().all(|c| c == '_')
+            || clean.chars().all(|c| c == '='))
 }
 
-fn render_heading_line(trimmed: &str) -> Option<Line<'static>> {
+fn render_heading_lines(trimmed: &str, width: usize) -> Option<Vec<Line<'static>>> {
     let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
     if (1..=6).contains(&hashes) {
         let rest = trimmed[hashes..].trim_start();
@@ -149,32 +233,54 @@ fn render_heading_line(trimmed: &str) -> Option<Line<'static>> {
             let color = match hashes {
                 1 => Color::Cyan,
                 2 => Color::LightBlue,
-                _ => Color::White,
+                3 => Color::White,
+                _ => Color::Gray,
             };
-            return Some(Line::from(parse_inline_spans(
+            let spans = parse_inline_spans(
                 rest,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )));
+            );
+            return Some(wrap_styled_spans(&spans, width, &[]));
         }
     }
-    // Treat standalone **Section Header** lines (common in Claude/Gemini output) as clean bold headings.
+    // Treat standalone **Section Header** lines as clean bold headings.
     if let Some(inner) = trimmed
         .strip_prefix("**")
         .and_then(|s| s.strip_suffix("**"))
         && !inner.is_empty()
         && !inner.contains("**")
     {
-        return Some(Line::from(Span::styled(
+        let spans = vec![Span::styled(
             inner.to_owned(),
             Style::default()
                 .fg(Color::LightBlue)
                 .add_modifier(Modifier::BOLD),
-        )));
+        )];
+        return Some(wrap_styled_spans(&spans, width, &[]));
     }
     None
 }
 
-fn render_list_line(raw: &str) -> Option<Line<'static>> {
+fn render_blockquote_line(trimmed: &str, width: usize) -> Vec<Line<'static>> {
+    let mut depth = 0usize;
+    let mut rest = trimmed;
+    while let Some(after) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after.strip_prefix(' ').unwrap_or(after).trim_start();
+    }
+    let bar = "│ ".repeat(depth.min(4));
+    let prefix = [Span::styled(bar, Style::default().fg(Color::DarkGray))];
+    let quote_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::ITALIC);
+    let spans = parse_inline_spans(rest, quote_style);
+    if spans.is_empty() {
+        return vec![Line::from(prefix.to_vec())];
+    }
+    wrap_styled_spans(&spans, width, &prefix)
+}
+
+fn render_list_lines(raw: &str, width: usize) -> Option<Vec<Line<'static>>> {
     let indent_len = raw.len() - raw.trim_start().len();
     let indent_spaces = " ".repeat((indent_len / 2).min(4) * 2);
     let trimmed = raw.trim_start();
@@ -184,12 +290,44 @@ fn render_list_line(raw: &str) -> Option<Line<'static>> {
         .or_else(|| trimmed.strip_prefix("* "))
         .or_else(|| trimmed.strip_prefix("+ "))
     {
-        let mut spans = vec![
-            Span::raw(indent_spaces),
+        if let Some((checked, task_body)) = parse_task_checkbox(rest) {
+            let (glyph, glyph_color, body_style) = if checked {
+                (
+                    "☑ ",
+                    Color::Green,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                )
+            } else {
+                ("☐ ", Color::Cyan, Style::default())
+            };
+            let first_prefix = vec![
+                Span::raw(indent_spaces.clone()),
+                Span::styled(glyph, Style::default().fg(glyph_color)),
+            ];
+            let hang = vec![Span::raw(format!("{indent_spaces}  "))];
+            let spans = parse_inline_spans(task_body, body_style);
+            return Some(wrap_with_first_and_hang(
+                &spans,
+                width,
+                &first_prefix,
+                &hang,
+            ));
+        }
+
+        let first_prefix = vec![
+            Span::raw(indent_spaces.clone()),
             Span::styled("• ", Style::default().fg(Color::Cyan)),
         ];
-        spans.extend(parse_inline_spans(rest, Style::default()));
-        return Some(Line::from(spans));
+        let hang = vec![Span::raw(format!("{indent_spaces}  "))];
+        let spans = parse_inline_spans(rest, Style::default());
+        return Some(wrap_with_first_and_hang(
+            &spans,
+            width,
+            &first_prefix,
+            &hang,
+        ));
     }
 
     let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
@@ -200,13 +338,33 @@ fn render_list_line(raw: &str) -> Option<Line<'static>> {
             .or_else(|| after_digits.strip_prefix(") "))
         {
             let marker = format!("{}. ", &trimmed[..digit_count]);
-            let mut spans = vec![
-                Span::raw(indent_spaces),
+            let hang_pad = " ".repeat(marker.chars().count());
+            let first_prefix = vec![
+                Span::raw(indent_spaces.clone()),
                 Span::styled(marker, Style::default().fg(Color::Cyan)),
             ];
-            spans.extend(parse_inline_spans(rest, Style::default()));
-            return Some(Line::from(spans));
+            let hang = vec![Span::raw(format!("{indent_spaces}{hang_pad}"))];
+            let spans = parse_inline_spans(rest, Style::default());
+            return Some(wrap_with_first_and_hang(
+                &spans,
+                width,
+                &first_prefix,
+                &hang,
+            ));
         }
+    }
+    None
+}
+
+fn parse_task_checkbox(rest: &str) -> Option<(bool, &str)> {
+    if let Some(body) = rest.strip_prefix("[ ] ") {
+        return Some((false, body));
+    }
+    if let Some(body) = rest
+        .strip_prefix("[x] ")
+        .or_else(|| rest.strip_prefix("[X] "))
+    {
+        return Some((true, body));
     }
     None
 }
@@ -231,6 +389,20 @@ fn is_table_separator(trimmed: &str) -> bool {
         && trimmed.contains('-')
 }
 
+fn parse_table_alignments(trimmed: &str) -> Vec<ColumnAlign> {
+    split_table_cells(trimmed)
+        .into_iter()
+        .map(|cell| {
+            let c = cell.trim();
+            match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => ColumnAlign::Center,
+                (false, true) => ColumnAlign::Right,
+                _ => ColumnAlign::Left,
+            }
+        })
+        .collect()
+}
+
 fn split_table_cells(trimmed: &str) -> Vec<String> {
     let stripped = trimmed
         .strip_prefix('|')
@@ -250,13 +422,18 @@ fn consume_table(
     out: &mut Vec<Line<'static>>,
 ) -> usize {
     let mut raw_rows = Vec::new();
+    let mut alignments = Vec::new();
     let mut idx = start;
     while idx < lines.len() {
         let trimmed = lines[idx].trim();
         if trimmed.is_empty() || !trimmed.contains('|') {
             break;
         }
-        if !is_table_separator(trimmed) {
+        if is_table_separator(trimmed) {
+            if alignments.is_empty() {
+                alignments = parse_table_alignments(trimmed);
+            }
+        } else {
             raw_rows.push(split_table_cells(trimmed));
         }
         idx += 1;
@@ -274,7 +451,6 @@ fn consume_table(
         }
     }
 
-    // Clamp total table width gracefully if very narrow terminal.
     let budget = usize::from(max_width.max(24));
     let overhead = col_count.saturating_sub(1) * 3;
     let sum_widths: usize = widths.iter().sum();
@@ -299,12 +475,12 @@ fn consume_table(
                 spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
             }
             let cell_raw = row.get(col).map(String::as_str).unwrap_or("");
+            let align = alignments.get(col).copied().unwrap_or(ColumnAlign::Left);
             let cell_spans = parse_inline_spans(cell_raw, base_style);
-            let cell_len = visible_inline_text(cell_raw).chars().count();
-            spans.extend(cell_spans);
-            if *col_width > cell_len {
-                spans.push(Span::raw(" ".repeat(*col_width - cell_len)));
-            }
+            let clamped = clamp_spans_to_width(cell_spans, *col_width);
+            let cell_len: usize = clamped.iter().map(|s| s.content.chars().count()).sum();
+            let pad = col_width.saturating_sub(cell_len);
+            push_aligned_cell(&mut spans, clamped, pad, align);
         }
         out.push(Line::from(spans));
 
@@ -325,6 +501,67 @@ fn consume_table(
     idx
 }
 
+fn push_aligned_cell(
+    out: &mut Vec<Span<'static>>,
+    cell: Vec<Span<'static>>,
+    pad: usize,
+    align: ColumnAlign,
+) {
+    match align {
+        ColumnAlign::Left => {
+            out.extend(cell);
+            if pad > 0 {
+                out.push(Span::raw(" ".repeat(pad)));
+            }
+        }
+        ColumnAlign::Right => {
+            if pad > 0 {
+                out.push(Span::raw(" ".repeat(pad)));
+            }
+            out.extend(cell);
+        }
+        ColumnAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            if left > 0 {
+                out.push(Span::raw(" ".repeat(left)));
+            }
+            out.extend(cell);
+            if right > 0 {
+                out.push(Span::raw(" ".repeat(right)));
+            }
+        }
+    }
+}
+
+fn clamp_spans_to_width(spans: Vec<Span<'static>>, max_cols: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= max_cols {
+        return spans;
+    }
+    let keep = max_cols.saturating_sub(1);
+    let mut out = Vec::new();
+    let mut taken = 0usize;
+    for span in spans {
+        if taken >= keep {
+            break;
+        }
+        let len = span.content.chars().count();
+        if taken + len <= keep {
+            taken += len;
+            out.push(span);
+        } else {
+            let partial: String = span.content.chars().take(keep - taken).collect();
+            out.push(Span::styled(partial, span.style));
+            taken = keep;
+        }
+    }
+    if max_cols >= 1 {
+        out.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+    }
+    out
+}
+
 fn visible_inline_text(raw: &str) -> String {
     parse_inline_spans(raw, Style::default())
         .into_iter()
@@ -332,7 +569,117 @@ fn visible_inline_text(raw: &str) -> String {
         .collect()
 }
 
-/// Parses inline Markdown spans (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)`).
+fn wrap_styled_spans(
+    spans: &[Span<'static>],
+    max_width: usize,
+    prefix: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    wrap_with_first_and_hang(spans, max_width, prefix, prefix)
+}
+
+fn wrap_with_first_and_hang(
+    spans: &[Span<'static>],
+    max_width: usize,
+    first_prefix: &[Span<'static>],
+    hang_prefix: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let words = split_spans_into_words(spans);
+    if words.is_empty() {
+        return vec![Line::from(first_prefix.to_vec())];
+    }
+
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = first_prefix.to_vec();
+    let mut col: usize = first_prefix.iter().map(|s| s.content.chars().count()).sum();
+    let hang_len: usize = hang_prefix.iter().map(|s| s.content.chars().count()).sum();
+
+    for word in words {
+        let word_len: usize = word.iter().map(|s| s.content.chars().count()).sum();
+        let is_space = word
+            .iter()
+            .all(|s| s.content.chars().all(char::is_whitespace));
+
+        if col > hang_len && col + word_len > max_width {
+            trim_trailing_whitespace(&mut current);
+            lines.push(Line::from(current));
+            current = hang_prefix.to_vec();
+            col = hang_len;
+            if is_space {
+                continue;
+            }
+        }
+        col += word_len;
+        for seg in word {
+            merge_or_push_span(&mut current, seg);
+        }
+    }
+
+    if !current.is_empty() {
+        trim_trailing_whitespace(&mut current);
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+fn split_spans_into_words(spans: &[Span<'static>]) -> Vec<Vec<Span<'static>>> {
+    let mut words: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut in_space: Option<bool> = None;
+
+    for span in spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let ch_space = ch.is_whitespace();
+            if let Some(prev_space) = in_space
+                && prev_space != ch_space
+            {
+                if !buf.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut buf), span.style));
+                }
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            in_space = Some(ch_space);
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            current.push(Span::styled(buf, span.style));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn merge_or_push_span(out: &mut Vec<Span<'static>>, span: Span<'static>) {
+    if span.content.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut()
+        && last.style == span.style
+    {
+        last.content.to_mut().push_str(&span.content);
+        return;
+    }
+    out.push(span);
+}
+
+fn trim_trailing_whitespace(spans: &mut Vec<Span<'static>>) {
+    while let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end_matches(' ');
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            let owned = trimmed.to_owned();
+            last.content = owned.into();
+            break;
+        }
+    }
+}
+
+/// Parses inline Markdown spans (`**bold**`, `__bold__`, `*italic*`, `_italic_`, `` `code` ``, `~~strike~~`, `[text](url)`, and `\*` escapes).
 #[must_use]
 pub fn parse_inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -341,21 +688,39 @@ pub fn parse_inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut i = 0usize;
 
     while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && let Some(next_ch) = text[i + 1..].chars().next()
+            && is_escapable(next_ch)
+        {
+            plain.push(next_ch);
+            i += 1 + next_ch.len_utf8();
+            continue;
+        }
+
         if bytes[i] == b'`'
-            && let Some(end) = find_closing(&text[i + 1..], "`")
+            && let Some((code, consumed)) = parse_backtick_code(&text[i..])
         {
             flush_plain(&mut plain, base, &mut spans);
-            let code = &text[i + 1..i + 1 + end];
             spans.push(Span::styled(
                 code.to_owned(),
-                base.fg(Color::Rgb(125, 207, 255)),
+                base.fg(FG_INLINE_CODE).bg(BG_INLINE_CODE),
             ));
-            i += 1 + end + 1;
+            i += consumed;
             continue;
         }
 
         if text[i..].starts_with("**")
             && let Some(end) = find_closing(&text[i + 2..], "**")
+        {
+            flush_plain(&mut plain, base, &mut spans);
+            let inner = &text[i + 2..i + 2 + end];
+            spans.extend(parse_inline_spans(inner, base.add_modifier(Modifier::BOLD)));
+            i += 2 + end + 2;
+            continue;
+        }
+
+        if text[i..].starts_with("__")
+            && let Some(end) = find_closing(&text[i + 2..], "__")
         {
             flush_plain(&mut plain, base, &mut spans);
             let inner = &text[i + 2..i + 2 + end];
@@ -392,7 +757,22 @@ pub fn parse_inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
 
         if bytes[i] == b'*'
             && !text[i..].starts_with("**")
-            && let Some(end) = find_single_asterisk_close(&text[i + 1..])
+            && let Some(end) = find_single_delim_close(&text[i + 1..], b'*')
+        {
+            flush_plain(&mut plain, base, &mut spans);
+            let inner = &text[i + 1..i + 1 + end];
+            spans.extend(parse_inline_spans(
+                inner,
+                base.add_modifier(Modifier::ITALIC),
+            ));
+            i += 1 + end + 1;
+            continue;
+        }
+
+        if bytes[i] == b'_'
+            && !text[i..].starts_with("__")
+            && is_underscore_open_boundary(text, i)
+            && let Some(end) = find_underscore_close(&text[i + 1..])
         {
             flush_plain(&mut plain, base, &mut spans);
             let inner = &text[i + 1..i + 1 + end];
@@ -415,6 +795,43 @@ pub fn parse_inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
+const fn is_escapable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '`'
+            | '*'
+            | '_'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '#'
+            | '+'
+            | '-'
+            | '.'
+            | '!'
+            | '~'
+            | '|'
+    )
+}
+
+fn parse_backtick_code(slice: &str) -> Option<(&str, usize)> {
+    let ticks = slice.bytes().take_while(|b| *b == b'`').count();
+    if ticks == 0 {
+        return None;
+    }
+    let delim = &slice[..ticks];
+    let rest = &slice[ticks..];
+    let end = rest.find(delim)?;
+    if end == 0 {
+        return None;
+    }
+    let code = rest[..end].trim();
+    Some((code, ticks + end + ticks))
+}
+
 fn flush_plain(buf: &mut String, base: Style, out: &mut Vec<Span<'static>>) {
     if !buf.is_empty() {
         out.push(Span::styled(std::mem::take(buf), base));
@@ -426,14 +843,42 @@ fn find_closing(slice: &str, delim: &str) -> Option<usize> {
     (pos > 0).then_some(pos)
 }
 
-fn find_single_asterisk_close(slice: &str) -> Option<usize> {
+fn find_single_delim_close(slice: &str, delim: u8) -> Option<usize> {
     if slice.starts_with(' ') {
         return None;
     }
     let bytes = slice.as_bytes();
     for (idx, b) in bytes.iter().enumerate() {
-        if *b == b'*' && bytes.get(idx + 1) != Some(&b'*') && idx > 0 {
+        if *b == delim && bytes.get(idx + 1) != Some(&delim) && idx > 0 {
             return Some(idx);
+        }
+    }
+    None
+}
+
+fn is_underscore_open_boundary(text: &str, idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    text[..idx]
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_alphanumeric())
+}
+
+fn find_underscore_close(slice: &str) -> Option<usize> {
+    if slice.starts_with(' ') {
+        return None;
+    }
+    let bytes = slice.as_bytes();
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == b'_' && bytes.get(idx + 1) != Some(&b'_') && idx > 0 {
+            let after_ok = bytes
+                .get(idx + 1)
+                .is_none_or(|next| !next.is_ascii_alphanumeric());
+            if after_ok {
+                return Some(idx);
+            }
         }
     }
     None
@@ -494,6 +939,7 @@ let x = 1;
         assert!(!joined.contains("│ let x"));
         assert!(!joined.contains("╰"));
         assert!(rendered.iter().any(|line| line == "  let x = 1;"));
+        assert!(rendered.iter().any(|line| line == "  rust"));
         assert!(!joined.contains("```rust"));
         let code_line = lines.iter().find(|l| {
             l.spans
@@ -503,9 +949,11 @@ let x = 1;
                 .contains("let x = 1;")
         });
         assert!(code_line.is_some_and(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content == "let" && s.style.fg == Some(Color::Magenta))
+            l.spans.iter().any(|s| {
+                s.content == "let"
+                    && s.style.fg == Some(Color::Magenta)
+                    && s.style.bg == Some(BG_CODE)
+            })
         }));
     }
 
@@ -526,7 +974,8 @@ let x = 1;
         let joined = rendered.join("\n");
 
         assert!(joined.contains("│ Important security note"));
-        assert!(joined.contains("• First item with docs (https://example.com)"));
+        assert!(joined.contains("• First item with docs"));
+        assert!(joined.contains("(https://example.com)"));
         assert!(!joined.contains("[docs]("));
         assert!(joined.contains("1. Ordered step"));
         let rule_line = rendered
@@ -543,5 +992,72 @@ let x = 1;
                 && s.style.fg == Some(Color::LightBlue)
                 && s.style.add_modifier.contains(Modifier::UNDERLINED)
         }));
+    }
+
+    #[test]
+    fn wraps_lists_with_hanging_indent_and_renders_task_checkboxes() {
+        let md = "\
+- [ ] Unchecked item that should wrap cleanly onto a second line
+- [x] Completed item";
+        let lines = render_markdown_blocks(md, 34);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(rendered[0].starts_with("☐ Unchecked"));
+        assert!(rendered[1].starts_with("  "));
+        assert!(rendered.iter().any(|l| l.starts_with("☑ Completed")));
+    }
+
+    #[test]
+    fn preserves_snake_case_and_renders_escapes_and_thoughts() {
+        let md = "\
+<think>
+Considering snake_case_ident and _italic_ and \\*escaped\\*.
+</think>
+
+Use `snake_case_ident` or _emphasized_ and ``inline `tick` code``.";
+        let lines = render_markdown_blocks(md, 80);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("│ Considering snake_case_ident"));
+        assert!(joined.contains("*escaped*"));
+        assert!(joined.contains("inline `tick` code"));
+        let emph_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "emphasized"))
+            .expect("emphasized span");
+        assert!(
+            emph_line
+                .spans
+                .iter()
+                .any(|s| s.content == "emphasized"
+                    && s.style.add_modifier.contains(Modifier::ITALIC))
+        );
+    }
+
+    #[test]
+    fn aligns_and_clamps_table_columns() {
+        let md = "\
+| Name | Count |
+| :--- | ---: |
+| alpha | 42 |";
+        let lines = render_markdown_blocks(md, 60);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(rendered[2].contains("42"));
+        assert!(rendered[2].ends_with("   42"));
     }
 }
