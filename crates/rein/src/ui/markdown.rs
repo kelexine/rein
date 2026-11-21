@@ -453,13 +453,8 @@ fn consume_table(
 
     let budget = usize::from(max_width.max(24));
     let overhead = col_count.saturating_sub(1) * 3;
-    let sum_widths: usize = widths.iter().sum();
-    if sum_widths + overhead > budget && sum_widths > 0 {
-        let avail = budget.saturating_sub(overhead).max(col_count * 4);
-        for w in &mut widths {
-            *w = ((*w * avail) / sum_widths).max(4);
-        }
-    }
+    let avail = budget.saturating_sub(overhead).max(col_count * 4);
+    fit_table_column_widths(&mut widths, avail);
 
     for (row_idx, row) in raw_rows.iter().enumerate() {
         let base_style = if row_idx == 0 {
@@ -469,20 +464,34 @@ fn consume_table(
         } else {
             Style::default()
         };
-        let mut spans = Vec::new();
-        for (col, col_width) in widths.iter().enumerate() {
-            if col > 0 {
-                spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        let wrapped_cols: Vec<Vec<Vec<Span<'static>>>> = widths
+            .iter()
+            .enumerate()
+            .map(|(col, col_width)| {
+                let cell_raw = row.get(col).map(String::as_str).unwrap_or("");
+                let cell_spans = parse_inline_spans(cell_raw, base_style);
+                wrap_styled_spans(&cell_spans, *col_width, &[])
+                    .into_iter()
+                    .map(|l| l.spans)
+                    .collect()
+            })
+            .collect();
+        let row_height = wrapped_cols.iter().map(Vec::len).max().unwrap_or(1);
+
+        for sub_idx in 0..row_height {
+            let mut spans = Vec::new();
+            for (col, col_width) in widths.iter().enumerate() {
+                if col > 0 {
+                    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                }
+                let align = alignments.get(col).copied().unwrap_or(ColumnAlign::Left);
+                let cell_spans = wrapped_cols[col].get(sub_idx).cloned().unwrap_or_default();
+                let cell_len: usize = cell_spans.iter().map(|s| s.content.chars().count()).sum();
+                let pad = col_width.saturating_sub(cell_len);
+                push_aligned_cell(&mut spans, cell_spans, pad, align);
             }
-            let cell_raw = row.get(col).map(String::as_str).unwrap_or("");
-            let align = alignments.get(col).copied().unwrap_or(ColumnAlign::Left);
-            let cell_spans = parse_inline_spans(cell_raw, base_style);
-            let clamped = clamp_spans_to_width(cell_spans, *col_width);
-            let cell_len: usize = clamped.iter().map(|s| s.content.chars().count()).sum();
-            let pad = col_width.saturating_sub(cell_len);
-            push_aligned_cell(&mut spans, clamped, pad, align);
+            out.push(Line::from(spans));
         }
-        out.push(Line::from(spans));
 
         if row_idx == 0 {
             let mut sep = String::new();
@@ -499,6 +508,32 @@ fn consume_table(
         }
     }
     idx
+}
+
+fn fit_table_column_widths(widths: &mut [usize], avail: usize) {
+    let total: usize = widths.iter().sum();
+    if total <= avail || widths.is_empty() {
+        return;
+    }
+    // Preserve narrow columns (up to 16 chars) so labels like "Crate" or "Lines" never truncate.
+    const PROTECTED_CAP: usize = 16;
+    let protected_sum: usize = widths.iter().map(|w| (*w).min(PROTECTED_CAP)).sum();
+    if protected_sum >= avail {
+        for w in widths.iter_mut() {
+            *w = ((*w * avail) / total).max(4);
+        }
+        return;
+    }
+    let remaining = avail - protected_sum;
+    let excess_sum: usize = widths.iter().map(|w| w.saturating_sub(PROTECTED_CAP)).sum();
+    if excess_sum == 0 {
+        return;
+    }
+    for w in widths.iter_mut() {
+        let base = (*w).min(PROTECTED_CAP);
+        let excess = w.saturating_sub(PROTECTED_CAP);
+        *w = base + (excess * remaining) / excess_sum;
+    }
 }
 
 fn push_aligned_cell(
@@ -532,34 +567,6 @@ fn push_aligned_cell(
             }
         }
     }
-}
-
-fn clamp_spans_to_width(spans: Vec<Span<'static>>, max_cols: usize) -> Vec<Span<'static>> {
-    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    if total <= max_cols {
-        return spans;
-    }
-    let keep = max_cols.saturating_sub(1);
-    let mut out = Vec::new();
-    let mut taken = 0usize;
-    for span in spans {
-        if taken >= keep {
-            break;
-        }
-        let len = span.content.chars().count();
-        if taken + len <= keep {
-            taken += len;
-            out.push(span);
-        } else {
-            let partial: String = span.content.chars().take(keep - taken).collect();
-            out.push(Span::styled(partial, span.style));
-            taken = keep;
-        }
-    }
-    if max_cols >= 1 {
-        out.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
-    }
-    out
 }
 
 fn visible_inline_text(raw: &str) -> String {
@@ -1059,5 +1066,26 @@ Use `snake_case_ident` or _emphasized_ and ``inline `tick` code``.";
             .collect();
         assert!(rendered[2].contains("42"));
         assert!(rendered[2].ends_with("   42"));
+    }
+
+    #[test]
+    fn wraps_wide_table_cells_without_truncation_or_squishing_short_columns() {
+        let md = "\
+| Crate | Lines | Role |
+|---|---|---|
+| `rein-core` | ~4.1k | Event-sourced core with a typestate loop and provider traits |";
+        let lines = render_markdown_blocks(md, 48);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(!joined.contains('…'));
+        assert!(joined.contains("rein-core"));
+        assert!(joined.contains("~4.1k"));
+        assert!(joined.contains("provider"));
+        assert!(joined.contains("traits"));
+        assert!(rendered.len() >= 4, "expected multi-line wrapped table row");
     }
 }

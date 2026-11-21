@@ -1,0 +1,7 @@
+# Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
+# Date: 2026-11-21
+# Purpose: Clippy config permitting expect/panic in tests while denying them in production code
+
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true

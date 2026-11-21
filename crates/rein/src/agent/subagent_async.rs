@@ -643,6 +643,9 @@ impl Tool for InvokeSubagentTool {
             "status": "running",
             "workspace_mode": ws_mode.as_str(),
             "workspace_path": ws_path,
+            "message": format!(
+                "Subagent '{conversation_id}' is running in the background. Do not poll; you will be woken up automatically when it completes or sends a message."
+            ),
         }))?)
     }
 }

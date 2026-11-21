@@ -34,6 +34,8 @@ pub struct ToolTranscriptEntry {
     pub arguments: Value,
     /// Current execution state.
     pub state: ToolRunState,
+    /// Optional background task/subagent ID when this tool continues asynchronously.
+    pub background_task_id: Option<String>,
     /// Captured full output or denial reason.
     pub output: String,
 }
@@ -71,6 +73,7 @@ impl TranscriptEntry {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
             state: ToolRunState::Running,
+            background_task_id: None,
             output: String::new(),
         })
     }
@@ -87,6 +90,7 @@ impl TranscriptEntry {
             } else {
                 ToolRunState::Done
             },
+            background_task_id: None,
             output: output.content.clone(),
         })
     }
@@ -307,8 +311,12 @@ fn render_tool_entry(
     };
 
     if tool.state == ToolRunState::Running {
+        let running_label = match &tool.background_task_id {
+            Some(id) => format!("  running in background ({id})…"),
+            None => "  running…".to_owned(),
+        };
         header_spans.push(Span::styled(
-            "  running…",
+            running_label,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),

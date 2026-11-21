@@ -149,7 +149,15 @@ pub fn run_tui(
             && app.pending_session_picker().is_none()
             && app.pending_rewind_picker().is_none()
             && let Some((display, prompt)) = collect_wakeup_batch(app)
-            && stream_prompt_background(display, prompt, agent, provider.as_mut(), app, &mut guard)?
+            && stream_prompt_background(
+                display,
+                prompt,
+                true,
+                agent,
+                provider.as_mut(),
+                app,
+                &mut guard,
+            )?
         {
             break;
         }
@@ -470,6 +478,7 @@ fn handle_enter(
     stream_prompt_background(
         trimmed.to_owned(),
         prompt_for_model,
+        false,
         agent,
         provider.as_mut(),
         app,
@@ -503,6 +512,7 @@ fn dispatch_slash(
                 stream_prompt_background(
                     raw.to_owned(),
                     prompt,
+                    false,
                     agent,
                     provider.as_mut(),
                     app,
@@ -923,6 +933,7 @@ fn compact_background(
 fn stream_prompt_background(
     mut display_label: String,
     mut prompt_for_model: String,
+    mut is_wakeup: bool,
     agent: &mut AgentLoop,
     provider: &mut dyn Provider,
     app: &mut AppState,
@@ -932,7 +943,11 @@ fn stream_prompt_background(
     let mut should_quit = false;
 
     loop {
-        app.push_user_turn(display_label);
+        if is_wakeup {
+            app.push_system_note(display_label);
+        } else {
+            app.push_user_turn(display_label);
+        }
         app.set_busy_status("Thinking…");
         app.set_busy(true);
         guard.terminal.draw(|f| render_frame(app, f))?;
@@ -1034,6 +1049,7 @@ fn stream_prompt_background(
         if let Some((next_display, next_prompt)) = app.take_next_queued_message() {
             display_label = next_display;
             prompt_for_model = next_prompt;
+            is_wakeup = false;
             continue;
         }
         break;
@@ -1401,6 +1417,7 @@ fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
                 labels.push(format!("{task_id} ({})", status.label()));
                 let code_str = exit_code.map_or_else(|| "none".to_owned(), |c| c.to_string());
                 let log_hint = log_path
+                    .as_ref()
                     .map(|p| format!("\nLog file: {}", p.display()))
                     .unwrap_or_default();
                 let excerpt = if tail.trim().is_empty() {
@@ -1408,6 +1425,20 @@ fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
                 } else {
                     tail
                 };
+                let failed = exit_code.is_some_and(|c| c != 0)
+                    || matches!(
+                        status,
+                        rein_tools::TaskStatus::Failed | rein_tools::TaskStatus::Killed
+                    );
+                let final_json = serde_json::json!({
+                    "task_id": task_id,
+                    "status": status.label(),
+                    "exit_code": exit_code,
+                    "output_file": log_path,
+                    "stdout": excerpt,
+                })
+                .to_string();
+                app.complete_background_tool(&task_id, failed, final_json);
                 sections.push(format!(
                     "- Background task `{task_id}` (`{command}`) finished with status `{}` (exit code: {code_str}).{log_hint}\nOutput tail:\n```\n{excerpt}\n```",
                     status.label()
@@ -1435,6 +1466,9 @@ fn collect_wakeup_batch(app: &mut AppState) -> Option<(String, String)> {
                 finished,
             } => {
                 app.task_registry().notify_external_event(&conversation_id);
+                if finished {
+                    app.complete_background_tool(&conversation_id, false, content.clone());
+                }
                 let state = if finished { "finished" } else { "waiting" };
                 sections.push(format!(
                     "- Subagent `{conversation_id}` (`{agent_type}: {role}`, state: {state}) sent:\n{content}"

@@ -969,21 +969,51 @@ impl AppState {
             }
             return;
         }
+        let background_id = (!output.is_error)
+            .then(|| extract_background_task_id(&output.content))
+            .flatten();
         if let Some(existing) = self.entries.iter_mut().rev().find_map(|entry| match entry {
             TranscriptEntry::Tool(tool) if tool.call_id == call.id => Some(tool),
             _ => None,
         }) {
-            existing.state = if output.is_error {
+            if let Some(task_id) = background_id {
+                existing.state = ToolRunState::Running;
+                existing.background_task_id = Some(task_id);
+            } else {
+                existing.state = if output.is_error {
+                    ToolRunState::Error
+                } else {
+                    ToolRunState::Done
+                };
+            }
+            existing.output = output.content.clone();
+        } else {
+            let mut entry = TranscriptEntry::tool_completed(call, output);
+            if let (Some(task_id), TranscriptEntry::Tool(tool)) = (background_id, &mut entry) {
+                tool.state = ToolRunState::Running;
+                tool.background_task_id = Some(task_id);
+            }
+            self.entries.push(entry);
+        }
+        self.auto_scroll = true;
+    }
+
+    /// Transitions a backgrounded tool transcript entry from `Running` to `Done` or `Error` on wakeup.
+    pub fn complete_background_tool(&mut self, task_id: &str, is_error: bool, output: String) {
+        if let Some(existing) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            TranscriptEntry::Tool(tool) if tool.background_task_id.as_deref() == Some(task_id) => {
+                Some(tool)
+            }
+            _ => None,
+        }) {
+            existing.state = if is_error {
                 ToolRunState::Error
             } else {
                 ToolRunState::Done
             };
-            existing.output = output.content.clone();
-        } else {
-            self.entries
-                .push(TranscriptEntry::tool_completed(call, output));
+            existing.output = output;
+            self.auto_scroll = true;
         }
-        self.auto_scroll = true;
     }
 
     fn apply_todo_call_args(&mut self, args: &Value) {
@@ -2553,6 +2583,19 @@ impl AppState {
     }
 }
 
+fn extract_background_task_id(output_content: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_str(output_content).ok()?;
+    let status = val.get("status").and_then(serde_json::Value::as_str)?;
+    if status != "backgrounded" && status != "running" {
+        return None;
+    }
+    val.get("task_id")
+        .or_else(|| val.get("conversation_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2723,5 +2766,44 @@ mod tests {
         assert!(state.entries().is_empty());
         assert!(state.active_todo_title().is_none());
         assert!(state.active_todos().is_empty());
+    }
+
+    #[test]
+    fn backgrounded_tool_stays_running_until_completed_on_wakeup() {
+        let mut state = AppState::new(Profile::coding(), "sandbox", "model");
+        let call = ToolCall {
+            id: "call_bg".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "sleep 5"}),
+        };
+        state.push_tool_running(&call);
+        state.finish_tool_entry(
+            &call,
+            &ToolOutput {
+                call_id: "call_bg".to_owned(),
+                content: serde_json::json!({
+                    "status": "backgrounded",
+                    "task_id": "task-1",
+                })
+                .to_string(),
+                is_error: false,
+            },
+        );
+        match &state.entries()[0] {
+            TranscriptEntry::Tool(tool) => {
+                assert_eq!(tool.state, ToolRunState::Running);
+                assert_eq!(tool.background_task_id.as_deref(), Some("task-1"));
+            }
+            other => panic!("expected tool entry, got {other:?}"),
+        }
+
+        state.complete_background_tool("task-1", false, "done".to_owned());
+        match &state.entries()[0] {
+            TranscriptEntry::Tool(tool) => {
+                assert_eq!(tool.state, ToolRunState::Done);
+                assert_eq!(tool.output, "done");
+            }
+            other => panic!("expected tool entry, got {other:?}"),
+        }
     }
 }

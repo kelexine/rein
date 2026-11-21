@@ -122,6 +122,9 @@ impl Tool for BashTool {
                     "is_daemon": is_daemon,
                     "partial_output": partial_output,
                     "output_file": log_path,
+                    "message": format!(
+                        "Command is still running in the background as task '{task_id}'. Do not poll; you will be woken up automatically when it completes."
+                    ),
                 }))?),
             };
         }
