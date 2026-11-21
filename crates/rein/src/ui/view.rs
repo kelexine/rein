@@ -28,7 +28,7 @@ const MAX_PROMPT_ROWS: usize = 6;
 const MAX_TODO_BAR_ROWS: usize = 5;
 const MIN_HEIGHT_FOR_HEADER: u16 = 14;
 const CITADEL_OWL: [&str; 3] = ["▜▙████▟▛", "▐▛▄██▄▜▌", " ▝▜▀▀▛▘ "];
-const SPINNER_FRAMES: [&str; 6] = ["✶", "✢", "✽", "✻", "✳", "·"];
+const SPINNER_FRAMES: [&str; 10] = ["✶", "✸", "✹", "✺", "✹", "✸", "✶", "✢", "✽", "✻"];
 
 /// Computes the number of top rows occupied by the Citadel Owl header at `total_height`.
 #[must_use]
@@ -442,20 +442,55 @@ fn render_header(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_busy_spinner(state: &AppState, frame: &mut Frame<'_>, area: Rect) {
-    let glyph = SPINNER_FRAMES[state.spinner_tick() % SPINNER_FRAMES.len()];
-    let coral = Color::Rgb(224, 130, 96);
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{glyph} "),
-            Style::default().fg(coral).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            state.busy_status(),
-            Style::default().fg(coral).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" (esc to interrupt)", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let tick = state.spinner_tick();
+    let glyph_step = tick / 2;
+    let glyph = SPINNER_FRAMES[glyph_step % SPINNER_FRAMES.len()];
+    let glyph_color = match glyph_step % 4 {
+        0 => Color::Rgb(255, 210, 175),
+        1 | 3 => Color::Rgb(240, 162, 124),
+        _ => Color::Rgb(224, 130, 96),
+    };
+    let mut spans = vec![Span::styled(
+        format!("{glyph} "),
+        Style::default()
+            .fg(glyph_color)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    let status = state.busy_status();
+    let chars: Vec<char> = status.chars().collect();
+    let sweep_len = chars.len() + 10;
+    let peak = tick % sweep_len.max(1);
+    for (idx, ch) in chars.into_iter().enumerate() {
+        let dist = idx.abs_diff(peak);
+        let color = match dist {
+            0 => Color::Rgb(255, 222, 192),
+            1 => Color::Rgb(244, 176, 138),
+            2 => Color::Rgb(234, 148, 112),
+            _ => Color::Rgb(224, 130, 96),
+        };
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    spans.push(Span::styled(
+        " (esc to interrupt)",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let elapsed = state.busy_elapsed_secs();
+    if elapsed >= 1 {
+        let formatted = if elapsed >= 60 {
+            format!(" · {}m {:02}s", elapsed / 60, elapsed % 60)
+        } else {
+            format!(" · {elapsed}s")
+        };
+        spans.push(Span::styled(formatted, Style::default().fg(Color::Gray)));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_rule(frame: &mut Frame<'_>, area: Rect) {

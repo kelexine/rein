@@ -325,6 +325,7 @@ pub struct AppState {
     auto_scroll: bool,
     busy: bool,
     busy_status: String,
+    busy_started_at: Option<Instant>,
     spinner_tick: usize,
     streaming_active: bool,
     thinking_active: bool,
@@ -427,6 +428,7 @@ impl AppState {
             auto_scroll: true,
             busy: false,
             busy_status: "Thinking…".to_owned(),
+            busy_started_at: None,
             spinner_tick: 0,
             streaming_active: false,
             thinking_active: false,
@@ -1068,6 +1070,7 @@ impl AppState {
             return;
         }
         self.streaming_active = false;
+        self.busy_status = "Reasoning…".to_owned();
         let elapsed = self
             .thinking_started
             .map_or(0, |started| started.elapsed().as_secs());
@@ -1118,6 +1121,7 @@ impl AppState {
         if delta.is_empty() {
             return;
         }
+        self.busy_status = "Responding…".to_owned();
         self.finalize_thinking();
         if self.streaming_active
             && let Some(TranscriptEntry::AssistantTurn(buf)) = self.entries.last_mut()
@@ -2062,11 +2066,23 @@ impl AppState {
     /// Marks whether a background model turn, login, or compaction is running.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
-        if !busy {
+        if busy {
+            if self.busy_started_at.is_none() {
+                self.busy_started_at = Some(Instant::now());
+            }
+        } else {
+            self.busy_started_at = None;
             self.finalize_thinking();
             self.streaming_active = false;
             self.busy_status = "Thinking…".to_owned();
         }
+    }
+
+    /// Returns elapsed seconds since the current busy operation started.
+    #[must_use]
+    pub fn busy_elapsed_secs(&self) -> u64 {
+        self.busy_started_at
+            .map_or(0, |started| started.elapsed().as_secs())
     }
 
     /// Updates the concise status label next to the animated busy spinner.

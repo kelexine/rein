@@ -1058,7 +1058,7 @@ fn stream_prompt_background(
 }
 
 fn tick_spinner(last_spin: &mut Instant, app: &mut AppState) {
-    if last_spin.elapsed() >= Duration::from_millis(110) {
+    if last_spin.elapsed() >= Duration::from_millis(180) {
         app.advance_spinner();
         *last_spin = Instant::now();
     }
