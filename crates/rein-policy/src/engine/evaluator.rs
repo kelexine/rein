@@ -158,6 +158,26 @@ impl PolicyEngine {
             Capability::AskUser => PolicyDecision::Allow {
                 reason: "interactive user clarification prompt permitted".to_owned(),
             },
+            Capability::WebSearch { .. } => PolicyDecision::Allow {
+                reason: "read-only web search permitted".to_owned(),
+            },
+            Capability::WebFetch { url, method } => {
+                if self.rules.mode == ModeId::Plan && method != "GET" {
+                    PolicyDecision::Deny {
+                        reason: format!(
+                            "plan mode is read-only and cannot perform {method} requests to '{url}'"
+                        ),
+                    }
+                } else if self.is_tool_allowlisted(tool_name) {
+                    PolicyDecision::Allow {
+                        reason: format!("tool '{tool_name}' matched configured allowlist"),
+                    }
+                } else {
+                    PolicyDecision::Ask {
+                        prompt: format!("Allow {method} web_fetch to '{url}'?"),
+                    }
+                }
+            }
         }
     }
 
@@ -1020,6 +1040,65 @@ mod tests {
             },
         )?;
         assert!(matches!(coding_personal, PolicyDecision::Deny { .. }));
+
+        let _ = std::fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_allows_and_web_fetch_asks_or_denies_mutating_in_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ws = std::env::temp_dir().join("rein_policy_web_tools_test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws)?;
+        let audit_path = ws.join("audit.jsonl");
+
+        let coding = PolicyEngine::with_sandbox_status(
+            PolicyRuleSet::coding_default(),
+            WorkspaceSandbox::new(&ws),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+        let search_dec = coding.evaluate(
+            "web_search",
+            &Capability::WebSearch {
+                query: "rust ureq".to_owned(),
+            },
+        )?;
+        assert!(matches!(search_dec, PolicyDecision::Allow { .. }));
+
+        let fetch_get = coding.evaluate(
+            "web_fetch",
+            &Capability::WebFetch {
+                url: "https://example.com".to_owned(),
+                method: "GET".to_owned(),
+            },
+        )?;
+        assert!(matches!(fetch_get, PolicyDecision::Ask { .. }));
+
+        let plan = PolicyEngine::with_sandbox_status(
+            PolicyRuleSet::plan_default(),
+            WorkspaceSandbox::new(&ws),
+            SandboxStatus::Enforced { abi_version: 5 },
+            AuditLog::new(&audit_path),
+        );
+        let plan_get = plan.evaluate(
+            "web_fetch",
+            &Capability::WebFetch {
+                url: "https://example.com".to_owned(),
+                method: "GET".to_owned(),
+            },
+        )?;
+        assert!(matches!(plan_get, PolicyDecision::Ask { .. }));
+
+        let plan_post = plan.evaluate(
+            "web_fetch",
+            &Capability::WebFetch {
+                url: "https://example.com".to_owned(),
+                method: "POST".to_owned(),
+            },
+        )?;
+        assert!(matches!(plan_post, PolicyDecision::Deny { .. }));
 
         let _ = std::fs::remove_dir_all(&ws);
         Ok(())

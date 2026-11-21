@@ -36,4 +36,12 @@ pub enum ToolError {
     /// JSONL serialization or parsing failure inside a tool backend.
     #[error("tool serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Runtime execution failure inside a tool (e.g., HTTP/API/conversion error).
+    #[error("tool '{tool}' failed: {reason}")]
+    Execution {
+        /// Tool name.
+        tool: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
 }

@@ -23,6 +23,8 @@ pub mod registry;
 pub mod tasks;
 /// Session and workspace todo checklist tools.
 pub mod todos;
+/// Web search and HTTP fetch tools (`web_search`, `web_fetch`).
+pub mod web;
 
 pub use ask::{AskQuestionTool, QuestionAnswer, QuestionHandler, QuestionSpec};
 pub use coding::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
@@ -41,3 +43,4 @@ pub use tasks::{
     TaskRegistry, TaskStatus, TaskSummary, TimerCondition,
 };
 pub use todos::{TodoItem, TodoListState, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};
+pub use web::{SearchBackend, WebFetchTool, WebSearchTool};

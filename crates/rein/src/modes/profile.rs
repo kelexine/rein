@@ -29,6 +29,8 @@ pub const CODING_TOOLS: &[&str] = &[
     "send_message",
     "swarm",
     "ask_question",
+    "web_search",
+    "web_fetch",
 ];
 
 /// Tool names enabled in the read-only Plan profile.
@@ -50,6 +52,8 @@ pub const PLAN_TOOLS: &[&str] = &[
     "send_message",
     "swarm",
     "ask_question",
+    "web_search",
+    "web_fetch",
 ];
 
 /// Tool names enabled in the Personal profile.
@@ -70,6 +74,8 @@ pub const PERSONAL_TOOLS: &[&str] = &[
     "send_message",
     "swarm",
     "ask_question",
+    "web_search",
+    "web_fetch",
 ];
 
 /// A self-contained mode profile keeping `rein-core` completely mode-agnostic.

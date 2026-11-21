@@ -97,4 +97,16 @@ pub enum Capability {
     },
     /// Interactive multiple-choice prompt asking the user clarifying questions (`ask_question`).
     AskUser,
+    /// Read-only web search (`web_search`) via Parallel AI or Brave Search.
+    WebSearch {
+        /// Search query string.
+        query: String,
+    },
+    /// HTTP request to an external URL (`web_fetch`), gated by explicit user permission.
+    WebFetch {
+        /// Target HTTP/HTTPS URL.
+        url: String,
+        /// HTTP method (`GET`, `POST`, `PUT`, `DELETE`).
+        method: String,
+    },
 }

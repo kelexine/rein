@@ -18,3 +18,6 @@ rein-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ureq.workspace = true
+htmd.workspace = true
+scraper.workspace = true

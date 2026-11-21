@@ -17,7 +17,7 @@ use rein_tools::{
     AskQuestionTool, BashTool, CalendarTool, CallMcpTool, EditTool, EmailTool, GlobTool, GrepTool,
     JsonlMemoryStore, ManageTaskTool, McpCatalog, McpClient, MemoryTool, NotesTool, ReadTool,
     ScheduleTool, SwitchModeTool, TaskNotification, TaskRegistry, TodoReadTool, TodoStore,
-    TodoWriteTool, ToolError, ToolRegistry, WriteTool,
+    TodoWriteTool, ToolError, ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 
 use rein::agent::{
@@ -485,6 +485,10 @@ fn build_registry(
     registry.register(Box::new(ScheduleTool::new(task_registry)));
     registry.register(Box::new(MemoryTool::new(memory)));
     registry.register(Box::new(SwitchModeTool::new()));
+    registry.register(Box::new(
+        WebSearchTool::new().with_credentials_dir(loaded.paths.global_dir.join("credentials")),
+    ));
+    registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(TodoWriteTool::with_store(todo_store.clone())));
     registry.register(Box::new(TodoReadTool::with_store(todo_store)));
     registry.register(Box::new(NotesTool::new(&loaded.paths.notes)));
