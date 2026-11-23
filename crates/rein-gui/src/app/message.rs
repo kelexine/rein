@@ -26,6 +26,8 @@ pub enum Message {
     ResumeSession(String),
     /// Switch active operating mode (`Coding`, `Plan`, `Personal`).
     SwitchMode(ModeId),
+    /// Toggle the `+` action popover menu above the composer.
+    TogglePlusMenu,
     /// Toggle the model picker popover.
     ToggleModelPicker,
     /// Select a model ID from the picker.
@@ -34,9 +36,11 @@ pub enum Message {
     CompactHistory,
     /// Toggle expand/collapse for a thinking or tool transcript card by index.
     ToggleExpand(usize),
+    /// Toggle expand/collapse for a grouped run of tool calls keyed by its starting index.
+    ToggleToolGroup(usize),
     /// Toggle expand/collapse for a long user prompt bubble by index.
     ToggleUserExpand(usize),
-    /// Open the right-hand split inspector pane with full paste/output content.
+    /// Open the right-hand split inspector pane with full paste/code/output content.
     OpenInspector {
         /// Inspector header title.
         title: String,

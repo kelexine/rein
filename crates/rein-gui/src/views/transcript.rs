@@ -1,27 +1,42 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Scrollable conversation transcript view with Claude Desktop bubbles, pasted cards, and disclosures
+// Purpose: Scrollable conversation transcript with grouped tool activity rows, bubbles, and markdown
 
 use iced::widget::{Space, button, column, container, markdown, row, scrollable, text};
 use iced::{Alignment, Element, Font, Length};
 
-use crate::app::{GuiApp, Message, TranscriptItem};
+use crate::app::{GuiApp, Message, ToolItemState, TranscriptItem};
 use crate::theme::palette::{
-    ACCENT_CORAL, STATUS_RED, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY, rein_markdown_settings,
+    ACCENT_CORAL, STATUS_GREEN, STATUS_RED, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
+    rein_markdown_settings,
 };
-use crate::theme::styles::{disclosure_card, ghost_button, pasted_badge_card, surface_card};
+use crate::theme::styles::{disclosure_card, ghost_button, pasted_badge_card, user_bubble};
 
 use super::tool_card;
 
 const SPINNER_FRAMES: [&str; 10] = ["✶", "✸", "✹", "✺", "✹", "✸", "✶", "✢", "✽", "✻"];
 
-/// Renders the scrollable, centered conversation column.
+/// Renders the scrollable, centered conversation column with consecutive tool grouping.
 #[must_use]
 pub fn view_transcript(app: &GuiApp) -> Element<'_, Message> {
     let mut col = column![].spacing(16).max_width(760.0).width(Length::Fill);
 
-    for (idx, item) in app.items.iter().enumerate() {
-        col = col.push(render_item(idx, item));
+    let mut idx = 0;
+    while idx < app.items.len() {
+        if matches!(app.items[idx], TranscriptItem::Tool { .. }) {
+            let start = idx;
+            while idx < app.items.len() && matches!(app.items[idx], TranscriptItem::Tool { .. }) {
+                idx += 1;
+            }
+            if idx - start >= 2 {
+                col = col.push(render_tool_group(app, start, &app.items[start..idx]));
+            } else {
+                col = col.push(render_item(start, &app.items[start]));
+            }
+        } else {
+            col = col.push(render_item(idx, &app.items[idx]));
+            idx += 1;
+        }
     }
 
     if app.busy {
@@ -38,6 +53,136 @@ pub fn view_transcript(app: &GuiApp) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn render_tool_group<'a>(
+    app: &'a GuiApp,
+    start_idx: usize,
+    slice: &'a [TranscriptItem],
+) -> Element<'a, Message> {
+    let expanded = app.expanded_tool_groups.contains(&start_idx);
+    let summary = summarize_tool_group(slice);
+    let any_running = slice.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::Tool {
+                state: ToolItemState::Running,
+                ..
+            }
+        )
+    });
+    let any_error = slice.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::Tool {
+                state: ToolItemState::Error,
+                ..
+            }
+        )
+    });
+    let dot_color = if any_running {
+        STATUS_YELLOW
+    } else if any_error {
+        STATUS_RED
+    } else {
+        STATUS_GREEN
+    };
+    let arrow = if expanded { "⌄" } else { "›" };
+
+    let header = button(
+        row![
+            text("●").size(8).color(dot_color),
+            text(format!("{summary}  {arrow}")).size(13).color(TEXT_MUTED),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 8])
+    .style(ghost_button)
+    .on_press(Message::ToggleToolGroup(start_idx));
+
+    if !expanded {
+        return header.into();
+    }
+
+    let mut inner = column![].spacing(4);
+    for (offset, item) in slice.iter().enumerate() {
+        inner = inner.push(render_item(start_idx + offset, item));
+    }
+    column![header, container(inner).padding([0, 12])]
+        .spacing(4)
+        .into()
+}
+
+fn summarize_tool_group(slice: &[TranscriptItem]) -> String {
+    let mut cmds = 0usize;
+    let mut reads = 0usize;
+    let mut edits = 0usize;
+    let mut searches = 0usize;
+    let mut other = 0usize;
+    let mut running_name: Option<&str> = None;
+
+    for item in slice {
+        if let TranscriptItem::Tool { name, state, .. } = item {
+            if *state == ToolItemState::Running {
+                running_name = Some(name.as_str());
+            }
+            match name.as_str() {
+                "bash" => cmds += 1,
+                "read" => reads += 1,
+                "edit" | "write" => edits += 1,
+                "glob" | "grep" | "web_search" => searches += 1,
+                _ => other += 1,
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if cmds > 0 {
+        parts.push(if cmds == 1 {
+            "ran 1 command".to_owned()
+        } else {
+            format!("ran {cmds} commands")
+        });
+    }
+    if reads > 0 {
+        parts.push(if reads == 1 {
+            "read 1 file".to_owned()
+        } else {
+            format!("read {reads} files")
+        });
+    }
+    if edits > 0 {
+        parts.push(if edits == 1 {
+            "edited 1 file".to_owned()
+        } else {
+            format!("edited {edits} files")
+        });
+    }
+    if searches > 0 {
+        parts.push(if searches == 1 {
+            "1 search".to_owned()
+        } else {
+            format!("{searches} searches")
+        });
+    }
+    if other > 0 {
+        parts.push(if other == 1 {
+            "1 tool".to_owned()
+        } else {
+            format!("{other} tools")
+        });
+    }
+
+    let mut joined = parts.join(", ");
+    if let Some(first) = joined.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    if let Some(active) = running_name {
+        format!("{joined} (running {active}…)")
+    } else {
+        joined
+    }
 }
 
 fn render_item<'a>(idx: usize, item: &'a TranscriptItem) -> Element<'a, Message> {
@@ -169,9 +314,9 @@ fn render_user_item<'a>(
     };
 
     let bubble = container(body)
-        .padding([10, 16])
+        .padding([11, 16])
         .max_width(560.0)
-        .style(surface_card);
+        .style(user_bubble);
     row![Space::new().width(Length::Fill), bubble]
         .width(Length::Fill)
         .into()

@@ -6,6 +6,8 @@
 pub mod composer;
 /// Empty-state centered greeting and composer layout.
 pub mod home;
+/// Split-view right inspector drawer with line numbers and syntax highlighting.
+pub mod inspector;
 /// Top-level window shell combining sidebar, topbar, main view, and modals.
 pub mod layout;
 /// Policy approval modal, `ask_question` picker, and background task drawer.

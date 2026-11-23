@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Rounded Claude Desktop-style composer card and model picker popover
+// Purpose: Sleek composer card with floating '+' action popover and model picker
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length};
@@ -9,14 +9,17 @@ use rein_core::ModeId;
 use crate::app::{GuiApp, Message};
 use crate::theme::palette::{ACCENT_CORAL, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
 use crate::theme::styles::{
-    composer_input, danger_button, elevated_card, ghost_button, pill_button, primary_button,
-    surface_card,
+    composer_card, composer_input, danger_button, elevated_card, ghost_button, pill_button,
+    primary_button,
 };
 
 /// Renders the bottom-pinned composer used during active conversations.
 #[must_use]
 pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
     let mut inner = column![].spacing(8).max_width(760.0).width(Length::Fill);
+    if app.plus_menu_open {
+        inner = inner.push(view_plus_menu(app));
+    }
     if app.model_picker_open {
         inner = inner.push(view_model_picker(app));
     }
@@ -54,20 +57,10 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
         .size(14)
         .style(composer_input);
 
-    let mode_label = match app.mode() {
-        ModeId::Coding => "Coding",
-        ModeId::Plan => "Plan",
-        ModeId::Personal => "Personal",
-    };
-    let next_mode = match app.mode() {
-        ModeId::Coding => ModeId::Plan,
-        ModeId::Plan => ModeId::Personal,
-        ModeId::Personal => ModeId::Coding,
-    };
-    let mode_btn = button(text(format!("+ {mode_label}")).size(12).color(TEXT_MUTED))
-        .padding([5, 10])
+    let plus_btn = button(text("+").size(16).color(TEXT_MUTED))
+        .padding([4, 10])
         .style(ghost_button)
-        .on_press(Message::SwitchMode(next_mode));
+        .on_press(Message::TogglePlusMenu);
 
     let model_btn = button(
         text(format!("{} ⌄", app.model_label))
@@ -84,7 +77,7 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
             .style(danger_button)
             .on_press(Message::CancelTurn)
     } else {
-        let btn = button(text("↑").size(14).color(TEXT_PRIMARY))
+        let btn = button(text("↑").size(14))
             .padding([6, 12])
             .style(primary_button);
         if app.input.trim().is_empty() {
@@ -95,7 +88,7 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
     };
 
     let bottom_row = row![
-        mode_btn,
+        plus_btn,
         Space::new().width(Length::Fill),
         model_btn,
         action_btn,
@@ -105,7 +98,65 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
 
     container(column![input, bottom_row].spacing(6).padding([8, 10]))
         .width(Length::Fill)
-        .style(surface_card)
+        .style(composer_card)
+        .into()
+}
+
+/// Renders the floating `+` action popover above the composer.
+#[must_use]
+pub fn view_plus_menu(app: &GuiApp) -> Element<'_, Message> {
+    let active_mode = app.mode();
+    let mode_row = |mode: ModeId, label: &'static str| {
+        let check = if active_mode == mode { "✓ " } else { "   " };
+        let color = if active_mode == mode {
+            ACCENT_CORAL
+        } else {
+            TEXT_PRIMARY
+        };
+        button(text(format!("{check}Mode: {label}")).size(13).color(color))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(ghost_button)
+            .on_press(Message::SwitchMode(mode))
+    };
+
+    let running_tasks = app
+        .tasks_snapshot
+        .iter()
+        .filter(|t| !t.status.is_done())
+        .count();
+    let tasks_label = if running_tasks > 0 {
+        format!("   Background tasks ({running_tasks})")
+    } else {
+        "   Background tasks".to_owned()
+    };
+
+    let list = column![
+        mode_row(ModeId::Coding, "Coding"),
+        mode_row(ModeId::Plan, "Plan (read-only)"),
+        mode_row(ModeId::Personal, "Personal"),
+        button(text(tasks_label).size(13).color(TEXT_MUTED))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(ghost_button)
+            .on_press(Message::ToggleTaskDrawer),
+        button(text("   Compact history").size(13).color(TEXT_MUTED))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(ghost_button)
+            .on_press(Message::CompactHistory),
+        button(text("   New chat").size(13).color(TEXT_MUTED))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(ghost_button)
+            .on_press(Message::NewSession),
+    ]
+    .spacing(2);
+
+    container(list)
+        .padding(8)
+        .max_width(240.0)
+        .style(elevated_card)
         .into()
 }
 

@@ -1,13 +1,15 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Collapsible left sidebar with New Chat, pre-truncated session history, and workspace footer
+// Purpose: Collapsible left sidebar with New Chat, pre-truncated session history, and monogram footer
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length};
 
 use crate::app::{GuiApp, Message};
 use crate::theme::palette::{ACCENT_CORAL, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
-use crate::theme::styles::{active_sidebar_button, ghost_button, pill_button, sidebar_container};
+use crate::theme::styles::{
+    active_sidebar_button, avatar_badge, ghost_button, pill_button, sidebar_container,
+};
 
 /// Renders the collapsible left sidebar (250px wide).
 #[must_use]
@@ -47,11 +49,28 @@ pub fn view_sidebar(app: &GuiApp) -> Element<'_, Message> {
         session_col = session_col.push(item);
     }
 
-    let footer = column![
-        text(&app.user_name).size(12).color(TEXT_PRIMARY),
-        text(&app.workspace_label).size(11).color(TEXT_DIM),
+    let initial = app
+        .user_name
+        .chars()
+        .next()
+        .map_or('R', |c| c.to_ascii_uppercase());
+    let badge = container(text(initial.to_string()).size(12))
+        .width(Length::Fixed(28.0))
+        .height(Length::Fixed(28.0))
+        .center_x(Length::Fixed(28.0))
+        .center_y(Length::Fixed(28.0))
+        .style(avatar_badge);
+
+    let footer = row![
+        badge,
+        column![
+            text(&app.user_name).size(12).color(TEXT_PRIMARY),
+            text(&app.workspace_label).size(11).color(TEXT_DIM),
+        ]
+        .spacing(2),
     ]
-    .spacing(2);
+    .spacing(10)
+    .align_y(Alignment::Center);
 
     let inner = column![
         new_btn,

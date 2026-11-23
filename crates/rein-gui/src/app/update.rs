@@ -35,6 +35,7 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             app.input.clear();
             app.model_picker_open = false;
+            app.plus_menu_open = false;
             app.items.push(TranscriptItem::user(trimmed.clone()));
             begin_busy(app, "Thinking…");
             app.worker
@@ -46,6 +47,7 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
                 return Task::none();
             }
             app.model_picker_open = false;
+            app.plus_menu_open = false;
             app.items.push(TranscriptItem::user(prompt.clone()));
             begin_busy(app, "Thinking…");
             app.worker.send(WorkerCommand::RunPrompt { prompt });
@@ -55,6 +57,8 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             if app.busy {
                 app.worker.cancel_turn();
                 app.busy_status = "Stopping…".to_owned();
+            } else if app.plus_menu_open {
+                app.plus_menu_open = false;
             } else if app.model_picker_open {
                 app.model_picker_open = false;
             } else if app.inspector.is_some() {
@@ -84,15 +88,26 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SwitchMode(mode) => {
+            app.plus_menu_open = false;
             if !app.busy {
                 app.worker.send(WorkerCommand::SwitchMode(mode));
             }
             Task::none()
         }
+        Message::TogglePlusMenu => {
+            app.plus_menu_open = !app.plus_menu_open;
+            if app.plus_menu_open {
+                app.model_picker_open = false;
+            }
+            Task::none()
+        }
         Message::ToggleModelPicker => {
             app.model_picker_open = !app.model_picker_open;
-            if app.model_picker_open && app.available_models.is_empty() {
-                app.worker.send(WorkerCommand::FetchModels);
+            if app.model_picker_open {
+                app.plus_menu_open = false;
+                if app.available_models.is_empty() {
+                    app.worker.send(WorkerCommand::FetchModels);
+                }
             }
             Task::none()
         }
@@ -114,6 +129,12 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             ) = app.items.get_mut(idx)
             {
                 *expanded = !*expanded;
+            }
+            Task::none()
+        }
+        Message::ToggleToolGroup(start_idx) => {
+            if !app.expanded_tool_groups.remove(&start_idx) {
+                app.expanded_tool_groups.insert(start_idx);
             }
             Task::none()
         }

@@ -2,6 +2,7 @@
 // Date: 2026-11-23
 // Purpose: GuiApp state, precomputed transcript items, and inspector state for rein-gui
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
@@ -228,6 +229,10 @@ pub struct GuiApp {
     pub transcript_id: Id,
     /// Optional right-hand split inspector drawer.
     pub inspector: Option<InspectorPane>,
+    /// Expanded grouped-tool runs keyed by the first item index in the run.
+    pub expanded_tool_groups: HashSet<usize>,
+    /// Whether the composer `+` action menu is open.
+    pub plus_menu_open: bool,
     /// Whether a turn is currently running.
     pub busy: bool,
     /// Shared flag read by the subscription ticker to throttle idle redraws.
@@ -320,6 +325,8 @@ impl GuiApp {
             items: Vec::new(),
             transcript_id: Id::unique(),
             inspector: None,
+            expanded_tool_groups: HashSet::new(),
+            plus_menu_open: false,
             busy: false,
             busy_flag: Arc::new(AtomicBool::new(false)),
             busy_status: "Thinking…".to_owned(),
