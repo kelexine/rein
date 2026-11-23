@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use anyhow::{Context, Result};
-use rein_core::{EventLog, Provider};
+use rein_core::{AvailableModel, EventLog, Provider};
 use rein_policy::{AuditLog, PolicyEngine, SandboxStatus, WorkspaceSandbox};
 use rein_tools::{
     AskQuestionTool, BashTool, CalendarTool, CallMcpTool, EditTool, EmailTool, GlobTool, GrepTool,
@@ -24,8 +24,8 @@ use crate::agent::{
 use crate::commands::{CommandSource, SlashCommand, SlashKind, SlashRegistry};
 use crate::config::{
     LoadedReinState, ProviderKind, apply_provider_switch, build_provider, ensure_dirs_and_load,
-    generate_session_uid, is_valid_session_uid, provider_startup_notice, read_repo_override_keys,
-    resolve_resume_session, write_latest_session_uid,
+    generate_session_uid, is_valid_session_uid, load_cached_models, provider_startup_notice,
+    read_repo_override_keys, resolve_resume_session, write_latest_session_uid,
 };
 use crate::modes::{Profile, RuntimeContext, utc_today_iso};
 use crate::plugins::PluginManager;
@@ -82,6 +82,8 @@ pub struct ReinSession {
     pub question_relay: SharedQuestionRelay,
     /// Keys overridden in repository `.rein/config.json`.
     pub repo_overrides: Vec<String>,
+    /// Disk-cached model list for the active provider, loaded at startup.
+    pub cached_models: Vec<AvailableModel>,
 }
 
 impl ReinSession {
@@ -297,6 +299,7 @@ impl ReinSession {
             .with_extra_tools(mcp_tools)
             .with_runtime_context(runtime_context);
         let repo_overrides = read_repo_override_keys(&loaded.paths.repo_config);
+        let cached_models = load_cached_models(&loaded.paths.global_dir, active_kind);
 
         Ok(Self {
             loaded,
@@ -319,6 +322,7 @@ impl ReinSession {
             swarm_manager,
             question_relay,
             repo_overrides,
+            cached_models,
         })
     }
 }

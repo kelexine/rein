@@ -15,7 +15,8 @@ use rein_tools::{JsonlMemoryStore, McpCatalog, TaskRegistry, TodoStore};
 
 use rein::agent::{AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest};
 use rein::config::{
-    LoadedReinState, ProviderKind, ensure_dirs_and_load, list_sessions, save_provider_selection,
+    LoadedReinState, ProviderKind, build_provider, ensure_dirs_and_load, list_sessions,
+    save_cached_models, save_provider_selection,
 };
 use rein::modes::Profile;
 use rein::runtime::{ReinSession, build_registry, has_bypass_permissions_flag, parse_resume_flag};
@@ -64,7 +65,7 @@ fn main() -> Result<()> {
 
 fn run_interactive_tui(mut session: ReinSession) -> Result<()> {
     let bypass_permissions = session.agent.policy().is_bypass_permissions();
-    let mut app = AppState::new(
+    let app = AppState::new(
         session.agent.active_profile().clone(),
         session.sandbox_label,
         session.model_label,
@@ -87,7 +88,23 @@ fn run_interactive_tui(mut session: ReinSession) -> Result<()> {
         session.loaded.config.settings.clone(),
         session.repo_overrides,
     )
-    .with_plugin_manager(session.plugin_manager);
+    .with_plugin_manager(session.plugin_manager)
+    .with_cached_models(session.cached_models);
+
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+    let bg_kind = session.provider_kind;
+    let bg_cfg = session.loaded.config.clone();
+    let bg_global_dir = session.loaded.paths.global_dir.clone();
+    std::thread::spawn(move || {
+        let (mut probe, _) = build_provider(bg_kind, &bg_cfg);
+        if let Ok(models) = probe.list_models()
+            && !models.is_empty()
+        {
+            save_cached_models(&bg_global_dir, bg_kind, &models);
+            let _ = refresh_tx.send(models);
+        }
+    });
+    let mut app = app.with_model_refresh_rx(refresh_rx);
 
     if session.should_hydrate {
         app.extend_hydrated(session.agent.hydrate_structured()?);

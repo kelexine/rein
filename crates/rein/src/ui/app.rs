@@ -354,6 +354,8 @@ pub struct AppState {
     pending_plugins_modal: Option<PendingPluginsModal>,
     queued_messages: Vec<(String, String)>,
     steering_pending: Vec<String>,
+    cached_models: Vec<AvailableModel>,
+    model_refresh_rx: Option<mpsc::Receiver<Vec<AvailableModel>>>,
 }
 
 /// Returns the vendor group label and sort rank (`0`: Google Gemini, `1`: Anthropic Claude, `2`: OpenAI GPT, `3`: Other).
@@ -457,6 +459,8 @@ impl AppState {
             pending_plugins_modal: None,
             queued_messages: Vec::new(),
             steering_pending: Vec::new(),
+            cached_models: Vec::new(),
+            model_refresh_rx: None,
         }
     }
 
@@ -734,6 +738,43 @@ impl AppState {
     #[must_use]
     pub fn model_quota(&self) -> Option<u8> {
         self.model_quota
+    }
+
+    /// Pre-seeds the in-memory model catalog from the startup disk cache.
+    #[must_use]
+    pub fn with_cached_models(mut self, models: Vec<AvailableModel>) -> Self {
+        self.cached_models = models;
+        self
+    }
+
+    /// Attaches a background model-refresh receiver populated on TUI launch.
+    #[must_use]
+    pub fn with_model_refresh_rx(mut self, rx: mpsc::Receiver<Vec<AvailableModel>>) -> Self {
+        self.model_refresh_rx = Some(rx);
+        self
+    }
+
+    /// Returns the cached model list for the active provider.
+    #[must_use]
+    pub fn cached_models(&self) -> &[AvailableModel] {
+        &self.cached_models
+    }
+
+    /// Replaces the cached model list for the active provider.
+    pub fn set_cached_models(&mut self, models: Vec<AvailableModel>) {
+        self.cached_models = models;
+    }
+
+    /// Drains any completed startup model refresh without blocking.
+    pub fn poll_model_refresh(&mut self) {
+        if let Some(rx) = &self.model_refresh_rx
+            && let Ok(models) = rx.try_recv()
+        {
+            if !models.is_empty() {
+                self.cached_models = models;
+            }
+            self.model_refresh_rx = None;
+        }
     }
 
     /// Accumulates per-turn token usage into session totals.

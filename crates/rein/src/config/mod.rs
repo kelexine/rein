@@ -4,6 +4,8 @@
 
 /// Loader and filesystem initializers for dual-scope Rein configurations.
 pub mod loader;
+/// Persistent per-provider model catalog cache.
+pub mod models_cache;
 
 pub use loader::{
     DreamConfig, LoadedReinState, ProviderKind, ReinConfig, ReinPaths, SessionSummary, UiSettings,
@@ -13,3 +15,4 @@ pub use loader::{
     resolve_model_target, resolve_resume_session, save_global_settings, save_provider_selection,
     write_latest_session_uid,
 };
+pub use models_cache::{load_cached_models, save_cached_models};
