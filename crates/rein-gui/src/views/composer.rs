@@ -36,9 +36,9 @@ pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
         .width(Length::Fill)
         .center_x(Length::Fill)
         .padding(iced::Padding {
-            top: 8.0,
+            top: 6.0,
             right: 24.0,
-            bottom: 14.0,
+            bottom: 12.0,
             left: 24.0,
         })
         .into()
@@ -75,11 +75,11 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
             .color(TEXT_MUTED),
     )
     .padding([5, 10])
-    .style(pill_button)
+    .style(ghost_button)
     .on_press(Message::ToggleModelPicker);
 
     let action_btn = if app.busy {
-        button(text("■ Stop").size(12).color(TEXT_PRIMARY))
+        button(text("■").size(12).color(TEXT_PRIMARY))
             .padding([6, 12])
             .style(danger_button)
             .on_press(Message::CancelTurn)
@@ -130,7 +130,7 @@ pub fn view_model_picker(app: &GuiApp) -> Element<'_, Message> {
             let item = button(text(label).size(13).color(color))
                 .width(Length::Fill)
                 .padding([6, 10])
-                .style(ghost_button)
+                .style(pill_button)
                 .on_press(Message::SelectModel(m.id.clone()));
             list = list.push(item);
         }

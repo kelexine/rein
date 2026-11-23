@@ -1,15 +1,15 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Collapsible left sidebar with New Chat, session history, and workspace footer
+// Purpose: Collapsible left sidebar with New Chat, pre-truncated session history, and workspace footer
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length};
 
 use crate::app::{GuiApp, Message};
 use crate::theme::palette::{ACCENT_CORAL, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
-use crate::theme::styles::{ghost_button, pill_button, sidebar_container};
+use crate::theme::styles::{active_sidebar_button, ghost_button, pill_button, sidebar_container};
 
-/// Renders the collapsible left sidebar (260px wide).
+/// Renders the collapsible left sidebar (250px wide).
 #[must_use]
 pub fn view_sidebar(app: &GuiApp) -> Element<'_, Message> {
     let new_btn = button(
@@ -31,21 +31,18 @@ pub fn view_sidebar(app: &GuiApp) -> Element<'_, Message> {
         .style(ghost_button)
         .on_press(Message::CompactHistory);
 
-    let mut session_col = column![text("Chats").size(11).color(TEXT_DIM)].spacing(4);
+    let mut session_col = column![text("Recents").size(11).color(TEXT_DIM)].spacing(4);
     for s in app.sessions.iter().take(24) {
-        let preview = s
-            .preview
-            .as_deref()
-            .unwrap_or("Empty session")
-            .chars()
-            .take(30)
-            .collect::<String>();
         let is_active = s.uid == app.session_uid;
-        let label_color = if is_active { ACCENT_CORAL } else { TEXT_MUTED };
-        let item = button(text(preview).size(12).color(label_color))
+        let label_color = if is_active { TEXT_PRIMARY } else { TEXT_MUTED };
+        let item = button(text(&s.label).size(12).color(label_color))
             .width(Length::Fill)
             .padding([6, 10])
-            .style(ghost_button)
+            .style(if is_active {
+                active_sidebar_button
+            } else {
+                ghost_button
+            })
             .on_press(Message::ResumeSession(s.uid.clone()));
         session_col = session_col.push(item);
     }

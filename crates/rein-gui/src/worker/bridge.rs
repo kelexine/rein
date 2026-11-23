@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use rein::agent::ApprovalDecision;
 use rein::config::{
-    build_provider, generate_session_uid, resolve_resume_session, write_latest_session_uid,
+    build_provider, generate_session_uid, resolve_resume_session, save_cached_models,
+    save_provider_selection, write_latest_session_uid,
 };
 use rein::runtime::ReinSession;
 use rein_core::{CoreError, EventLog, ModeId};
@@ -153,20 +154,32 @@ fn handle_command(
                 let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
             }
         },
-        WorkerCommand::FetchModels => match session.provider.list_models() {
-            Ok(models) => {
+        WorkerCommand::FetchModels => {
+            if let Ok(models) = session.provider.list_models() {
+                save_cached_models(
+                    &session.loaded.paths.global_dir,
+                    session.provider_kind,
+                    &models,
+                );
                 let _ = bridge.ev_tx.send(WorkerEvent::ModelsLoaded(models));
             }
-            Err(err) => {
-                let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
-            }
-        },
+        }
         WorkerCommand::SelectModel(model_id) => {
             session.loaded.config.model = Some(model_id.clone());
-            let (new_provider, model_label) =
-                build_provider(session.provider_kind, &session.loaded.config);
-            session.provider = new_provider;
+            let model_label = if session.provider.set_model(&model_id) {
+                format!("{}/{}", session.provider_kind.as_str(), model_id)
+            } else {
+                let (new_provider, label) =
+                    build_provider(session.provider_kind, &session.loaded.config);
+                session.provider = new_provider;
+                label
+            };
             session.model_label = model_label.clone();
+            let _ = save_provider_selection(
+                &session.loaded.paths.global_config,
+                session.provider_kind,
+                Some(&model_id),
+            );
             let _ = bridge.ev_tx.send(WorkerEvent::ModelSelected(model_label));
         }
         WorkerCommand::Compact => {

@@ -12,6 +12,10 @@ use iced::{Subscription, keyboard, stream};
 
 use crate::app::Message;
 
+const BUSY_TICK_MS: u64 = 100;
+const IDLE_SLEEP_MS: u64 = 120;
+const IDLE_TASK_POLL_MS: u64 = 1500;
+
 #[derive(Clone)]
 struct PollFlags {
     busy: Arc<AtomicBool>,
@@ -64,10 +68,13 @@ fn tick_stream(
             std::thread::spawn(move || {
                 let mut last_idle_check = Instant::now();
                 loop {
-                    std::thread::sleep(Duration::from_millis(60));
                     let is_busy = busy_flag.load(Ordering::Relaxed);
+                    let sleep_ms = if is_busy { BUSY_TICK_MS } else { IDLE_SLEEP_MS };
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+
                     let has_wake = wake_flag.swap(false, Ordering::AcqRel);
-                    let idle_task_poll = last_idle_check.elapsed() >= Duration::from_millis(500);
+                    let idle_task_poll =
+                        !is_busy && last_idle_check.elapsed() >= Duration::from_millis(IDLE_TASK_POLL_MS);
                     if is_busy || has_wake || idle_task_poll {
                         if idle_task_poll {
                             last_idle_check = Instant::now();

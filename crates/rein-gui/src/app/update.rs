@@ -1,12 +1,14 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Elm update() logic handling UI messages, worker events, and background task wakeups
+// Purpose: Elm update() logic handling UI messages, worker events, auto-scroll, and inspector actions
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use iced::Task;
+use iced::clipboard;
 use iced::widget::markdown;
+use iced::widget::operation::{RelativeOffset, snap_to};
 use rein::agent::ApprovalDecision;
 use rein_core::{ToolCall, ToolOutput};
 use rein_tools::{QuestionAnswer, TaskNotification, TaskStatus};
@@ -14,7 +16,9 @@ use rein_tools::{QuestionAnswer, TaskNotification, TaskStatus};
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt, WorkerCommand, WorkerEvent};
 
 use super::message::Message;
-use super::state::{GuiApp, ToolItemState, TranscriptItem};
+use super::state::{GuiApp, InspectorPane, ToolItemState, TranscriptItem, collapse_preview};
+
+const STREAM_MD_THROTTLE_MS: u64 = 200;
 
 /// Processes a [`Message`] and updates [`GuiApp`] state.
 pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
@@ -31,21 +35,21 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             app.input.clear();
             app.model_picker_open = false;
-            app.items.push(TranscriptItem::User(trimmed.clone()));
+            app.items.push(TranscriptItem::user(trimmed.clone()));
             begin_busy(app, "Thinking…");
             app.worker
                 .send(WorkerCommand::RunPrompt { prompt: trimmed });
-            Task::none()
+            scroll_transcript_to_bottom(app)
         }
         Message::QuickPrompt(prompt) => {
             if app.busy {
                 return Task::none();
             }
             app.model_picker_open = false;
-            app.items.push(TranscriptItem::User(prompt.clone()));
+            app.items.push(TranscriptItem::user(prompt.clone()));
             begin_busy(app, "Thinking…");
             app.worker.send(WorkerCommand::RunPrompt { prompt });
-            Task::none()
+            scroll_transcript_to_bottom(app)
         }
         Message::CancelTurn => {
             if app.busy {
@@ -53,6 +57,8 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
                 app.busy_status = "Stopping…".to_owned();
             } else if app.model_picker_open {
                 app.model_picker_open = false;
+            } else if app.inspector.is_some() {
+                app.inspector = None;
             }
             Task::none()
         }
@@ -65,12 +71,14 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
         }
         Message::NewSession => {
             if !app.busy {
+                app.inspector = None;
                 app.worker.send(WorkerCommand::NewSession);
             }
             Task::none()
         }
         Message::ResumeSession(uid) => {
             if !app.busy {
+                app.inspector = None;
                 app.worker.send(WorkerCommand::ResumeSession(uid));
             }
             Task::none()
@@ -109,6 +117,29 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::ToggleUserExpand(idx) => {
+            if let Some(TranscriptItem::User { expanded, .. }) = app.items.get_mut(idx) {
+                *expanded = !*expanded;
+            }
+            Task::none()
+        }
+        Message::OpenInspector {
+            title,
+            subtitle,
+            content,
+        } => {
+            app.inspector = Some(InspectorPane {
+                title,
+                subtitle,
+                content,
+            });
+            Task::none()
+        }
+        Message::CloseInspector => {
+            app.inspector = None;
+            Task::none()
+        }
+        Message::CopyText(text) => clipboard::write(text),
         Message::ApprovalFeedbackChanged(fb) => {
             if let Some(pending) = &mut app.pending_approval {
                 pending.feedback = fb;
@@ -155,6 +186,10 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
     }
 }
 
+fn scroll_transcript_to_bottom(app: &GuiApp) -> Task<Message> {
+    snap_to(app.transcript_id.clone(), RelativeOffset::END)
+}
+
 fn begin_busy(app: &mut GuiApp, status: &str) {
     app.busy = true;
     app.busy_flag.store(true, Ordering::Release);
@@ -166,16 +201,27 @@ fn handle_tick(app: &mut GuiApp) -> Task<Message> {
     if app.busy {
         app.spinner_tick = app.spinner_tick.wrapping_add(1);
     }
+    let mut should_scroll = false;
     for ev in app.worker.drain_events() {
+        if matches!(
+            ev,
+            WorkerEvent::TextDelta(_)
+                | WorkerEvent::ToolStart(_)
+                | WorkerEvent::ToolFinish(_, _)
+                | WorkerEvent::SessionHydrated { .. }
+        ) {
+            should_scroll = true;
+        }
         apply_worker_event(app, ev);
-    }
-    if app.task_drawer_open {
-        app.tasks_snapshot = app.task_registry.list_tasks();
     }
     if !app.busy && app.pending_approval.is_none() && app.pending_question.is_none() {
         drain_wakeups(app);
     }
-    Task::none()
+    if should_scroll {
+        scroll_transcript_to_bottom(app)
+    } else {
+        Task::none()
+    }
 }
 
 fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
@@ -265,6 +311,7 @@ fn append_thinking(app: &mut GuiApp, delta: &str) {
         app.thinking_started_at = Some(Instant::now());
         app.items.push(TranscriptItem::Thinking {
             content: delta.to_owned(),
+            preview: String::new(),
             elapsed_secs: 0,
             active: true,
             expanded: false,
@@ -278,6 +325,8 @@ fn finalize_thinking(app: &mut GuiApp) {
         .take()
         .map_or(1, |t| t.elapsed().as_secs().max(1));
     if let Some(TranscriptItem::Thinking {
+        content,
+        preview,
         elapsed_secs,
         active,
         ..
@@ -286,6 +335,7 @@ fn finalize_thinking(app: &mut GuiApp) {
     {
         *active = false;
         *elapsed_secs = (*elapsed_secs).max(elapsed);
+        *preview = collapse_preview(content, 100);
     }
 }
 
@@ -297,7 +347,7 @@ fn append_assistant_delta(app: &mut GuiApp, delta: &str) {
     app.busy_status = "Responding…".to_owned();
     if let Some(TranscriptItem::Assistant { raw, parsed }) = app.items.last_mut() {
         raw.push_str(delta);
-        if app.last_md_parse.elapsed() >= Duration::from_millis(160) {
+        if app.last_md_parse.elapsed() >= Duration::from_millis(STREAM_MD_THROTTLE_MS) {
             *parsed = markdown::Content::parse(raw);
             app.last_md_parse = Instant::now();
         }
@@ -456,6 +506,9 @@ fn drain_wakeups(app: &mut GuiApp) {
         }
     }
 
+    if app.task_drawer_open {
+        app.tasks_snapshot = app.task_registry.list_tasks();
+    }
     let display = format!("[task wakeup] {}", labels.join(", "));
     let prompt = format!(
         "[Background Task / Schedule Wakeup Notification]\n{}\n\nRespond to these completed task/schedule events and continue any pending work.",

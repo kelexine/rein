@@ -1,14 +1,16 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Top-level Iced view shell (sidebar + topbar + home/transcript + overlays)
+// Purpose: Top-level Iced view shell (sidebar + topbar + home/transcript + split inspector + overlays)
 
-use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Element, Length};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::{Alignment, Element, Font, Length};
 use rein_core::ModeId;
 
-use crate::app::{GuiApp, Message};
+use crate::app::{GuiApp, InspectorPane, Message};
 use crate::theme::palette::{ACCENT_BLUE, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
-use crate::theme::styles::{canvas_container, ghost_button, pill_button, primary_button};
+use crate::theme::styles::{
+    canvas_container, ghost_button, inspector_container, pill_button, primary_button,
+};
 
 use super::{composer, home, modals, sidebar, transcript};
 
@@ -28,27 +30,28 @@ pub fn view(app: &GuiApp) -> Element<'_, Message> {
         .into()
     };
 
-    let mut main_col = column![topbar, body]
+    let mut center_col = column![topbar, body]
         .width(Length::Fill)
         .height(Length::Fill);
 
     if app.task_drawer_open {
-        main_col = main_col.push(modals::view_task_drawer(app));
+        center_col = center_col.push(modals::view_task_drawer(app));
     }
     if let Some(pending) = &app.pending_approval {
-        main_col = main_col.push(modals::view_approval_banner(pending));
+        center_col = center_col.push(modals::view_approval_banner(pending));
     }
     if let Some(question) = &app.pending_question {
-        main_col = main_col.push(modals::view_question_banner(app, question));
+        center_col = center_col.push(modals::view_question_banner(app, question));
     }
 
-    let root = if app.sidebar_open {
-        row![sidebar::view_sidebar(app), main_col]
-            .width(Length::Fill)
-            .height(Length::Fill)
-    } else {
-        row![main_col].width(Length::Fill).height(Length::Fill)
-    };
+    let mut root = row![].width(Length::Fill).height(Length::Fill);
+    if app.sidebar_open {
+        root = root.push(sidebar::view_sidebar(app));
+    }
+    root = root.push(center_col);
+    if let Some(pane) = &app.inspector {
+        root = root.push(render_inspector_pane(pane));
+    }
 
     container(root)
         .width(Length::Fill)
@@ -59,7 +62,7 @@ pub fn view(app: &GuiApp) -> Element<'_, Message> {
 
 fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
     let sidebar_btn = button(text("◧").size(15).color(TEXT_MUTED))
-        .padding([6, 10])
+        .padding([5, 9])
         .style(ghost_button)
         .on_press(Message::ToggleSidebar);
 
@@ -110,6 +113,50 @@ fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
     .padding([8, 14])
     .align_y(Alignment::Center)
     .into()
+}
+
+fn render_inspector_pane(pane: &InspectorPane) -> Element<'_, Message> {
+    let header = row![
+        text("‹").size(16).color(TEXT_MUTED),
+        text(&pane.title).size(13).color(TEXT_PRIMARY),
+        Space::new().width(Length::Fill),
+        button(text("Copy").size(12).color(TEXT_MUTED))
+            .padding([4, 8])
+            .style(ghost_button)
+            .on_press(Message::CopyText(pane.content.clone())),
+        button(text("✕").size(13).color(TEXT_MUTED))
+            .padding([4, 8])
+            .style(ghost_button)
+            .on_press(Message::CloseInspector),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let meta = text(&pane.subtitle).size(11).color(TEXT_DIM);
+
+    let body = scrollable(
+        container(
+            text(&pane.content)
+                .size(12)
+                .font(Font::MONOSPACE)
+                .color(TEXT_PRIMARY),
+        )
+        .padding([8, 4])
+        .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let inner = column![header, meta, body]
+        .spacing(10)
+        .padding(14)
+        .width(Length::Fixed(440.0))
+        .height(Length::Fill);
+
+    container(inner)
+        .height(Length::Fill)
+        .style(inspector_container)
+        .into()
 }
 
 fn mode_segment(active: ModeId, target: ModeId, label: &'static str) -> Element<'static, Message> {

@@ -34,6 +34,21 @@ pub enum Message {
     CompactHistory,
     /// Toggle expand/collapse for a thinking or tool transcript card by index.
     ToggleExpand(usize),
+    /// Toggle expand/collapse for a long user prompt bubble by index.
+    ToggleUserExpand(usize),
+    /// Open the right-hand split inspector pane with full paste/output content.
+    OpenInspector {
+        /// Inspector header title.
+        title: String,
+        /// Inspector metadata subtitle (e.g. size and line count).
+        subtitle: String,
+        /// Full text content displayed in the inspector.
+        content: String,
+    },
+    /// Close the right-hand split inspector pane.
+    CloseInspector,
+    /// Copy text to the system clipboard.
+    CopyText(String),
     /// Update approval modal feedback text.
     ApprovalFeedbackChanged(String),
     /// Resolve the pending policy approval request.

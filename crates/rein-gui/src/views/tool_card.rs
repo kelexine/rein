@@ -1,18 +1,18 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Human-friendly tool card formatting (diffs, bash output, search results, file previews)
+// Purpose: Claude Desktop-style inline disclosure tool cards with inspector & diff support
 
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Font, Length};
 use serde_json::Value;
 
-use crate::app::{Message, ToolItemState};
+use crate::app::{Message, ToolItemState, format_size_and_lines};
 use crate::theme::palette::{
     STATUS_GREEN, STATUS_RED, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
 };
 use crate::theme::styles::{disclosure_card, ghost_button};
 
-/// Renders a collapsible tool card with human-readable title, summary, and formatted output.
+/// Renders a collapsible tool card with muted inline header when collapsed and code card when expanded.
 #[must_use]
 pub fn render_tool_card<'a>(
     idx: usize,
@@ -36,55 +36,59 @@ pub fn render_tool_card<'a>(
     let arrow = if expanded { "⌄" } else { "›" };
 
     let mut header_row = row![
-        text("●").size(10).color(dot_color),
-        text(title).size(13).color(TEXT_PRIMARY),
+        text("●").size(9).color(dot_color),
+        text(title).size(13).color(TEXT_MUTED),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
 
     if !subtitle.is_empty() {
         header_row = header_row.push(
-            text(subtitle)
+            text(subtitle.clone())
                 .size(12)
                 .font(Font::MONOSPACE)
-                .color(TEXT_MUTED),
+                .color(TEXT_DIM),
         );
     }
 
     header_row = header_row
         .push(Space::new().width(Length::Fill))
         .push(text(status_badge).size(11).color(TEXT_DIM))
-        .push(text(arrow).size(13).color(TEXT_MUTED));
+        .push(text(arrow).size(13).color(TEXT_DIM));
 
     let header = button(header_row)
         .width(Length::Fill)
-        .padding([7, 12])
+        .padding([4, 8])
         .style(ghost_button)
         .on_press(Message::ToggleExpand(idx));
 
     if !expanded {
-        return container(header)
-            .width(Length::Fill)
-            .style(disclosure_card)
-            .into();
+        return header.into();
     }
 
     let body = format_tool_body(name, arguments, output);
-    container(
+    let line_count = output.lines().count().max(1);
+    let inspect_btn = button(text("Open in inspector ›").size(11).color(TEXT_DIM))
+        .padding([2, 6])
+        .style(ghost_button)
+        .on_press(Message::OpenInspector {
+            title: format!("{name} output"),
+            subtitle: format_size_and_lines(output.len(), line_count),
+            content: output.to_owned(),
+        });
+
+    let body_card = container(
         column![
-            header,
-            container(body).padding(iced::Padding {
-                top: 2.0,
-                right: 12.0,
-                bottom: 10.0,
-                left: 12.0,
-            })
+            body,
+            row![Space::new().width(Length::Fill), inspect_btn],
         ]
-        .spacing(4),
+        .spacing(6),
     )
+    .padding(12)
     .width(Length::Fill)
-    .style(disclosure_card)
-    .into()
+    .style(disclosure_card);
+
+    column![header, body_card].spacing(4).into()
 }
 
 fn format_tool_title(name: &str, args: &Value) -> (String, String) {

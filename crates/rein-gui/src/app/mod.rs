@@ -10,5 +10,5 @@ pub mod state;
 pub mod update;
 
 pub use message::Message;
-pub use state::{GuiApp, ToolItemState, TranscriptItem};
+pub use state::{GuiApp, InspectorPane, ToolItemState, TranscriptItem, format_size_and_lines};
 pub use update::update;

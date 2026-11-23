@@ -1,14 +1,14 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Iced container, button, and input styles matching Claude Desktop dark UI
+// Purpose: Iced container, button, and input styles matching Claude Desktop warm dark UI
 
 use iced::border::Radius;
 use iced::widget::{button, container, text_input};
 use iced::{Background, Border, Color, Theme};
 
 use super::palette::{
-    ACCENT_CORAL, BG_CANVAS, BG_ELEVATED, BG_SIDEBAR, BG_SURFACE, BORDER_SUBTLE, STATUS_RED,
-    TEXT_MUTED, TEXT_PRIMARY,
+    ACCENT_CORAL, BG_CANVAS, BG_CODE, BG_ELEVATED, BG_INSPECTOR, BG_SIDEBAR, BG_SURFACE,
+    BORDER_SUBTLE, STATUS_RED, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// Main canvas container style.
@@ -36,6 +36,21 @@ pub fn sidebar_container(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Right-hand split inspector drawer style (Pasted content / Tool output).
+#[must_use]
+pub fn inspector_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_INSPECTOR)),
+        border: Border {
+            color: BORDER_SUBTLE,
+            width: 1.0,
+            radius: Radius::default(),
+        },
+        text_color: Some(TEXT_PRIMARY),
+        ..Default::default()
+    }
+}
+
 /// Rounded composer card & user bubble container style.
 #[must_use]
 pub fn surface_card(_theme: &Theme) -> container::Style {
@@ -45,6 +60,21 @@ pub fn surface_card(_theme: &Theme) -> container::Style {
             color: BORDER_SUBTLE,
             width: 1.0,
             radius: 14.0.into(),
+        },
+        text_color: Some(TEXT_PRIMARY),
+        ..Default::default()
+    }
+}
+
+/// Compact `PASTED` attachment badge container style.
+#[must_use]
+pub fn pasted_badge_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SURFACE)),
+        border: Border {
+            color: BORDER_SUBTLE,
+            width: 1.0,
+            radius: 10.0.into(),
         },
         text_color: Some(TEXT_PRIMARY),
         ..Default::default()
@@ -70,7 +100,7 @@ pub fn elevated_card(_theme: &Theme) -> container::Style {
 #[must_use]
 pub fn disclosure_card(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
+        background: Some(Background::Color(BG_CODE)),
         border: Border {
             color: BORDER_SUBTLE,
             width: 1.0,
@@ -90,6 +120,24 @@ pub fn ghost_button(_theme: &Theme, status: button::Status) -> button::Style {
     };
     button::Style {
         background: bg,
+        text_color: TEXT_PRIMARY,
+        border: Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Active sidebar session row button.
+#[must_use]
+pub fn active_sidebar_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => BG_ELEVATED,
+        _ => BG_SURFACE,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
         text_color: TEXT_PRIMARY,
         border: Border {
             radius: 8.0.into(),
