@@ -1,0 +1,23 @@
+# Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
+# Date: 2026-11-23
+# Purpose: Manifest for rein-gui (Iced desktop GUI frontend reusing rein::runtime)
+
+[package]
+name = "rein-gui"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iced.workspace = true
+rein.workspace = true
+rein-core.workspace = true
+rein-policy.workspace = true
+rein-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
