@@ -81,6 +81,18 @@ pub trait Provider: Send {
         Ok(Vec::new())
     }
 
+    /// Returns cached models from the last [`Self::list_models`] call, if any.
+    #[must_use]
+    fn cached_models(&self) -> &[AvailableModel] {
+        &[]
+    }
+
+    /// Updates the active model ID in place without discarding cached provider state.
+    /// Returns `false` if the provider does not support in-place model switching.
+    fn set_model(&mut self, _model: &str) -> bool {
+        false
+    }
+
     /// Returns cached remaining quota percentage (`0..=100`) for the active model if known.
     #[must_use]
     fn active_model_quota(&self) -> Option<u8> {

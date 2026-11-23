@@ -143,6 +143,11 @@ impl Provider for AnthropicProvider {
         Ok(parse_anthropic_models(&val))
     }
 
+    fn set_model(&mut self, model: &str) -> bool {
+        self.config.model = model.to_owned();
+        true
+    }
+
     fn stream_turn_with(
         &mut self,
         system_prompt: &str,
