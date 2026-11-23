@@ -70,11 +70,6 @@ pub fn render_markdown_blocks(source: &str, max_width: u16) -> Vec<Line<'static>
             continue;
         }
 
-        if trimmed.starts_with("<think>") {
-            i = consume_thought_block(&raw_lines, i, width, &mut out);
-            continue;
-        }
-
         if is_table_start(&raw_lines, i) {
             i = consume_table(&raw_lines, i, max_width, &mut out);
             continue;
@@ -174,44 +169,6 @@ fn consume_code_block(
         }
         out.push(Line::from(styled_spans));
         idx += 1;
-    }
-    idx
-}
-
-fn consume_thought_block(
-    lines: &[&str],
-    start: usize,
-    width: usize,
-    out: &mut Vec<Line<'static>>,
-) -> usize {
-    let thought_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
-    let prefix = [Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-    let mut idx = start;
-    while idx < lines.len() {
-        let mut text = lines[idx].trim();
-        if idx == start {
-            text = text.strip_prefix("<think>").unwrap_or(text).trim_start();
-        }
-        let closed = if let Some(before) = text.strip_suffix("</think>") {
-            text = before.trim_end();
-            true
-        } else if let Some(pos) = text.find("</think>") {
-            text = text[..pos].trim_end();
-            true
-        } else {
-            false
-        };
-
-        if !text.is_empty() {
-            let spans = parse_inline_spans(text, thought_style);
-            out.extend(wrap_styled_spans(&spans, width, &prefix));
-        }
-        idx += 1;
-        if closed {
-            break;
-        }
     }
     idx
 }
@@ -1018,13 +975,9 @@ let x = 1;
     }
 
     #[test]
-    fn preserves_snake_case_and_renders_escapes_and_thoughts() {
+    fn preserves_snake_case_and_renders_escapes() {
         let md = "\
-<think>
-Considering snake_case_ident and _italic_ and \\*escaped\\*.
-</think>
-
-Use `snake_case_ident` or _emphasized_ and ``inline `tick` code``.";
+Use `snake_case_ident` or _emphasized_ and \\*escaped\\* and ``inline `tick` code``.";
         let lines = render_markdown_blocks(md, 80);
         let joined: String = lines
             .iter()
@@ -1037,7 +990,7 @@ Use `snake_case_ident` or _emphasized_ and ``inline `tick` code``.";
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(joined.contains("│ Considering snake_case_ident"));
+        assert!(joined.contains("snake_case_ident"));
         assert!(joined.contains("*escaped*"));
         assert!(joined.contains("inline `tick` code"));
         let emph_line = lines
