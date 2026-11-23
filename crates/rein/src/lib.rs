@@ -17,5 +17,7 @@ pub mod memory;
 pub mod modes;
 /// Claude-compatible plugin and marketplace manager (`~/.rein/plugins`).
 pub mod plugins;
+/// Shared session runtime bootstrap reused by CLI/TUI and GUI frontends.
+pub mod runtime;
 /// In-process Ratatui terminal interface.
 pub mod ui;
