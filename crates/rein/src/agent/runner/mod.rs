@@ -5,6 +5,7 @@
 mod agent_loop;
 mod batch;
 mod format;
+mod lifecycle;
 
 pub use agent_loop::{
     AgentLoop, ApprovalAction, ApprovalDecision, ApprovalPrompter, ApprovalRequest, HydratedEvent,

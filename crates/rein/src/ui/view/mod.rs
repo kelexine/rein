@@ -5,5 +5,6 @@
 mod layout;
 mod modals;
 mod prompt;
+mod statusbar;
 
 pub use layout::{compute_max_scroll, header_height, render_frame, transcript_viewport};

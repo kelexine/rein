@@ -190,4 +190,3 @@ pub(super) fn schema_to_spec(schema: &ToolSchema) -> ToolSpec {
         input_schema: schema.input_schema.clone(),
     }
 }
-

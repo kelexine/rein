@@ -427,4 +427,3 @@ pub(super) fn render_mention_menu(
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
-

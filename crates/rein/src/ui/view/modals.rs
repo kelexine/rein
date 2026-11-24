@@ -196,7 +196,11 @@ pub(super) fn render_session_picker(
     frame.render_widget(Paragraph::new(rows), area);
 }
 
-pub(super) fn render_rewind_picker(picker: &PendingRewindPicker, frame: &mut Frame<'_>, area: Rect) {
+pub(super) fn render_rewind_picker(
+    picker: &PendingRewindPicker,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     let mut rows = Vec::with_capacity(MAX_MENU_ROWS + 2);
     match picker.step {
         RewindStep::SelectTurn => {

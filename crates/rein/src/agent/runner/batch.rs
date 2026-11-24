@@ -14,9 +14,7 @@ use crate::agent::snapshot::now_unix_secs;
 use crate::config::append_allowed_command;
 use crate::modes::{ModeManager, Profile};
 
-use super::format::{
-    build_approval_request, format_tool_status, record_full_message,
-};
+use super::format::{build_approval_request, format_tool_status, record_full_message};
 use super::{ApprovalAction, ApprovalPrompter, HydratedEvent};
 
 pub(super) fn build_mode_profile(

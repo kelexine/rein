@@ -3,6 +3,8 @@
 // Purpose: Terminal UI loop module exports
 
 mod commands;
+mod idle_keys;
 mod session;
+mod streaming_keys;
 
 pub use session::run_tui;

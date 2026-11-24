@@ -3,6 +3,7 @@
 // Purpose: TUI slash command dispatch, background streaming, login, and compaction handlers
 
 use super::session::*;
+use super::streaming_keys::{handle_streaming_key, is_ctrl_c, is_ctrl_o, scroll_page};
 
 pub(super) fn handle_enter(
     agent: &mut AgentLoop,
@@ -205,7 +206,8 @@ pub(super) fn run_model_command(
 
     if let Some(kind) = target_kind {
         let is_active_provider = kind == config.resolved_provider();
-        let models_res = if is_active_provider && !force_refresh && !app.cached_models().is_empty() {
+        let models_res = if is_active_provider && !force_refresh && !app.cached_models().is_empty()
+        {
             Ok(app.cached_models().to_vec())
         } else {
             app.set_busy_status("Fetching models…");
@@ -644,4 +646,3 @@ pub(super) fn stream_prompt_background(
     }
     Ok(should_quit)
 }
-
