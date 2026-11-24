@@ -518,7 +518,10 @@ impl SwarmManager {
             profile.allowed_tools.push("call_mcp_tool".to_owned());
         }
         profile.system_prompt.push_str(&format!(
-            "\n\n## Swarm Worker\n- Roster name: `{worker_name}` (caller: `{caller}`).\n- Post updates on the shared board using `swarm_post` and mention `@coordinator` or `@{caller}` when done or blocked."
+            "\n\n## Swarm Worker\n\
+             - Roster name: `{worker_name}` (spawned by `{caller}`, workspace mode: `{}`).\n\
+             - Execute your assigned tasks concisely, post concrete findings or diffs on the shared board via `swarm_post`, and mention `@coordinator` or `@{caller}` when done or blocked.",
+            workspace_mode.as_str()
         ));
 
         let policy = PolicyEngine::with_sandbox_status(

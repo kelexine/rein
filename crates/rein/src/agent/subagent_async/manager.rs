@@ -355,6 +355,13 @@ impl SubagentManager {
             }
         }
         profile.allowed_tools.push("send_message".to_owned());
+        profile.system_prompt.push_str(&format!(
+            "\n\n## Asynchronous Sub-Agent Protocol\n\
+             - Workspace isolation mode: `{}` (`{}`).\n\
+             - Your final turn response is delivered automatically to the parent inbox; you can also call `send_message` (`recipient: \"parent\"`) for intermediate status or follow-up replies.",
+            workspace_mode.as_str(),
+            effective_ws.display()
+        ));
 
         let policy = PolicyEngine::with_sandbox_status(
             profile.policy_rules.clone(),

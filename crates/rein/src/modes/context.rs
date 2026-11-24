@@ -154,7 +154,12 @@ impl<'a> ContextBuilder<'a> {
 fn read_capped_index(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty()
+        || !trimmed
+            .lines()
+            .map(str::trim)
+            .any(|line| !line.is_empty() && !line.starts_with('#'))
+    {
         return None;
     }
     let mut out = String::new();
@@ -397,6 +402,7 @@ mod tests {
         )?;
 
         let memory = JsonlMemoryStore::dual(dir.join("proj.jsonl"), dir.join("pers.jsonl"));
+        std::fs::write(pers_mem.join("MEMORY.md"), "# Personal Memory Index\n\n")?;
         let mut low = MemoryRecord::new(MemoryScope::Project, "old", "stale");
         low.salience = 0.1;
         let high = MemoryRecord::new(MemoryScope::Project, "arch", "typestate")
@@ -418,6 +424,7 @@ mod tests {
             .unwrap_or(usize::MAX);
         let old_pos = ctx.system_prompt.find("old: stale").unwrap_or(usize::MAX);
         assert!(ctx.system_prompt.contains("- [Build](build.md)"));
+        assert!(!ctx.system_prompt.contains("# Personal Memory Index"));
         assert!(arch_pos < old_pos);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -637,7 +637,10 @@ pub(crate) fn build_subagent_profile(
         )
     });
     profile.system_prompt.push_str(&format!(
-        "\n\n## Sub-Agent Confinement\n- You are running as an isolated `{agent_type}` sub-agent with role **{role}**.\n- You cannot switch modes or overwrite the parent todo list. Focus strictly on your assigned task and return a clear, evidence-backed report."
+        "\n\n## Sub-Agent Confinement\n\
+         - You are running as an isolated `{agent_type}` sub-agent with role **{role}**.\n\
+         - Stay strictly within your assigned task: do not switch modes, modify the parent todo list, or expand into unrelated files.\n\
+         - Return a concise, high-signal report to the parent agent citing exact `path:line` locations and observed tool/test outputs."
     ));
     profile
 }
