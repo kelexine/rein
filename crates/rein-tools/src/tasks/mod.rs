@@ -4,6 +4,7 @@
 
 /// Standard 5-field cron expression parser and local wall-clock evaluator.
 pub mod cron;
+mod io_helpers;
 /// Model-facing `manage_task` tool (`list`, `status`, `send_input`, `kill`).
 pub mod manage;
 /// Thread-safe background shell, timer, and cron registry.

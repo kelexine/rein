@@ -3,15 +3,15 @@
 // Purpose: Session-scoped TaskRegistry managing backgrounded bash process groups, timers, crons, and wakeup events
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use rein_policy::{SandboxSpec, SpawnedSandboxProcess, local_time_parts, spawn_sandboxed_command};
+use rein_policy::{SandboxSpec, SpawnedSandboxProcess, spawn_sandboxed_command};
 use serde::{Deserialize, Serialize};
 
+use super::io_helpers::*;
 use crate::registry::ToolError;
 use crate::tasks::cron::CronSchedule;
 
@@ -25,8 +25,6 @@ pub const MAX_WAIT_MS_BEFORE_ASYNC: u64 = 10_000;
 pub const DEFAULT_WAIT_MS_BEFORE_ASYNC: u64 = 10_000;
 /// Maximum random jitter (seconds) added to non-exact cron triggers.
 const CRON_DEFAULT_JITTER_SECS: u64 = 4;
-
-static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Category of background task managed by [`TaskRegistry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,7 +221,7 @@ pub enum BashSpawnOutcome {
     },
 }
 
-enum TaskRuntime {
+pub(super) enum TaskRuntime {
     Shell {
         proc: Arc<SpawnedSandboxProcess>,
         ring: Arc<Mutex<Vec<u8>>>,
@@ -239,10 +237,10 @@ enum TaskRuntime {
     },
 }
 
-struct TaskEntry {
-    summary: TaskSummary,
+pub(super) struct TaskEntry {
+    pub(super) summary: TaskSummary,
     visible: bool,
-    runtime: TaskRuntime,
+    pub(super) runtime: TaskRuntime,
 }
 
 #[derive(Default)]
@@ -865,133 +863,6 @@ impl TaskRegistry {
         }
         inbox
     }
-}
-
-fn next_task_id() -> String {
-    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("task-{seq}")
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-fn format_local_timestamps(unix_secs: u64) -> (String, String) {
-    let ts = i64::try_from(unix_secs).unwrap_or(0);
-    let p = local_time_parts(ts);
-    let hms = format!("{:02}:{:02}:{:02}", p.hour, p.minute, p.second);
-    let full = format!("{:04}-{:02}-{:02} {hms}", p.year, p.month, p.day);
-    (hms, full)
-}
-
-fn format_duration_short(secs: u64) -> String {
-    if secs.is_multiple_of(3_600) && secs >= 3_600 {
-        format!("{}h", secs / 3_600)
-    } else if secs.is_multiple_of(60) && secs >= 60 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
-fn refresh_summary_snapshot(entry: &TaskEntry) -> TaskSummary {
-    let mut summary = entry.summary.clone();
-    if let TaskRuntime::Shell { ring, .. } = &entry.runtime {
-        summary.output_tail = read_ring_tail(ring, 40);
-    }
-    summary
-}
-
-fn drain_split<R: std::io::Read>(
-    pipe: Option<R>,
-    header: &str,
-    log: &rein_policy::SharedLogWriter,
-    stream_buf: &Arc<Mutex<Vec<u8>>>,
-    combined_ring: &Arc<Mutex<Vec<u8>>>,
-) -> std::io::Result<()> {
-    let Some(mut reader) = pipe else {
-        return Ok(());
-    };
-    let mut buf = [0u8; 4096];
-    let mut wrote_header = false;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        let chunk = &buf[..n];
-        if let Ok(mut guard) = log.lock() {
-            if !wrote_header {
-                guard.write_all(header.as_bytes())?;
-                wrote_header = true;
-            }
-            guard.write_all(chunk)?;
-            guard.flush()?;
-        }
-        append_capped(stream_buf, chunk, TASK_OUTPUT_CAP_BYTES);
-        append_capped(combined_ring, chunk, TASK_OUTPUT_CAP_BYTES);
-    }
-    Ok(())
-}
-
-fn append_capped(target: &Arc<Mutex<Vec<u8>>>, chunk: &[u8], cap: usize) {
-    if let Ok(mut guard) = target.lock() {
-        guard.extend_from_slice(chunk);
-        if guard.len() > cap {
-            let excess = guard.len() - cap;
-            guard.drain(..excess);
-        }
-    }
-}
-
-fn read_stream_buffer(buf: &Arc<Mutex<Vec<u8>>>) -> (String, bool) {
-    let Ok(guard) = buf.lock() else {
-        return (String::new(), false);
-    };
-    let truncated = guard.len() >= rein_policy::OUTPUT_CAP_BYTES;
-    let slice = if guard.len() > rein_policy::OUTPUT_CAP_BYTES {
-        &guard[guard.len() - rein_policy::OUTPUT_CAP_BYTES..]
-    } else {
-        &guard[..]
-    };
-    (String::from_utf8_lossy(slice).into_owned(), truncated)
-}
-
-fn read_ring_tail(ring: &Arc<Mutex<Vec<u8>>>, max_lines: usize) -> String {
-    let Ok(guard) = ring.lock() else {
-        return String::new();
-    };
-    let text = String::from_utf8_lossy(&guard);
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
-}
-
-fn signal_condvar(pair: &(Mutex<bool>, Condvar)) {
-    if let Ok(mut flag) = pair.0.lock() {
-        *flag = true;
-        pair.1.notify_all();
-    }
-}
-
-fn wait_condvar_timeout(pair: &(Mutex<bool>, Condvar), timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    let Ok(mut guard) = pair.0.lock() else {
-        return false;
-    };
-    while !*guard {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let Ok((next, _)) = pair.1.wait_timeout(guard, deadline - now) else {
-            return false;
-        };
-        guard = next;
-    }
-    true
 }
 
 #[cfg(test)]
