@@ -8,7 +8,9 @@ pub mod decision;
 pub mod error;
 /// Capability evaluator and audit dispatcher.
 pub mod evaluator;
+mod suggest;
 
 pub use decision::{PolicyDecision, PolicyRuleSet};
 pub use error::PolicyError;
-pub use evaluator::{PolicyEngine, suggest_command_allow_pattern};
+pub use evaluator::PolicyEngine;
+pub use suggest::suggest_command_allow_pattern;
