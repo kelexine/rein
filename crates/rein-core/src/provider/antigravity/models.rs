@@ -25,7 +25,9 @@ pub(super) fn parse_available_models(root: &Value) -> Vec<AvailableModel> {
     parse_available_models_with_wire(root).0
 }
 
-pub(super) fn parse_available_models_with_wire(root: &Value) -> (Vec<AvailableModel>, EffortWireMap) {
+pub(super) fn parse_available_models_with_wire(
+    root: &Value,
+) -> (Vec<AvailableModel>, EffortWireMap) {
     let mut wire_map = EffortWireMap::new();
     let Some(models_map) = root.get("models").and_then(Value::as_object) else {
         return (Vec::new(), wire_map);
@@ -149,15 +151,7 @@ fn push_aicode_experience_entry(
     }
 
     if let Some(entry) = exp.get("model") {
-        push_aicode_model_entry(
-            entry,
-            false,
-            seen,
-            out,
-            wire_map,
-            aicode_ids,
-            experiences,
-        );
+        push_aicode_model_entry(entry, false, seen, out, wire_map, aicode_ids, experiences);
     }
 }
 
@@ -180,7 +174,9 @@ fn push_aicode_model_entry(
     experiences.insert(id.clone(), id.clone());
     for model in expand_model_entry(&id, entry, recommended, wire_map) {
         aicode_ids.insert(model.id.clone());
-        experiences.entry(model.id.clone()).or_insert_with(|| model.id.clone());
+        experiences
+            .entry(model.id.clone())
+            .or_insert_with(|| model.id.clone());
         if seen.insert(model.id.clone()) {
             out.push(model);
         }
