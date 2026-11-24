@@ -9,14 +9,17 @@ use iced::Task;
 use iced::clipboard;
 use iced::widget::markdown;
 use iced::widget::operation::{RelativeOffset, snap_to};
-use rein::agent::ApprovalDecision;
-use rein_core::{ToolCall, ToolOutput};
+use rein::agent::{ApprovalAction, ApprovalDecision};
+use rein_core::{ModeId, ToolCall, ToolOutput};
 use rein_tools::{QuestionAnswer, TaskNotification, TaskStatus};
 
+use crate::views::tool_card::{format_tool_title, summarize_done};
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt, WorkerCommand, WorkerEvent};
 
 use super::message::Message;
-use super::state::{GuiApp, InspectorPane, ToolItemState, TranscriptItem, collapse_preview};
+use super::state::{
+    GuiApp, InspectorPane, ToolItemState, TranscriptItem, collapse_preview, format_size_and_lines,
+};
 
 const STREAM_MD_THROTTLE_MS: u64 = 200;
 
@@ -30,12 +33,25 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
         }
         Message::SubmitPrompt => {
             let trimmed = app.input.trim().to_owned();
-            if trimmed.is_empty() || app.busy {
+            if trimmed.is_empty() {
+                return Task::none();
+            }
+            if app.busy {
+                if app.worker.send_steer(trimmed.clone(), trimmed.clone()) {
+                    app.input.clear();
+                    app.stick_to_bottom = true;
+                    app.items.push(TranscriptItem::user(trimmed));
+                    return scroll_transcript_to_bottom(app);
+                }
                 return Task::none();
             }
             app.input.clear();
             app.model_picker_open = false;
             app.plus_menu_open = false;
+            if let Some(task) = try_handle_slash_command(app, &trimmed) {
+                return task;
+            }
+            app.stick_to_bottom = true;
             app.items.push(TranscriptItem::user(trimmed.clone()));
             begin_busy(app, "Thinking…");
             app.worker
@@ -48,12 +64,27 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             app.model_picker_open = false;
             app.plus_menu_open = false;
+            app.stick_to_bottom = true;
             app.items.push(TranscriptItem::user(prompt.clone()));
             begin_busy(app, "Thinking…");
             app.worker.send(WorkerCommand::RunPrompt { prompt });
             scroll_transcript_to_bottom(app)
         }
         Message::CancelTurn => {
+            if let Some(pending) = app.pending_approval.take() {
+                let fb = pending.feedback.trim().to_owned();
+                app.worker.send_approval(ApprovalDecision {
+                    action: ApprovalAction::Deny,
+                    feedback: (!fb.is_empty()).then_some(fb),
+                });
+            }
+            if let Some(q) = app.pending_question.take() {
+                let _ = q.reply_tx.send(None);
+                app.question_answers.clear();
+                app.question_step = 0;
+                app.question_selected.clear();
+                app.question_custom_text.clear();
+            }
             if app.busy {
                 app.worker.cancel_turn();
                 app.busy_status = "Stopping…".to_owned();
@@ -61,6 +92,8 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
                 app.plus_menu_open = false;
             } else if app.model_picker_open {
                 app.model_picker_open = false;
+            } else if app.task_drawer_open {
+                app.task_drawer_open = false;
             } else if app.inspector.is_some() {
                 app.inspector = None;
             }
@@ -144,16 +177,17 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::TranscriptScrolled(viewport) => {
+            let fits = viewport.content_bounds().height <= viewport.bounds().height + 2.0;
+            app.stick_to_bottom = fits || viewport.relative_offset().y >= 0.97;
+            Task::none()
+        }
         Message::OpenInspector {
             title,
             subtitle,
             content,
         } => {
-            app.inspector = Some(InspectorPane {
-                title,
-                subtitle,
-                content,
-            });
+            app.inspector = Some(InspectorPane::new(title, subtitle, content));
             Task::none()
         }
         Message::CloseInspector => {
@@ -178,7 +212,26 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SelectQuestionOption(opt_idx) => {
-            app.question_selected = Some(opt_idx);
+            let is_multi = app
+                .pending_question
+                .as_ref()
+                .and_then(|p| p.questions.get(app.question_step))
+                .is_some_and(|q| q.is_multi_select);
+            if is_multi {
+                if let Some(pos) = app.question_selected.iter().position(|&x| x == opt_idx) {
+                    app.question_selected.remove(pos);
+                } else {
+                    app.question_selected.push(opt_idx);
+                    app.question_selected.sort_unstable();
+                }
+            } else {
+                app.question_selected.clear();
+                app.question_selected.push(opt_idx);
+            }
+            Task::none()
+        }
+        Message::QuestionCustomTextChanged(text) => {
+            app.question_custom_text = text;
             Task::none()
         }
         Message::ConfirmQuestion => confirm_question_step(app),
@@ -188,7 +241,8 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             }
             app.question_answers.clear();
             app.question_step = 0;
-            app.question_selected = None;
+            app.question_selected.clear();
+            app.question_custom_text.clear();
             Task::none()
         }
         Message::LinkClicked(_url) => Task::none(),
@@ -224,13 +278,15 @@ fn handle_tick(app: &mut GuiApp) -> Task<Message> {
     }
     let mut should_scroll = false;
     for ev in app.worker.drain_events() {
-        if matches!(
-            ev,
-            WorkerEvent::TextDelta(_)
-                | WorkerEvent::ToolStart(_)
-                | WorkerEvent::ToolFinish(_, _)
-                | WorkerEvent::SessionHydrated { .. }
-        ) {
+        if matches!(ev, WorkerEvent::SessionHydrated { .. })
+            || (app.stick_to_bottom
+                && matches!(
+                    ev,
+                    WorkerEvent::TextDelta(_)
+                        | WorkerEvent::ToolStart(_)
+                        | WorkerEvent::ToolFinish(_, _)
+                ))
+        {
             should_scroll = true;
         }
         apply_worker_event(app, ev);
@@ -250,7 +306,10 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
         WorkerEvent::ThinkingDelta(delta) => append_thinking(app, &delta),
         WorkerEvent::TextDelta(delta) => append_assistant_delta(app, &delta),
         WorkerEvent::ToolStart(call) => push_tool_start(app, &call),
-        WorkerEvent::ToolFinish(call, output) => finish_tool(app, &call, &output),
+        WorkerEvent::ToolFinish(call, output) => {
+            finish_tool(app, &call, &output);
+            app.sync_runtime_snapshots();
+        }
         WorkerEvent::Usage(u) => app.usage.add_assign_turn(u),
         WorkerEvent::ModeSwitched(profile) => {
             let mode = profile.mode;
@@ -274,7 +333,8 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
             });
             app.question_answers.clear();
             app.question_step = 0;
-            app.question_selected = Some(0);
+            app.question_selected = vec![0];
+            app.question_custom_text.clear();
         }
         WorkerEvent::ModelsLoaded(models) => app.available_models = models,
         WorkerEvent::ModelSelected(label) => app.model_label = label,
@@ -286,8 +346,13 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
             app.session_uid = session_uid;
             app.active_profile = *profile;
             app.items.clear();
+            app.expanded_tool_groups.clear();
+            app.thinking_started_at = None;
+            app.inspector = None;
+            app.stick_to_bottom = true;
             app.apply_hydrated(events);
             app.refresh_sessions();
+            app.sync_runtime_snapshots();
         }
         WorkerEvent::SessionReset {
             session_uid,
@@ -296,10 +361,18 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
             app.session_uid = session_uid;
             app.active_profile = *profile;
             app.items.clear();
+            app.expanded_tool_groups.clear();
+            app.thinking_started_at = None;
+            app.inspector = None;
+            app.stick_to_bottom = true;
             app.usage = rein_core::UsageStats::default();
             app.refresh_sessions();
+            app.sync_runtime_snapshots();
         }
         WorkerEvent::Note(note) => app.items.push(TranscriptItem::System(note)),
+        WorkerEvent::SteerDelivered(msg) => app
+            .items
+            .push(TranscriptItem::System(format!("steered: {msg}"))),
         WorkerEvent::Error(err) => app.items.push(TranscriptItem::Error(err)),
         WorkerEvent::TurnFinished => {
             finalize_thinking(app);
@@ -309,6 +382,7 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
             app.busy_started_at = None;
             app.busy_status = "Thinking…".to_owned();
             app.refresh_sessions();
+            app.sync_runtime_snapshots();
         }
     }
 }
@@ -390,9 +464,14 @@ fn flush_trailing_markdown(app: &mut GuiApp) {
 fn push_tool_start(app: &mut GuiApp, call: &ToolCall) {
     finalize_thinking(app);
     app.busy_status = format!("Running {}…", call.name);
+    let (title, subtitle) = format_tool_title(&call.name, &call.arguments);
     app.items.push(TranscriptItem::Tool {
         call_id: call.id.clone(),
         name: call.name.clone(),
+        title,
+        subtitle,
+        done_summary: String::new(),
+        inspector_subtitle: String::new(),
         arguments: call.arguments.clone(),
         state: ToolItemState::Running,
         background_task_id: None,
@@ -407,6 +486,9 @@ fn finish_tool(app: &mut GuiApp, call: &ToolCall, output: &ToolOutput) {
         .then(|| extract_background_id(&output.content))
         .flatten();
     if let Some(TranscriptItem::Tool {
+        name,
+        done_summary,
+        inspector_subtitle,
         state,
         background_task_id,
         output: out_buf,
@@ -426,6 +508,9 @@ fn finish_tool(app: &mut GuiApp, call: &ToolCall, output: &ToolOutput) {
                 ToolItemState::Done
             };
         }
+        *done_summary = summarize_done(name, &output.content);
+        let line_count = output.content.lines().count().max(1);
+        *inspector_subtitle = format_size_and_lines(output.content.len(), line_count);
         *out_buf = output.content.clone();
     }
 }
@@ -444,22 +529,30 @@ fn extract_background_id(content: &str) -> Option<String> {
 }
 
 fn complete_background_tool(app: &mut GuiApp, task_id: &str, is_error: bool, text: String) {
-    if let Some(TranscriptItem::Tool { state, output, .. }) =
-        app.items.iter_mut().rev().find(|item| {
-            matches!(
-                item,
-                TranscriptItem::Tool {
-                    background_task_id: Some(id),
-                    ..
-                } if id == task_id
-            )
-        })
-    {
+    if let Some(TranscriptItem::Tool {
+        name,
+        done_summary,
+        inspector_subtitle,
+        state,
+        output,
+        ..
+    }) = app.items.iter_mut().rev().find(|item| {
+        matches!(
+            item,
+            TranscriptItem::Tool {
+                background_task_id: Some(id),
+                ..
+            } if id == task_id
+        )
+    }) {
         *state = if is_error {
             ToolItemState::Error
         } else {
             ToolItemState::Done
         };
+        *done_summary = summarize_done(name, &text);
+        let line_count = text.lines().count().max(1);
+        *inspector_subtitle = format_size_and_lines(text.len(), line_count);
         *output = text;
     }
 }
@@ -527,9 +620,7 @@ fn drain_wakeups(app: &mut GuiApp) {
         }
     }
 
-    if app.task_drawer_open {
-        app.tasks_snapshot = app.task_registry.list_tasks();
-    }
+    app.sync_runtime_snapshots();
     let display = format!("[task wakeup] {}", labels.join(", "));
     let prompt = format!(
         "[Background Task / Schedule Wakeup Notification]\n{}\n\nRespond to these completed task/schedule events and continue any pending work.",
@@ -547,19 +638,27 @@ fn confirm_question_step(app: &mut GuiApp) -> Task<Message> {
     let Some(q) = pending.questions.get(app.question_step) else {
         return Task::none();
     };
-    let selected_label = app
+    let custom = app.question_custom_text.trim().to_owned();
+    let mut selected: Vec<String> = app
         .question_selected
-        .and_then(|idx| q.options.get(idx))
-        .cloned()
-        .unwrap_or_else(|| q.options.first().cloned().unwrap_or_default());
+        .iter()
+        .filter_map(|&idx| q.options.get(idx).cloned())
+        .collect();
+    if selected.is_empty()
+        && custom.is_empty()
+        && let Some(first) = q.options.first()
+    {
+        selected.push(first.clone());
+    }
     app.question_answers.push(QuestionAnswer {
         question: q.question.clone(),
-        selected: vec![selected_label],
-        custom_text: None,
+        selected,
+        custom_text: (!custom.is_empty()).then_some(custom),
     });
+    app.question_custom_text.clear();
     if app.question_step + 1 < pending.questions.len() {
         app.question_step += 1;
-        app.question_selected = Some(0);
+        app.question_selected = vec![0];
         return Task::none();
     }
     if let Some(done) = app.pending_question.take() {
@@ -567,6 +666,19 @@ fn confirm_question_step(app: &mut GuiApp) -> Task<Message> {
         let _ = done.reply_tx.send(Some(answers));
     }
     app.question_step = 0;
-    app.question_selected = None;
+    app.question_selected.clear();
     Task::none()
+}
+
+fn try_handle_slash_command(app: &mut GuiApp, input: &str) -> Option<Task<Message>> {
+    match input {
+        "/new" | "/clear" => Some(update(app, Message::NewSession)),
+        "/compact" => Some(update(app, Message::CompactHistory)),
+        "/tasks" => Some(update(app, Message::ToggleTaskDrawer)),
+        "/model" => Some(update(app, Message::ToggleModelPicker)),
+        "/coding" | "/mode coding" => Some(update(app, Message::SwitchMode(ModeId::Coding))),
+        "/plan" | "/mode plan" => Some(update(app, Message::SwitchMode(ModeId::Plan))),
+        "/personal" | "/mode personal" => Some(update(app, Message::SwitchMode(ModeId::Personal))),
+        _ => None,
+    }
 }

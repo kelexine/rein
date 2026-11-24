@@ -50,6 +50,7 @@ pub fn view_transcript(app: &GuiApp) -> Element<'_, Message> {
 
     scrollable(centered)
         .id(app.transcript_id.clone())
+        .on_scroll(Message::TranscriptScrolled)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -92,7 +93,9 @@ fn render_tool_group<'a>(
     let header = button(
         row![
             text("●").size(8).color(dot_color),
-            text(format!("{summary}  {arrow}")).size(13).color(TEXT_MUTED),
+            text(format!("{summary}  {arrow}"))
+                .size(13)
+                .color(TEXT_MUTED),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -219,6 +222,10 @@ fn render_item<'a>(idx: usize, item: &'a TranscriptItem) -> Element<'a, Message>
         }
         TranscriptItem::Tool {
             name,
+            title,
+            subtitle,
+            done_summary,
+            inspector_subtitle,
             arguments,
             state,
             background_task_id,
@@ -227,7 +234,13 @@ fn render_item<'a>(idx: usize, item: &'a TranscriptItem) -> Element<'a, Message>
             ..
         } => tool_card::render_tool_card(
             idx,
-            name,
+            tool_card::ToolCardMeta {
+                name,
+                title,
+                subtitle,
+                done_summary,
+                inspector_subtitle,
+            },
             arguments,
             *state,
             background_task_id.as_deref(),
@@ -264,14 +277,18 @@ fn render_user_item<'a>(
         .spacing(8)
         .width(Length::Fixed(240.0));
 
-        let badge = button(container(card_content).padding([10, 12]).style(pasted_badge_card))
-            .padding(0)
-            .style(ghost_button)
-            .on_press(Message::OpenInspector {
-                title: "Pasted content".to_owned(),
-                subtitle: subtitle.to_owned(),
-                content: raw.to_owned(),
-            });
+        let badge = button(
+            container(card_content)
+                .padding([10, 12])
+                .style(pasted_badge_card),
+        )
+        .padding(0)
+        .style(ghost_button)
+        .on_press(Message::OpenInspector {
+            title: "Pasted content".to_owned(),
+            subtitle: subtitle.to_owned(),
+            content: raw.to_owned(),
+        });
 
         return row![Space::new().width(Length::Fill), badge]
             .width(Length::Fill)

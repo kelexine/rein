@@ -12,8 +12,11 @@ use rein::agent::HydratedEvent;
 use rein::config::{ReinPaths, SessionSummary, list_sessions};
 use rein::modes::Profile;
 use rein_core::{AvailableModel, ModeId, ToolCall, ToolOutput, UsageStats};
-use rein_tools::{QuestionAnswer, TaskNotification, TaskRegistry, TaskSummary, TodoItem};
+use rein_tools::{
+    QuestionAnswer, TaskNotification, TaskRegistry, TaskSummary, TodoItem, TodoStore,
+};
 
+use crate::views::tool_card::{format_tool_title, summarize_done};
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt, WorkerHandle};
 
 const USER_COLLAPSE_LINES: usize = 6;
@@ -33,7 +36,7 @@ pub enum ToolItemState {
 }
 
 /// Right-hand split inspector drawer content (e.g. Pasted content or full Tool output).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InspectorPane {
     /// Header title shown in the inspector bar.
     pub title: String,
@@ -41,6 +44,29 @@ pub struct InspectorPane {
     pub subtitle: String,
     /// Full scrollable text content.
     pub content: String,
+    /// Precomputed content-kind badge (`SH`, `RS`, `TOML`, `JSON`, `MD`, `TEXT`).
+    pub kind_badge: &'static str,
+    /// Total line count in `content`.
+    pub total_lines: usize,
+    /// Precomputed syntax-highlighted `(token, Color)` spans per line (up to 500 lines).
+    pub highlighted_lines: Vec<Vec<(String, iced::Color)>>,
+}
+
+impl InspectorPane {
+    /// Constructs an [`InspectorPane`] with precomputed line count and syntax tokens.
+    #[must_use]
+    pub fn new(title: String, subtitle: String, content: String) -> Self {
+        let (kind_badge, total_lines, highlighted_lines) =
+            crate::views::inspector::tokenize_inspector_lines(&title, &content);
+        Self {
+            title,
+            subtitle,
+            content,
+            kind_badge,
+            total_lines,
+            highlighted_lines,
+        }
+    }
 }
 
 /// Pre-truncated sidebar session summary avoiding per-frame string allocations.
@@ -110,6 +136,14 @@ pub enum TranscriptItem {
         call_id: String,
         /// Tool name.
         name: String,
+        /// Precomputed short action title (`Run`, `Read`, `Edit`).
+        title: String,
+        /// Precomputed monospace subtitle (path or command).
+        subtitle: String,
+        /// Precomputed completion summary (`exit 0`, `42 lines`).
+        done_summary: String,
+        /// Precomputed inspector subtitle (`1.4 kB · 42 lines`).
+        inspector_subtitle: String,
         /// Tool arguments JSON.
         arguments: serde_json::Value,
         /// Current run state.
@@ -135,7 +169,8 @@ impl TranscriptItem {
         let char_count = raw.chars().count();
         let byte_len = raw.len();
         let is_pasted = line_count >= USER_PASTED_LINES || byte_len >= USER_PASTED_BYTES;
-        let is_long = !is_pasted && (line_count > USER_COLLAPSE_LINES || char_count > USER_COLLAPSE_CHARS);
+        let is_long =
+            !is_pasted && (line_count > USER_COLLAPSE_LINES || char_count > USER_COLLAPSE_CHARS);
         let preview = if is_pasted {
             raw.lines()
                 .take(2)
@@ -203,6 +238,8 @@ pub struct GuiApp {
     pub paths: ReinPaths,
     /// Task registry shared with tools.
     pub task_registry: TaskRegistry,
+    /// Session-scoped todo checklist store shared with tools.
+    pub todo_store: TodoStore,
     /// Receiver for async background task/subagent wakeups.
     pub task_rx: mpsc::Receiver<TaskNotification>,
     /// Active mode profile.
@@ -227,6 +264,8 @@ pub struct GuiApp {
     pub items: Vec<TranscriptItem>,
     /// Scrollable widget ID for auto-scrolling the transcript.
     pub transcript_id: Id,
+    /// Whether transcript auto-scroll should stick to the bottom as deltas arrive.
+    pub stick_to_bottom: bool,
     /// Optional right-hand split inspector drawer.
     pub inspector: Option<InspectorPane>,
     /// Expanded grouped-tool runs keyed by the first item index in the run.
@@ -259,8 +298,10 @@ pub struct GuiApp {
     pub question_answers: Vec<QuestionAnswer>,
     /// Current question step index.
     pub question_step: usize,
-    /// Selected option index for the current question step.
-    pub question_selected: Option<usize>,
+    /// Selected option indices for the current question step.
+    pub question_selected: Vec<usize>,
+    /// Custom free-text answer for the current question step.
+    pub question_custom_text: String,
     /// Active todo checklist items.
     pub todos: Vec<TodoItem>,
     /// Active todo list title.
@@ -291,6 +332,7 @@ impl GuiApp {
         let notices = session.notices.clone();
         let cached_models = session.cached_models.clone();
         let task_registry = session.task_registry.clone();
+        let todo_store = session.todo_store.clone();
         let sessions = list_sessions(&paths)
             .unwrap_or_default()
             .iter()
@@ -301,7 +343,7 @@ impl GuiApp {
         let (_dummy_tx, dummy_rx) = mpsc::channel();
         let task_rx = std::mem::replace(&mut session.task_rx, dummy_rx);
 
-        let (worker, _rx) = WorkerHandle::spawn(session);
+        let worker = WorkerHandle::spawn(session);
         worker.send(crate::worker::WorkerCommand::FetchModels);
         let user_name = std::env::var("USER")
             .ok()
@@ -312,6 +354,7 @@ impl GuiApp {
             worker,
             paths,
             task_registry,
+            todo_store,
             task_rx,
             active_profile,
             model_label,
@@ -324,6 +367,7 @@ impl GuiApp {
             input: String::new(),
             items: Vec::new(),
             transcript_id: Id::unique(),
+            stick_to_bottom: true,
             inspector: None,
             expanded_tool_groups: HashSet::new(),
             plus_menu_open: false,
@@ -340,7 +384,8 @@ impl GuiApp {
             pending_question: None,
             question_answers: Vec::new(),
             question_step: 0,
-            question_selected: None,
+            question_selected: Vec::new(),
+            question_custom_text: String::new(),
             todos: Vec::new(),
             todo_title: None,
             task_drawer_open: false,
@@ -351,6 +396,7 @@ impl GuiApp {
             app.items.push(TranscriptItem::System(notice));
         }
         app.apply_hydrated(initial_events);
+        app.sync_runtime_snapshots();
         app
     }
 
@@ -409,9 +455,17 @@ impl GuiApp {
     }
 
     fn push_hydrated_tool(&mut self, call: &ToolCall, output: &ToolOutput) {
+        let (title, subtitle) = format_tool_title(&call.name, &call.arguments);
+        let done_summary = summarize_done(&call.name, &output.content);
+        let line_count = output.content.lines().count().max(1);
+        let inspector_subtitle = format_size_and_lines(output.content.len(), line_count);
         self.items.push(TranscriptItem::Tool {
             call_id: call.id.clone(),
             name: call.name.clone(),
+            title,
+            subtitle,
+            done_summary,
+            inspector_subtitle,
             arguments: call.arguments.clone(),
             state: if output.is_error {
                 ToolItemState::Error
@@ -432,6 +486,15 @@ impl GuiApp {
             .map(SidebarSession::from_summary)
             .collect();
     }
+
+    /// Synchronizes background task snapshots and the session todo checklist from shared stores.
+    pub fn sync_runtime_snapshots(&mut self) {
+        self.tasks_snapshot = self.task_registry.list_tasks();
+        if let Ok(state) = self.todo_store.load_state() {
+            self.todo_title = state.title;
+            self.todos = state.todos;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +513,10 @@ mod tests {
             }
         ));
 
-        let long_lines = (0..8).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long_lines = (0..8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let long = TranscriptItem::user(long_lines);
         assert!(matches!(
             long,

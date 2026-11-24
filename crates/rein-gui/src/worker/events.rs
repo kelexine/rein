@@ -98,6 +98,8 @@ pub enum WorkerEvent {
     },
     /// Status note (compaction, errors, cancellations).
     Note(String),
+    /// Mid-turn user steering message delivered to the active turn.
+    SteerDelivered(String),
     /// Error note.
     Error(String),
     /// Current worker command finished.
@@ -112,7 +114,7 @@ pub struct GuiAgentBridge {
 }
 
 impl GuiAgentBridge {
-    fn emit(&self, ev: WorkerEvent) {
+    pub(crate) fn emit(&self, ev: WorkerEvent) {
         let _ = self.ev_tx.send(ev);
         self.wake_flag.store(true, Ordering::Release);
     }
@@ -146,5 +148,9 @@ impl ApprovalPrompter for GuiAgentBridge {
 
     fn on_mode_switched(&mut self, profile: &Profile) {
         self.emit(WorkerEvent::ModeSwitched(Box::new(profile.clone())));
+    }
+
+    fn on_steer_delivered(&mut self, display: &str) {
+        self.emit(WorkerEvent::SteerDelivered(display.to_owned()));
     }
 }

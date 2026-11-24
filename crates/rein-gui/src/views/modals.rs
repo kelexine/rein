@@ -81,8 +81,13 @@ pub fn view_question_banner<'a>(
     let Some(q) = pending.questions.get(app.question_step) else {
         return Space::new().into();
     };
+    let hint = if q.is_multi_select {
+        " (select one or more)"
+    } else {
+        ""
+    };
     let title = text(format!(
-        "Question {}/{}: {}",
+        "Question {}/{}{hint}: {}",
         app.question_step + 1,
         pending.questions.len(),
         q.question
@@ -92,8 +97,14 @@ pub fn view_question_banner<'a>(
 
     let mut opts_col = column![].spacing(4);
     for (idx, opt) in q.options.iter().enumerate() {
-        let selected = app.question_selected == Some(idx);
-        let prefix = if selected { "● " } else { "○ " };
+        let selected = app.question_selected.contains(&idx);
+        let prefix = if q.is_multi_select {
+            if selected { "☑ " } else { "☐ " }
+        } else if selected {
+            "● "
+        } else {
+            "○ "
+        };
         let color = if selected { ACCENT_CORAL } else { TEXT_MUTED };
         opts_col = opts_col.push(
             button(text(format!("{prefix}{opt}")).size(13).color(color))
@@ -103,6 +114,13 @@ pub fn view_question_banner<'a>(
                 .on_press(Message::SelectQuestionOption(idx)),
         );
     }
+
+    let custom_input = text_input("Optional custom answer…", &app.question_custom_text)
+        .on_input(Message::QuestionCustomTextChanged)
+        .on_submit(Message::ConfirmQuestion)
+        .padding([6, 10])
+        .size(13)
+        .style(composer_input);
 
     let actions = row![
         button(text("Confirm").size(12))
@@ -116,10 +134,14 @@ pub fn view_question_banner<'a>(
     ]
     .spacing(8);
 
-    let card = container(column![title, opts_col, actions].spacing(8).padding(14))
-        .max_width(760.0)
-        .width(Length::Fill)
-        .style(elevated_card);
+    let card = container(
+        column![title, opts_col, custom_input, actions]
+            .spacing(8)
+            .padding(14),
+    )
+    .max_width(760.0)
+    .width(Length::Fill)
+    .style(elevated_card);
 
     container(card)
         .width(Length::Fill)

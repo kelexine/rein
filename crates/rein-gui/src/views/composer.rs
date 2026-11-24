@@ -7,23 +7,33 @@ use iced::{Alignment, Element, Length};
 use rein_core::ModeId;
 
 use crate::app::{GuiApp, Message};
-use crate::theme::palette::{ACCENT_CORAL, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
+use crate::theme::palette::{
+    ACCENT_CORAL, STATUS_GREEN, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
+};
 use crate::theme::styles::{
-    composer_card, composer_input, danger_button, elevated_card, ghost_button, pill_button,
-    primary_button,
+    composer_card, composer_input, danger_button, disclosure_card, elevated_card, ghost_button,
+    pill_button, primary_button,
 };
 
 /// Renders the bottom-pinned composer used during active conversations.
 #[must_use]
 pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
     let mut inner = column![].spacing(8).max_width(760.0).width(Length::Fill);
+    if !app.todos.is_empty() {
+        inner = inner.push(view_todo_strip(app.todo_title.as_deref(), &app.todos));
+    }
     if app.plus_menu_open {
         inner = inner.push(view_plus_menu(app));
     }
     if app.model_picker_open {
         inner = inner.push(view_model_picker(app));
     }
-    inner = inner.push(view_composer_card(app, "Write a message…"));
+    let placeholder = if app.busy {
+        "Steer active turn, or press ■ / Esc to stop…"
+    } else {
+        "Write a message… (/new, /compact, /plan, /tasks)"
+    };
+    inner = inner.push(view_composer_card(app, placeholder));
     inner = inner.push(
         row![
             text("Rein can make mistakes. Verify tool actions before approving.")
@@ -71,30 +81,36 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
     .style(ghost_button)
     .on_press(Message::ToggleModelPicker);
 
-    let action_btn = if app.busy {
-        button(text("■").size(12).color(TEXT_PRIMARY))
-            .padding([6, 12])
-            .style(danger_button)
-            .on_press(Message::CancelTurn)
+    let mut bottom_row = row![plus_btn, Space::new().width(Length::Fill), model_btn]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+    if app.busy {
+        if !app.input.trim().is_empty() {
+            bottom_row = bottom_row.push(
+                button(text("↑").size(14))
+                    .padding([6, 12])
+                    .style(primary_button)
+                    .on_press(Message::SubmitPrompt),
+            );
+        }
+        bottom_row = bottom_row.push(
+            button(text("■").size(12).color(TEXT_PRIMARY))
+                .padding([6, 12])
+                .style(danger_button)
+                .on_press(Message::CancelTurn),
+        );
     } else {
         let btn = button(text("↑").size(14))
             .padding([6, 12])
             .style(primary_button);
-        if app.input.trim().is_empty() {
+        let btn = if app.input.trim().is_empty() {
             btn
         } else {
             btn.on_press(Message::SubmitPrompt)
-        }
-    };
-
-    let bottom_row = row![
-        plus_btn,
-        Space::new().width(Length::Fill),
-        model_btn,
-        action_btn,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+        };
+        bottom_row = bottom_row.push(btn);
+    }
 
     container(column![input, bottom_row].spacing(6).padding([8, 10]))
         .width(Length::Fill)
@@ -192,5 +208,47 @@ pub fn view_model_picker(app: &GuiApp) -> Element<'_, Message> {
         .max_width(380.0)
         .max_height(240.0)
         .style(elevated_card)
+        .into()
+}
+
+fn view_todo_strip<'a>(
+    todo_title: Option<&'a str>,
+    todos: &'a [rein_tools::TodoItem],
+) -> Element<'a, Message> {
+    let completed = todos
+        .iter()
+        .filter(|t| matches!(t.status, rein_tools::TodoStatus::Completed))
+        .count();
+    let total = todos.len();
+    let title = todo_title.unwrap_or("Tasks");
+    let mut col = column![
+        row![
+            text(format!("{title} ({completed}/{total})"))
+                .size(12)
+                .color(TEXT_PRIMARY),
+        ]
+        .align_y(Alignment::Center)
+    ]
+    .spacing(3);
+
+    for item in todos.iter().take(5) {
+        let (glyph, color) = match item.status {
+            rein_tools::TodoStatus::Completed => ("✓", STATUS_GREEN),
+            rein_tools::TodoStatus::InProgress => ("●", STATUS_YELLOW),
+            rein_tools::TodoStatus::Pending => ("○", TEXT_DIM),
+        };
+        col = col.push(
+            row![
+                text(glyph).size(11).color(color),
+                text(&item.content).size(12).color(TEXT_MUTED),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    container(col.padding([8, 12]))
+        .width(Length::Fill)
+        .style(disclosure_card)
         .into()
 }

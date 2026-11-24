@@ -6,17 +6,31 @@ use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Font, Length};
 use serde_json::Value;
 
-use crate::app::{Message, ToolItemState, format_size_and_lines};
+use crate::app::{Message, ToolItemState};
 use crate::theme::palette::{
     STATUS_GREEN, STATUS_RED, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
 };
 use crate::theme::styles::{disclosure_card, ghost_button};
 
+/// Precomputed metadata for a tool invocation card.
+pub struct ToolCardMeta<'a> {
+    /// Tool name.
+    pub name: &'a str,
+    /// Precomputed short action title (e.g. `Run`, `Read`, `Edit`).
+    pub title: &'a str,
+    /// Precomputed monospace subtitle (e.g. path or command).
+    pub subtitle: &'a str,
+    /// Precomputed completion summary badge (e.g. `exit 0`, `42 lines`).
+    pub done_summary: &'a str,
+    /// Precomputed inspector subtitle (`1.4 kB · 42 lines`).
+    pub inspector_subtitle: &'a str,
+}
+
 /// Renders a collapsible tool card with muted inline header when collapsed and code card when expanded.
 #[must_use]
 pub fn render_tool_card<'a>(
     idx: usize,
-    name: &'a str,
+    meta: ToolCardMeta<'a>,
     arguments: &'a Value,
     state: ToolItemState,
     bg_id: Option<&'a str>,
@@ -28,23 +42,22 @@ pub fn render_tool_card<'a>(
             STATUS_YELLOW,
             bg_id.map_or_else(|| "running…".to_owned(), |id| format!("background ({id})…")),
         ),
-        ToolItemState::Done => (STATUS_GREEN, summarize_done(name, output)),
+        ToolItemState::Done => (STATUS_GREEN, meta.done_summary.to_owned()),
         ToolItemState::Error => (STATUS_RED, "error".to_owned()),
     };
 
-    let (title, subtitle) = format_tool_title(name, arguments);
     let arrow = if expanded { "⌄" } else { "›" };
 
     let mut header_row = row![
         text("●").size(9).color(dot_color),
-        text(title).size(13).color(TEXT_MUTED),
+        text(meta.title).size(13).color(TEXT_MUTED),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
 
-    if !subtitle.is_empty() {
+    if !meta.subtitle.is_empty() {
         header_row = header_row.push(
-            text(subtitle.clone())
+            text(meta.subtitle)
                 .size(12)
                 .font(Font::MONOSPACE)
                 .color(TEXT_DIM),
@@ -66,32 +79,28 @@ pub fn render_tool_card<'a>(
         return header.into();
     }
 
-    let body = format_tool_body(name, arguments, output);
-    let line_count = output.lines().count().max(1);
+    let body = format_tool_body(meta.name, arguments, output);
     let inspect_btn = button(text("Open in inspector ›").size(11).color(TEXT_DIM))
         .padding([2, 6])
         .style(ghost_button)
         .on_press(Message::OpenInspector {
-            title: format!("{name} output"),
-            subtitle: format_size_and_lines(output.len(), line_count),
+            title: format!("{} output", meta.name),
+            subtitle: meta.inspector_subtitle.to_owned(),
             content: output.to_owned(),
         });
 
-    let body_card = container(
-        column![
-            body,
-            row![Space::new().width(Length::Fill), inspect_btn],
-        ]
-        .spacing(6),
-    )
-    .padding(12)
-    .width(Length::Fill)
-    .style(disclosure_card);
+    let body_card =
+        container(column![body, row![Space::new().width(Length::Fill), inspect_btn],].spacing(6))
+            .padding(12)
+            .width(Length::Fill)
+            .style(disclosure_card);
 
     column![header, body_card].spacing(4).into()
 }
 
-fn format_tool_title(name: &str, args: &Value) -> (String, String) {
+/// Precomputes the `(title, subtitle)` pair for a tool card header.
+#[must_use]
+pub fn format_tool_title(name: &str, args: &Value) -> (String, String) {
     let str_arg = |key: &str| {
         args.get(key)
             .and_then(Value::as_str)
@@ -113,7 +122,15 @@ fn format_tool_title(name: &str, args: &Value) -> (String, String) {
         "write" => ("Write".to_owned(), str_arg("path")),
         "edit" => ("Edit".to_owned(), str_arg("path")),
         "glob" => ("Glob".to_owned(), str_arg("pattern")),
-        "grep" => ("Search".to_owned(), str_arg("pattern")),
+        "grep" => {
+            let query = str_arg("query");
+            let label = if query.is_empty() {
+                str_arg("pattern")
+            } else {
+                query
+            };
+            ("Search".to_owned(), label)
+        }
         "web_search" => ("Web Search".to_owned(), str_arg("query")),
         "web_fetch" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -129,7 +146,9 @@ fn format_tool_title(name: &str, args: &Value) -> (String, String) {
     }
 }
 
-fn summarize_done(name: &str, output: &str) -> String {
+/// Precomputes the short completion summary badge (`exit 0`, `14 lines`, `5 matches`) for a finished tool.
+#[must_use]
+pub fn summarize_done(name: &str, output: &str) -> String {
     if output.trim().is_empty() {
         return "done".to_owned();
     }
@@ -240,7 +259,15 @@ fn render_bash_body<'a>(args: &'a Value, output: &'a str) -> Element<'a, Message
 
 fn render_edit_diff<'a>(args: &'a Value, output: &'a str) -> Element<'a, Message> {
     let mut col = column![].spacing(3);
-    if let Some(old_str) = args.get("old_string").and_then(Value::as_str) {
+    let old_text = args
+        .get("old_text")
+        .or_else(|| args.get("old_string"))
+        .and_then(Value::as_str);
+    let new_text = args
+        .get("new_text")
+        .or_else(|| args.get("new_string"))
+        .and_then(Value::as_str);
+    if let Some(old_str) = old_text {
         for line in old_str.lines().take(20) {
             col = col.push(
                 text(format!("- {line}"))
@@ -250,7 +277,7 @@ fn render_edit_diff<'a>(args: &'a Value, output: &'a str) -> Element<'a, Message
             );
         }
     }
-    if let Some(new_str) = args.get("new_string").and_then(Value::as_str) {
+    if let Some(new_str) = new_text {
         for line in new_str.lines().take(20) {
             col = col.push(
                 text(format!("+ {line}"))
@@ -260,7 +287,7 @@ fn render_edit_diff<'a>(args: &'a Value, output: &'a str) -> Element<'a, Message
             );
         }
     }
-    if args.get("old_string").is_none() && !output.is_empty() {
+    if old_text.is_none() && new_text.is_none() && !output.is_empty() {
         col = col.push(
             text(truncate_chars(output, 1500))
                 .size(12)
@@ -341,5 +368,31 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
         format!("{head}\n… (truncated)")
     } else {
         head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn humanizes_tool_calls_and_summaries() {
+        let (title, sub) = format_tool_title("edit", &json!({"path": "src/main.rs"}));
+        assert_eq!(title, "Edit");
+        assert_eq!(sub, "src/main.rs");
+
+        let (title, sub) = format_tool_title("bash", &json!({"command": "cargo test -p rein-gui"}));
+        assert_eq!(title, "Run");
+        assert_eq!(sub, "cargo test -p rein-gui");
+
+        assert_eq!(
+            summarize_done("bash", r#"{"status_code":0,"stdout":"ok"}"#),
+            "exit 0"
+        );
+        assert_eq!(
+            summarize_done("bash", r#"{"status_code":101,"stderr":"err"}"#),
+            "exit 101"
+        );
     }
 }

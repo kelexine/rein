@@ -2,6 +2,7 @@
 // Date: 2026-11-23
 // Purpose: Iced Message enum for rein-gui user interactions and background events
 
+use iced::widget::scrollable;
 use rein::agent::ApprovalAction;
 use rein_core::ModeId;
 
@@ -12,7 +13,7 @@ pub enum Message {
     Tick,
     /// Prompt text input changed.
     InputChanged(String),
-    /// Submit the current prompt.
+    /// Submit the current prompt (or steer active turn if busy).
     SubmitPrompt,
     /// Submit a quick-action prompt from the home chips.
     QuickPrompt(String),
@@ -40,6 +41,8 @@ pub enum Message {
     ToggleToolGroup(usize),
     /// Toggle expand/collapse for a long user prompt bubble by index.
     ToggleUserExpand(usize),
+    /// Transcript viewport scrolled by the user.
+    TranscriptScrolled(scrollable::Viewport),
     /// Open the right-hand split inspector pane with full paste/code/output content.
     OpenInspector {
         /// Inspector header title.
@@ -57,8 +60,10 @@ pub enum Message {
     ApprovalFeedbackChanged(String),
     /// Resolve the pending policy approval request.
     ResolveApproval(ApprovalAction),
-    /// Select an option index for the active `ask_question` step.
+    /// Select or toggle an option index for the active `ask_question` step.
     SelectQuestionOption(usize),
+    /// Update custom free-text answer for the active `ask_question` step.
+    QuestionCustomTextChanged(String),
     /// Confirm the current `ask_question` step.
     ConfirmQuestion,
     /// Cancel the `ask_question` modal.

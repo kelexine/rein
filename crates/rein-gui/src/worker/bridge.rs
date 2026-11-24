@@ -15,11 +15,14 @@ use rein_core::{CoreError, EventLog, ModeId};
 
 use super::events::{GuiAgentBridge, WorkerCommand, WorkerEvent};
 
-/// Handle to the background agent thread, cancellation flag, and approval channel.
+type SteerSlot = Arc<Mutex<Option<mpsc::Sender<(String, String)>>>>;
+
+/// Handle to the background agent thread, cancellation flag, steering channel, and approval channel.
 pub struct WorkerHandle {
     cmd_tx: mpsc::Sender<WorkerCommand>,
     ev_rx: Arc<Mutex<mpsc::Receiver<WorkerEvent>>>,
     approval_tx: mpsc::Sender<ApprovalDecision>,
+    steer_slot: SteerSlot,
     cancel_flag: Arc<AtomicBool>,
     wake_flag: Arc<AtomicBool>,
 }
@@ -27,17 +30,18 @@ pub struct WorkerHandle {
 impl WorkerHandle {
     /// Spawns the background agent thread owning `session.agent` and `session.provider`.
     #[must_use]
-    pub fn spawn(mut session: ReinSession) -> (Self, Arc<Mutex<mpsc::Receiver<WorkerEvent>>>) {
+    pub fn spawn(mut session: ReinSession) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
         let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalDecision>();
+        let steer_slot: SteerSlot = Arc::new(Mutex::new(None));
+        let steer_worker = Arc::clone(&steer_slot);
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel_flag);
         let wake_flag = Arc::new(AtomicBool::new(false));
         let wake_worker = Arc::clone(&wake_flag);
         let wake_q = Arc::clone(&wake_flag);
         let ev_rx_shared = Arc::new(Mutex::new(ev_rx));
-        let ev_rx_ret = Arc::clone(&ev_rx_shared);
 
         let (q_tx, q_rx) = mpsc::channel();
         if let Ok(mut guard) = session.question_relay.lock() {
@@ -68,20 +72,24 @@ impl WorkerHandle {
             };
             while let Ok(cmd) = cmd_rx.recv() {
                 cancel_worker.store(false, Ordering::Release);
-                handle_command(cmd, &mut session, &mut bridge, &cancel_worker);
+                handle_command(
+                    cmd,
+                    &mut session,
+                    &mut bridge,
+                    &cancel_worker,
+                    &steer_worker,
+                );
             }
         });
 
-        (
-            Self {
-                cmd_tx,
-                ev_rx: ev_rx_shared,
-                approval_tx,
-                cancel_flag,
-                wake_flag,
-            },
-            ev_rx_ret,
-        )
+        Self {
+            cmd_tx,
+            ev_rx: ev_rx_shared,
+            approval_tx,
+            steer_slot,
+            cancel_flag,
+            wake_flag,
+        }
     }
 
     /// Returns the shared wake flag set whenever the worker emits a UI event.
@@ -93,6 +101,16 @@ impl WorkerHandle {
     /// Sends a [`WorkerCommand`] to the background thread.
     pub fn send(&self, cmd: WorkerCommand) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Queues a mid-turn steering message `(display, prompt)` into the active turn if running.
+    pub fn send_steer(&self, display: String, prompt: String) -> bool {
+        if let Ok(guard) = self.steer_slot.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            return tx.send((display, prompt)).is_ok();
+        }
+        false
     }
 
     /// Sends a policy [`ApprovalDecision`] to the waiting `GuiAgentBridge`.
@@ -123,35 +141,41 @@ fn handle_command(
     session: &mut ReinSession,
     bridge: &mut GuiAgentBridge,
     cancel: &AtomicBool,
+    steer_slot: &SteerSlot,
 ) {
     match cmd {
         WorkerCommand::RunPrompt { prompt } => {
+            let (steer_tx, steer_rx) = mpsc::channel();
+            if let Ok(mut guard) = steer_slot.lock() {
+                *guard = Some(steer_tx);
+            }
+            session.agent.set_steer_receiver(steer_rx);
             let res = session.agent.run_user_prompt_cancellable(
                 &prompt,
                 session.provider.as_mut(),
                 bridge,
                 cancel,
             );
+            session.agent.clear_steer_receiver();
+            if let Ok(mut guard) = steer_slot.lock() {
+                *guard = None;
+            }
             if let Err(err) = res {
                 if matches!(err.downcast_ref::<CoreError>(), Some(CoreError::Cancelled)) {
-                    let _ = bridge
-                        .ev_tx
-                        .send(WorkerEvent::Note("stopped response".to_owned()));
+                    bridge.emit(WorkerEvent::Note("stopped response".to_owned()));
                 } else {
-                    let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
+                    bridge.emit(WorkerEvent::Error(err.to_string()));
                 }
             }
-            let _ = bridge.ev_tx.send(WorkerEvent::TurnFinished);
+            bridge.emit(WorkerEvent::TurnFinished);
         }
         WorkerCommand::SwitchMode(mode) => match session.agent.set_mode(mode) {
             Ok(_) => {
                 let active = session.agent.active_profile().clone();
-                let _ = bridge
-                    .ev_tx
-                    .send(WorkerEvent::ModeSwitched(Box::new(active)));
+                bridge.emit(WorkerEvent::ModeSwitched(Box::new(active)));
             }
             Err(err) => {
-                let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
+                bridge.emit(WorkerEvent::Error(err.to_string()));
             }
         },
         WorkerCommand::FetchModels => {
@@ -161,7 +185,7 @@ fn handle_command(
                     session.provider_kind,
                     &models,
                 );
-                let _ = bridge.ev_tx.send(WorkerEvent::ModelsLoaded(models));
+                bridge.emit(WorkerEvent::ModelsLoaded(models));
             }
         }
         WorkerCommand::SelectModel(model_id) => {
@@ -180,7 +204,7 @@ fn handle_command(
                 session.provider_kind,
                 Some(&model_id),
             );
-            let _ = bridge.ev_tx.send(WorkerEvent::ModelSelected(model_label));
+            bridge.emit(WorkerEvent::ModelSelected(model_label));
         }
         WorkerCommand::Compact => {
             match session
@@ -188,13 +212,13 @@ fn handle_command(
                 .compact_with_provider(None, session.provider.as_mut())
             {
                 Ok(msg) => {
-                    let _ = bridge.ev_tx.send(WorkerEvent::Note(msg));
+                    bridge.emit(WorkerEvent::Note(msg));
                 }
                 Err(err) => {
-                    let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
+                    bridge.emit(WorkerEvent::Error(err.to_string()));
                 }
             }
-            let _ = bridge.ev_tx.send(WorkerEvent::TurnFinished);
+            bridge.emit(WorkerEvent::TurnFinished);
         }
         WorkerCommand::NewSession => {
             let uid = generate_session_uid(&session.loaded.paths);
@@ -206,7 +230,7 @@ fn handle_command(
                 .switch_session(EventLog::new(&log_path), full_path);
             let _ = session.agent.set_mode(ModeId::Coding);
             let active = session.agent.active_profile().clone();
-            let _ = bridge.ev_tx.send(WorkerEvent::SessionReset {
+            bridge.emit(WorkerEvent::SessionReset {
                 session_uid: uid,
                 profile: Box::new(active),
             });
@@ -222,19 +246,19 @@ fn handle_command(
                     match session.agent.hydrate_structured() {
                         Ok(events) => {
                             let active = session.agent.active_profile().clone();
-                            let _ = bridge.ev_tx.send(WorkerEvent::SessionHydrated {
+                            bridge.emit(WorkerEvent::SessionHydrated {
                                 session_uid: summary.uid,
                                 events,
                                 profile: Box::new(active),
                             });
                         }
                         Err(err) => {
-                            let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
+                            bridge.emit(WorkerEvent::Error(err.to_string()));
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = bridge.ev_tx.send(WorkerEvent::Error(err.to_string()));
+                    bridge.emit(WorkerEvent::Error(err.to_string()));
                 }
             }
         }

@@ -73,8 +73,8 @@ fn tick_stream(
                     std::thread::sleep(Duration::from_millis(sleep_ms));
 
                     let has_wake = wake_flag.swap(false, Ordering::AcqRel);
-                    let idle_task_poll =
-                        !is_busy && last_idle_check.elapsed() >= Duration::from_millis(IDLE_TASK_POLL_MS);
+                    let idle_task_poll = !is_busy
+                        && last_idle_check.elapsed() >= Duration::from_millis(IDLE_TASK_POLL_MS);
                     if is_busy || has_wake || idle_task_poll {
                         if idle_task_poll {
                             last_idle_check = Instant::now();

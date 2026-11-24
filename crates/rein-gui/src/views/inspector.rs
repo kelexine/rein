@@ -14,14 +14,15 @@ use crate::theme::styles::{ghost_button, inspector_container};
 
 const MAX_INSPECTOR_LINES: usize = 500;
 
-/// Renders the right-hand split inspector drawer with line-number gutter and syntax highlighting.
+/// Renders the right-hand split inspector drawer with line-number gutter and precomputed syntax spans.
 #[must_use]
 pub fn view_inspector_pane(pane: &InspectorPane) -> Element<'_, Message> {
-    let kind_badge = infer_kind_badge(&pane.title);
     let header = row![
         text("‹").size(16).color(TEXT_MUTED),
         text(&pane.title).size(13).color(TEXT_PRIMARY),
-        text(format!("· {kind_badge}")).size(12).color(TEXT_DIM),
+        text(format!("· {}", pane.kind_badge))
+            .size(12)
+            .color(TEXT_DIM),
         Space::new().width(Length::Fill),
         button(text("Copy").size(12).color(TEXT_MUTED))
             .padding([4, 8])
@@ -38,25 +39,28 @@ pub fn view_inspector_pane(pane: &InspectorPane) -> Element<'_, Message> {
     let meta = text(&pane.subtitle).size(11).color(TEXT_DIM);
 
     let mut lines_col = column![].spacing(2).width(Length::Fill);
-    for (idx, line) in pane.content.lines().take(MAX_INSPECTOR_LINES).enumerate() {
+    for (idx, line_tokens) in pane.highlighted_lines.iter().enumerate() {
         let line_no = format!("{:>4}", idx + 1);
-        let highlighted = highlight_line_spans(line);
+        let spans: Vec<_> = line_tokens
+            .iter()
+            .map(|(tok, color)| span::<(), Font>(tok.as_str()).color(*color))
+            .collect();
         let row_line = row![
-            text(line_no)
-                .size(12)
-                .font(Font::MONOSPACE)
-                .color(TEXT_DIM),
-            rich_text(highlighted).size(12).font(Font::MONOSPACE),
+            text(line_no).size(12).font(Font::MONOSPACE).color(TEXT_DIM),
+            rich_text(spans).size(12).font(Font::MONOSPACE),
         ]
         .spacing(14)
         .align_y(Alignment::Start);
         lines_col = lines_col.push(row_line);
     }
-    if pane.content.lines().count() > MAX_INSPECTOR_LINES {
+    if pane.total_lines > MAX_INSPECTOR_LINES {
         lines_col = lines_col.push(
-            text("… (preview capped at 500 lines; use Copy for full content)")
-                .size(11)
-                .color(TEXT_DIM),
+            text(format!(
+                "… (preview capped at 500 of {} lines; use Copy for full content)",
+                pane.total_lines
+            ))
+            .size(11)
+            .color(TEXT_DIM),
         );
     }
 
@@ -76,6 +80,22 @@ pub fn view_inspector_pane(pane: &InspectorPane) -> Element<'_, Message> {
         .into()
 }
 
+/// Precomputes `(kind_badge, total_lines, highlighted_lines)` once when opening the inspector.
+#[must_use]
+pub fn tokenize_inspector_lines(
+    title: &str,
+    content: &str,
+) -> (&'static str, usize, Vec<Vec<(String, Color)>>) {
+    let kind_badge = infer_kind_badge(title);
+    let total_lines = content.lines().count();
+    let highlighted_lines = content
+        .lines()
+        .take(MAX_INSPECTOR_LINES)
+        .map(highlight_line_tokens)
+        .collect();
+    (kind_badge, total_lines, highlighted_lines)
+}
+
 fn infer_kind_badge(title: &str) -> &'static str {
     let lower = title.to_ascii_lowercase();
     if lower.contains("bash") || lower.ends_with(".sh") {
@@ -93,10 +113,10 @@ fn infer_kind_badge(title: &str) -> &'static str {
     }
 }
 
-fn highlight_line_spans<'a>(line: &'a str) -> Vec<iced::widget::text::Span<'a, (), Font>> {
+fn highlight_line_tokens(line: &str) -> Vec<(String, Color)> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed.starts_with("//") {
-        return vec![span(line).color(SYN_COMMENT)];
+        return vec![(line.to_owned(), SYN_COMMENT)];
     }
 
     let mut out = Vec::new();
@@ -106,56 +126,74 @@ fn highlight_line_spans<'a>(line: &'a str) -> Vec<iced::widget::text::Span<'a, (
 
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'"' || b == b'\'' {
-            if plain_start < i {
-                push_tokenized_plain(&line[plain_start..i], &mut out);
+        let is_word_apostrophe = b == b'\'' && i > 0 && bytes[i - 1].is_ascii_alphabetic();
+        if (b == b'"' || b == b'\'') && !is_word_apostrophe {
+            if plain_start < i
+                && let Some(prefix) = line.get(plain_start..i)
+            {
+                push_tokenized_plain(prefix, &mut out);
             }
             let quote = b;
             let start = i;
             i += 1;
             while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    if let Some(ch) = line.get(i..).and_then(|s| s.chars().next()) {
+                        i += ch.len_utf8();
+                    }
                 } else if bytes[i] == quote {
                     i += 1;
                     break;
+                } else if let Some(ch) = line.get(i..).and_then(|s| s.chars().next()) {
+                    i += ch.len_utf8();
                 } else {
                     i += 1;
                 }
             }
-            out.push(span(&line[start..i]).color(SYN_STRING));
+            if let Some(seg) = line.get(start..i) {
+                out.push((seg.to_owned(), SYN_STRING));
+            }
             plain_start = i;
             continue;
         }
-        i += 1;
+        if let Some(ch) = line.get(i..).and_then(|s| s.chars().next()) {
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
     }
 
-    if plain_start < line.len() {
-        push_tokenized_plain(&line[plain_start..], &mut out);
+    if plain_start < line.len()
+        && let Some(tail) = line.get(plain_start..)
+    {
+        push_tokenized_plain(tail, &mut out);
     }
     if out.is_empty() {
-        out.push(span(" ").color(TEXT_PRIMARY));
+        out.push((" ".to_owned(), TEXT_PRIMARY));
     }
     out
 }
 
-fn push_tokenized_plain<'a>(chunk: &'a str, out: &mut Vec<iced::widget::text::Span<'a, (), Font>>) {
+fn push_tokenized_plain(chunk: &str, out: &mut Vec<(String, Color)>) {
     let mut idx = 0;
-    for part in chunk.split_inclusive(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-        let token = part.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+    for part in chunk.split_inclusive(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+    {
+        let token =
+            part.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
         let sep_len = part.len() - token.len();
         if !token.is_empty() {
             let color = classify_token(token);
-            out.push(span(token).color(color));
+            out.push((token.to_owned(), color));
         }
         if sep_len > 0 {
             let sep = &part[token.len()..];
-            out.push(span(sep).color(TEXT_MUTED));
+            out.push((sep.to_owned(), TEXT_MUTED));
         }
         idx += part.len();
     }
     if idx < chunk.len() {
-        out.push(span(&chunk[idx..]).color(TEXT_PRIMARY));
+        out.push((chunk[idx..].to_owned(), TEXT_PRIMARY));
     }
 }
 
@@ -206,8 +244,12 @@ mod tests {
         assert_eq!(infer_kind_badge("src/main.rs"), "RS");
         assert_eq!(infer_kind_badge("Cargo.toml"), "TOML");
 
-        let comment = highlight_line_spans("  // a comment");
+        let comment = highlight_line_tokens("  // a comment");
         assert_eq!(comment.len(), 1);
+        let unicode_escape = highlight_line_tokens("\"hello \\λ");
+        assert_eq!(unicode_escape.len(), 1);
+        let prose = highlight_line_tokens("don't highlight prose as string");
+        assert!(prose.iter().all(|(_, color)| *color != SYN_STRING));
         assert_eq!(classify_token("readonly"), SYN_KEYWORD);
         assert_eq!(classify_token("--no-db"), SYN_ACCENT);
         assert_eq!(classify_token("120"), SYN_NUMBER);
