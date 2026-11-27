@@ -7,6 +7,8 @@
 
 /// In-process event-sourced agent loop.
 pub mod agent;
+/// Command-line argument parser and non-interactive subcommand suite.
+pub mod cli;
 /// Built-in slash commands and `~/.rein/skills` + `<workspace>/.rein/skills` loader.
 pub mod commands;
 /// Dual-scope (`~/.rein` and `<workspace>/.rein`) config and command allowlist loader.

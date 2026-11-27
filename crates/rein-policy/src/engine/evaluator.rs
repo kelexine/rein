@@ -59,6 +59,11 @@ impl PolicyEngine {
         self.bypass_permissions
     }
 
+    /// Updates explicit permission bypass (`policy-gated` vs `auto-bypass`) at runtime.
+    pub fn set_bypass_permissions(&mut self, bypass: bool) {
+        self.bypass_permissions = bypass;
+    }
+
     /// Swaps the active [`PolicyRuleSet`] when switching profiles between Coding and Personal modes.
     pub fn set_rules(&mut self, rules: PolicyRuleSet) {
         self.rules = rules;
@@ -70,6 +75,11 @@ impl PolicyEngine {
         if !self.rules.allowed_commands.iter().any(|p| p == &pat) {
             self.rules.allowed_commands.push(pat);
         }
+    }
+
+    /// Replaces the active `allowed_commands` slice in the current [`PolicyRuleSet`].
+    pub fn set_allowed_commands(&mut self, commands: Vec<String>) {
+        self.rules.allowed_commands = commands;
     }
 
     /// Returns a reference to the active [`PolicyRuleSet`].

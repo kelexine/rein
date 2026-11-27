@@ -261,6 +261,19 @@ impl AgentLoop {
         self
     }
 
+    /// Updates the merged allowlisted shell commands in-memory and syncs [`PolicyEngine`] + subagent state.
+    pub fn set_allowed_commands(&mut self, commands: Vec<String>) {
+        self.allowed_commands.clone_from(&commands);
+        self.policy.set_allowed_commands(commands);
+        self.sync_subagent_state();
+    }
+
+    /// Updates runtime permission bypass (`policy-gated` vs `auto-bypass`) and syncs subagent state.
+    pub fn set_bypass_permissions(&mut self, bypass: bool) {
+        self.policy.set_bypass_permissions(bypass);
+        self.sync_subagent_state();
+    }
+
     /// Configures extra registered tool names (e.g., MCP tools) enabled across profile switches.
     #[must_use]
     pub fn with_extra_tools(mut self, extra_tools: Vec<String>) -> Self {

@@ -401,14 +401,57 @@ pub fn save_global_settings(config_path: &Path, settings: &UiSettings) -> Result
         ReinConfig::global_starter()
     };
     cfg.settings = settings.clone();
+    save_config_file(config_path, &cfg)
+}
+
+/// Reads a [`ReinConfig`] from `config_path` (returning `Default` if the file does not exist).
+pub fn read_config_file(config_path: &Path) -> Result<ReinConfig> {
+    if !config_path.exists() {
+        return Ok(ReinConfig::default());
+    }
+    read_json_file(config_path)
+}
+
+/// Writes an entire [`ReinConfig`] to `config_path` (`~/.rein/config.json` or `<workspace>/.rein/config.json`).
+pub fn save_config_file(config_path: &Path, config: &ReinConfig) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config dir '{}'", parent.display()))?;
     }
-    let encoded = serde_json::to_string_pretty(&cfg).context("failed to serialize config JSON")?;
+    let encoded =
+        serde_json::to_string_pretty(config).context("failed to serialize config JSON")?;
     std::fs::write(config_path, format!("{encoded}\n"))
         .with_context(|| format!("failed to write config '{}'", config_path.display()))?;
     Ok(())
+}
+
+/// Deletes a saved session's event log, full transcript, and checkpoint log by `uid_or_prefix`.
+pub fn delete_session(paths: &ReinPaths, uid_or_prefix: &str) -> Result<String> {
+    let (summary, found) = resolve_resume_session(paths, Some(uid_or_prefix))?;
+    if !found {
+        anyhow::bail!("no saved session matching '{uid_or_prefix}'");
+    }
+    if summary.event_log.exists() {
+        std::fs::remove_file(&summary.event_log).with_context(|| {
+            format!(
+                "failed to remove session log '{}'",
+                summary.event_log.display()
+            )
+        })?;
+    }
+    if summary.full_transcript.exists() {
+        let _ = std::fs::remove_file(&summary.full_transcript);
+    }
+    let ckpt = paths
+        .sessions_dir
+        .join(format!("{}.checkpoints.jsonl", summary.uid));
+    if ckpt.exists() {
+        let _ = std::fs::remove_file(&ckpt);
+    }
+    if read_latest_session_uid(paths).as_deref() == Some(summary.uid.as_str()) {
+        let _ = std::fs::remove_file(&paths.latest_session);
+    }
+    Ok(summary.uid)
 }
 
 /// Returns top-level keys explicitly present in `<workspace>/.rein/config.json`.
@@ -595,11 +638,7 @@ pub fn append_allowed_command(path: &Path, pattern: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
     }
-    let mut commands: Vec<String> = if path.exists() {
-        read_json_file(path)?
-    } else {
-        Vec::new()
-    };
+    let mut commands = read_command_list(path)?;
     if !commands.iter().any(|existing| existing == trimmed) {
         commands.push(trimmed.to_owned());
         let encoded = serde_json::to_string_pretty(&commands)
@@ -608,6 +647,33 @@ pub fn append_allowed_command(path: &Path, pattern: &str) -> Result<()> {
             .with_context(|| format!("failed to write allowlist '{}'", path.display()))?;
     }
     Ok(())
+}
+
+/// Reads a `commands.json` array file (returning an empty `Vec` if missing).
+pub fn read_command_list(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    read_json_file(path)
+}
+
+/// Removes `pattern` from a `commands.json` JSON array file and returns `true` if removed.
+pub fn remove_allowed_command(path: &Path, pattern: &str) -> Result<bool> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() || !path.exists() {
+        return Ok(false);
+    }
+    let mut commands = read_command_list(path)?;
+    let before = commands.len();
+    commands.retain(|c| c != trimmed);
+    if commands.len() == before {
+        return Ok(false);
+    }
+    let encoded = serde_json::to_string_pretty(&commands)
+        .context("failed to serialize commands allowlist JSON")?;
+    std::fs::write(path, format!("{encoded}\n"))
+        .with_context(|| format!("failed to write allowlist '{}'", path.display()))?;
+    Ok(true)
 }
 
 pub(crate) fn resolve_global_dir() -> Result<PathBuf> {
@@ -673,8 +739,17 @@ mod tests {
 
         append_allowed_command(&initial.paths.repo_commands, "cargo *")?;
         append_allowed_command(&initial.paths.repo_commands, "cargo *")?;
-        let updated: Vec<String> = read_json_file(&initial.paths.repo_commands)?;
+        let updated = read_command_list(&initial.paths.repo_commands)?;
         assert_eq!(updated, vec!["bun", "git", "cargo *"]);
+        assert!(remove_allowed_command(&initial.paths.repo_commands, "bun")?);
+        assert!(!remove_allowed_command(
+            &initial.paths.repo_commands,
+            "nonexistent"
+        )?);
+        assert_eq!(
+            read_command_list(&initial.paths.repo_commands)?,
+            vec!["git", "cargo *"]
+        );
 
         save_provider_selection(
             &initial.paths.global_config,
@@ -733,6 +808,14 @@ mod tests {
         let (pref_res, found_pref) = resolve_resume_session(&loaded.paths, Some(prefix))?;
         assert!(found_pref);
         assert_eq!(pref_res.uid, u1);
+
+        let deleted_uid = delete_session(&loaded.paths, prefix)?;
+        assert_eq!(deleted_uid, u1);
+        assert!(!p1.exists());
+        assert_eq!(read_latest_session_uid(&loaded.paths), None);
+
+        // Recreate p1 for the cross-directory check below.
+        std::fs::write(&p1, format!("{}\n", serde_json::to_string(&ev1)?))?;
 
         assert!(resolve_resume_session(&loaded.paths, Some("deadbeef99")).is_err());
 
