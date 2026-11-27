@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Sleek composer card with floating '+' action popover and model picker
+// Purpose: Material 3 Expressive floating pill composer, Primary Send FAB, and elevated popovers
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length};
@@ -12,13 +12,13 @@ use crate::theme::palette::{
 };
 use crate::theme::styles::{
     composer_card, composer_input, danger_button, disclosure_card, elevated_card, ghost_button,
-    pill_button, primary_button,
+    pill_button, primary_button, tonal_icon_button, tonal_pill_button,
 };
 
-/// Renders the bottom-pinned composer used during active conversations.
+/// Renders the bottom-floating M3 pill composer used during active conversations.
 #[must_use]
 pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
-    let mut inner = column![].spacing(8).max_width(760.0).width(Length::Fill);
+    let mut inner = column![].spacing(10).max_width(780.0).width(Length::Fill);
     if !app.todos.is_empty() {
         inner = inner.push(view_todo_strip(app.todo_title.as_deref(), &app.todos));
     }
@@ -42,6 +42,7 @@ pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
             Space::new().width(Length::Fill),
             text(&app.model_label).size(11).color(TEXT_DIM),
         ]
+        .padding([0, 8])
         .width(Length::Fill),
     );
 
@@ -51,35 +52,31 @@ pub fn view_bottom_composer(app: &GuiApp) -> Element<'_, Message> {
         .padding(iced::Padding {
             top: 6.0,
             right: 24.0,
-            bottom: 12.0,
+            bottom: 14.0,
             left: 24.0,
         })
         .into()
 }
 
-/// Renders the rounded composer card shared by Home and Active views.
+/// Renders the M3 Expressive floating composer card (`28px` radius, Level 3 shadow, Send FAB).
 #[must_use]
 pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<'a, Message> {
     let input = text_input(placeholder, &app.input)
         .on_input(Message::InputChanged)
         .on_submit(Message::SubmitPrompt)
-        .padding([10, 12])
+        .padding([10, 14])
         .size(14)
         .style(composer_input);
 
-    let plus_btn = button(text("+").size(16).color(TEXT_MUTED))
-        .padding([4, 10])
-        .style(ghost_button)
+    let plus_btn = button(text("+").size(16))
+        .padding([6, 12])
+        .style(tonal_icon_button)
         .on_press(Message::TogglePlusMenu);
 
-    let model_btn = button(
-        text(format!("{} ⌄", app.model_label))
-            .size(12)
-            .color(TEXT_MUTED),
-    )
-    .padding([5, 10])
-    .style(ghost_button)
-    .on_press(Message::ToggleModelPicker);
+    let model_btn = button(text(format!("{} ⌄", app.model_label)).size(12))
+        .padding([6, 14])
+        .style(tonal_pill_button)
+        .on_press(Message::ToggleModelPicker);
 
     let mut bottom_row = row![plus_btn, Space::new().width(Length::Fill), model_btn]
         .spacing(8)
@@ -89,20 +86,20 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
         if !app.input.trim().is_empty() {
             bottom_row = bottom_row.push(
                 button(text("↑").size(14))
-                    .padding([6, 12])
+                    .padding([7, 14])
                     .style(primary_button)
                     .on_press(Message::SubmitPrompt),
             );
         }
         bottom_row = bottom_row.push(
-            button(text("■").size(12).color(TEXT_PRIMARY))
-                .padding([6, 12])
+            button(text("■").size(12))
+                .padding([7, 14])
                 .style(danger_button)
                 .on_press(Message::CancelTurn),
         );
     } else {
         let btn = button(text("↑").size(14))
-            .padding([6, 12])
+            .padding([7, 14])
             .style(primary_button);
         let btn = if app.input.trim().is_empty() {
             btn
@@ -112,13 +109,13 @@ pub fn view_composer_card<'a>(app: &'a GuiApp, placeholder: &'a str) -> Element<
         bottom_row = bottom_row.push(btn);
     }
 
-    container(column![input, bottom_row].spacing(6).padding([8, 10]))
+    container(column![input, bottom_row].spacing(6).padding([10, 14]))
         .width(Length::Fill)
         .style(composer_card)
         .into()
 }
 
-/// Renders the floating `+` action popover above the composer.
+/// Renders the M3 elevated `+` action menu sheet above the composer.
 #[must_use]
 pub fn view_plus_menu(app: &GuiApp) -> Element<'_, Message> {
     let active_mode = app.mode();
@@ -131,7 +128,7 @@ pub fn view_plus_menu(app: &GuiApp) -> Element<'_, Message> {
         };
         button(text(format!("{check}Mode: {label}")).size(13).color(color))
             .width(Length::Fill)
-            .padding([6, 10])
+            .padding([7, 12])
             .style(ghost_button)
             .on_press(Message::SwitchMode(mode))
     };
@@ -153,33 +150,33 @@ pub fn view_plus_menu(app: &GuiApp) -> Element<'_, Message> {
         mode_row(ModeId::Personal, "Personal"),
         button(text(tasks_label).size(13).color(TEXT_MUTED))
             .width(Length::Fill)
-            .padding([6, 10])
+            .padding([7, 12])
             .style(ghost_button)
             .on_press(Message::ToggleTaskDrawer),
         button(text("   Compact history").size(13).color(TEXT_MUTED))
             .width(Length::Fill)
-            .padding([6, 10])
+            .padding([7, 12])
             .style(ghost_button)
             .on_press(Message::CompactHistory),
         button(text("   New chat").size(13).color(TEXT_MUTED))
             .width(Length::Fill)
-            .padding([6, 10])
+            .padding([7, 12])
             .style(ghost_button)
             .on_press(Message::NewSession),
     ]
-    .spacing(2);
+    .spacing(3);
 
     container(list)
-        .padding(8)
-        .max_width(240.0)
+        .padding(10)
+        .max_width(250.0)
         .style(elevated_card)
         .into()
 }
 
-/// Renders the model picker popover card.
+/// Renders the M3 elevated model picker sheet.
 #[must_use]
 pub fn view_model_picker(app: &GuiApp) -> Element<'_, Message> {
-    let mut list = column![text("Select Model").size(12).color(TEXT_DIM)].spacing(4);
+    let mut list = column![text("Select Model").size(12).color(TEXT_DIM)].spacing(5);
     if app.available_models.is_empty() {
         list = list.push(text("Fetching models…").size(12).color(TEXT_MUTED));
     } else {
@@ -196,17 +193,21 @@ pub fn view_model_picker(app: &GuiApp) -> Element<'_, Message> {
             };
             let item = button(text(label).size(13).color(color))
                 .width(Length::Fill)
-                .padding([6, 10])
-                .style(pill_button)
+                .padding([7, 14])
+                .style(if is_active {
+                    tonal_pill_button
+                } else {
+                    pill_button
+                })
                 .on_press(Message::SelectModel(m.id.clone()));
             list = list.push(item);
         }
     }
 
     container(scrollable(list).height(Length::Shrink))
-        .padding(10)
-        .max_width(380.0)
-        .max_height(240.0)
+        .padding(12)
+        .max_width(400.0)
+        .max_height(260.0)
         .style(elevated_card)
         .into()
 }
@@ -247,7 +248,7 @@ fn view_todo_strip<'a>(
         );
     }
 
-    container(col.padding([8, 12]))
+    container(col.padding([8, 14]))
         .width(Length::Fill)
         .style(disclosure_card)
         .into()

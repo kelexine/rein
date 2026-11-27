@@ -1,16 +1,18 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Scrollable conversation transcript with grouped tool activity rows, bubbles, and markdown
+// Purpose: M3 Expressive conversation transcript with asymmetric user bubbles and tonal tool pills
 
 use iced::widget::{Space, button, column, container, markdown, row, scrollable, text};
 use iced::{Alignment, Element, Font, Length};
 
 use crate::app::{GuiApp, Message, ToolItemState, TranscriptItem};
 use crate::theme::palette::{
-    ACCENT_CORAL, STATUS_GREEN, STATUS_RED, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
-    rein_markdown_settings,
+    ACCENT_CORAL, ON_PRIMARY_CONTAINER, ON_SECONDARY_CONTAINER, STATUS_GREEN, STATUS_RED,
+    STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, rein_markdown_settings,
 };
-use crate::theme::styles::{disclosure_card, ghost_button, pasted_badge_card, user_bubble};
+use crate::theme::styles::{
+    disclosure_card, ghost_button, pasted_badge_card, tonal_pill_button, user_bubble,
+};
 
 use super::tool_card;
 
@@ -19,7 +21,7 @@ const SPINNER_FRAMES: [&str; 10] = ["✶", "✸", "✹", "✺", "✹", "✸", "�
 /// Renders the scrollable, centered conversation column with consecutive tool grouping.
 #[must_use]
 pub fn view_transcript(app: &GuiApp) -> Element<'_, Message> {
-    let mut col = column![].spacing(16).max_width(760.0).width(Length::Fill);
+    let mut col = column![].spacing(18).max_width(780.0).width(Length::Fill);
 
     let mut idx = 0;
     while idx < app.items.len() {
@@ -46,7 +48,7 @@ pub fn view_transcript(app: &GuiApp) -> Element<'_, Message> {
     let centered = container(col)
         .width(Length::Fill)
         .center_x(Length::Fill)
-        .padding([12, 24]);
+        .padding([14, 24]);
 
     scrollable(centered)
         .id(app.transcript_id.clone())
@@ -94,26 +96,26 @@ fn render_tool_group<'a>(
         row![
             text("●").size(8).color(dot_color),
             text(format!("{summary}  {arrow}"))
-                .size(13)
-                .color(TEXT_MUTED),
+                .size(12)
+                .color(ON_SECONDARY_CONTAINER),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     )
-    .padding([4, 8])
-    .style(ghost_button)
+    .padding([6, 14])
+    .style(tonal_pill_button)
     .on_press(Message::ToggleToolGroup(start_idx));
 
     if !expanded {
         return header.into();
     }
 
-    let mut inner = column![].spacing(4);
+    let mut inner = column![].spacing(6);
     for (offset, item) in slice.iter().enumerate() {
         inner = inner.push(render_item(start_idx + offset, item));
     }
-    column![header, container(inner).padding([0, 12])]
-        .spacing(4)
+    column![header, container(inner).padding([4, 12])]
+        .spacing(6)
         .into()
 }
 
@@ -210,7 +212,7 @@ fn render_item<'a>(idx: usize, item: &'a TranscriptItem) -> Element<'a, Message>
                 .map(|url| Message::LinkClicked(url.to_string()));
             let actions = row![
                 button(text("Copy").size(11).color(TEXT_DIM))
-                    .padding([2, 6])
+                    .padding([3, 10])
                     .style(ghost_button)
                     .on_press(Message::CopyText(raw.clone())),
             ]
@@ -266,11 +268,11 @@ fn render_user_item<'a>(
             text(preview)
                 .size(12)
                 .font(Font::MONOSPACE)
-                .color(TEXT_MUTED),
+                .color(ON_SECONDARY_CONTAINER),
             row![
-                text("PASTED").size(10).color(TEXT_DIM),
+                text("PASTED").size(10).color(TEXT_MUTED),
                 Space::new().width(Length::Fill),
-                text(subtitle).size(10).color(TEXT_DIM),
+                text(subtitle).size(10).color(TEXT_MUTED),
             ]
             .align_y(Alignment::Center),
         ]
@@ -279,7 +281,7 @@ fn render_user_item<'a>(
 
         let badge = button(
             container(card_content)
-                .padding([10, 12])
+                .padding([10, 14])
                 .style(pasted_badge_card),
         )
         .padding(0)
@@ -297,14 +299,16 @@ fn render_user_item<'a>(
 
     let body: Element<'a, Message> = if is_long && !expanded {
         column![
-            text(format!("{preview}…")).size(14).color(TEXT_PRIMARY),
+            text(format!("{preview}…"))
+                .size(14)
+                .color(ON_PRIMARY_CONTAINER),
             row![
-                button(text("Show more").size(12).color(TEXT_MUTED))
-                    .padding([2, 6])
+                button(text("Show more").size(12).color(ACCENT_CORAL))
+                    .padding([3, 8])
                     .style(ghost_button)
                     .on_press(Message::ToggleUserExpand(idx)),
-                button(text("Inspect").size(12).color(TEXT_DIM))
-                    .padding([2, 6])
+                button(text("Inspect").size(12).color(TEXT_MUTED))
+                    .padding([3, 8])
                     .style(ghost_button)
                     .on_press(Message::OpenInspector {
                         title: "User prompt".to_owned(),
@@ -318,20 +322,20 @@ fn render_user_item<'a>(
         .into()
     } else if is_long {
         column![
-            text(raw).size(14).color(TEXT_PRIMARY),
-            button(text("Show less").size(12).color(TEXT_MUTED))
-                .padding([2, 6])
+            text(raw).size(14).color(ON_PRIMARY_CONTAINER),
+            button(text("Show less").size(12).color(ACCENT_CORAL))
+                .padding([3, 8])
                 .style(ghost_button)
                 .on_press(Message::ToggleUserExpand(idx)),
         ]
         .spacing(6)
         .into()
     } else {
-        text(raw).size(14).color(TEXT_PRIMARY).into()
+        text(raw).size(14).color(ON_PRIMARY_CONTAINER).into()
     };
 
     let bubble = container(body)
-        .padding([11, 16])
+        .padding([12, 18])
         .max_width(560.0)
         .style(user_bubble);
     row![Space::new().width(Length::Fill), bubble]
@@ -353,8 +357,8 @@ fn render_thinking_item<'a>(
         format!("Thought for {elapsed_secs}s")
     };
     let arrow = if expanded || active { "⌄" } else { "›" };
-    let header = button(text(format!("{label} {arrow}")).size(13).color(TEXT_MUTED))
-        .padding([3, 6])
+    let header = button(text(format!("{label} {arrow}")).size(12).color(TEXT_MUTED))
+        .padding([4, 10])
         .style(ghost_button)
         .on_press(Message::ToggleExpand(idx));
     if expanded || active {

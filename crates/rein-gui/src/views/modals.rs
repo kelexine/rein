@@ -2,8 +2,8 @@
 // Date: 2026-11-23
 // Purpose: Policy approval prompt, ask_question modal, and background task drawer
 
-use iced::widget::{Space, button, column, container, row, text, text_input};
-use iced::{Alignment, Element, Length};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::{Alignment, Element, Font, Length};
 use rein::agent::ApprovalAction;
 
 use crate::app::{GuiApp, Message};
@@ -11,7 +11,8 @@ use crate::theme::palette::{
     ACCENT_CORAL, STATUS_GREEN, STATUS_RED, STATUS_YELLOW, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY,
 };
 use crate::theme::styles::{
-    composer_input, danger_button, elevated_card, ghost_button, pill_button, primary_button,
+    composer_input, danger_button, disclosure_card, elevated_card, ghost_button, pill_button,
+    primary_button,
 };
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt};
 
@@ -19,25 +20,52 @@ use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt};
 #[must_use]
 pub fn view_approval_banner(pending: &PendingApprovalPrompt) -> Element<'_, Message> {
     let header = row![
+        text("●").size(9).color(ACCENT_CORAL),
         text("Permission required").size(13).color(ACCENT_CORAL),
-        text(&pending.request.excerpt).size(12).color(TEXT_DIM),
+        text(clip_label(&pending.request.excerpt, 64))
+            .size(12)
+            .font(Font::MONOSPACE)
+            .color(TEXT_DIM),
     ]
-    .spacing(10);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    let prompt = text(&pending.request.title).size(13).color(TEXT_PRIMARY);
-    let fb_input = text_input("Optional feedback if denying…", &pending.feedback)
-        .on_input(Message::ApprovalFeedbackChanged)
-        .padding([6, 10])
-        .size(13)
-        .style(composer_input);
+    let prompt_box = container(
+        scrollable(text(&pending.request.title).size(13).color(TEXT_PRIMARY))
+            .height(Length::Shrink),
+    )
+    .max_height(130.0)
+    .width(Length::Fill)
+    .padding([8, 10])
+    .style(disclosure_card);
 
     let pat = &pending.request.pattern;
+    let pattern_line = row![
+        text("Allowlist pattern:").size(11).color(TEXT_DIM),
+        text(clip_label(pat, 72))
+            .size(11)
+            .font(Font::MONOSPACE)
+            .color(TEXT_MUTED),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let fb_box = container(
+        text_input("Optional feedback if denying…", &pending.feedback)
+            .on_input(Message::ApprovalFeedbackChanged)
+            .padding([6, 10])
+            .size(12)
+            .style(composer_input),
+    )
+    .width(Length::Fill)
+    .style(disclosure_card);
+
     let buttons = row![
         button(text("Allow once").size(12))
             .padding([6, 12])
             .style(primary_button)
             .on_press(Message::ResolveApproval(ApprovalAction::AllowOnce)),
-        button(text(format!("Allow in CWD ({pat})")).size(12))
+        button(text("Allow in CWD").size(12))
             .padding([6, 12])
             .style(pill_button)
             .on_press(Message::ResolveApproval(ApprovalAction::AllowCwd(
@@ -49,16 +77,18 @@ pub fn view_approval_banner(pending: &PendingApprovalPrompt) -> Element<'_, Mess
             .on_press(Message::ResolveApproval(ApprovalAction::AllowGlobal(
                 pat.clone()
             ))),
+        Space::new().width(Length::Fill),
         button(text("Deny").size(12))
-            .padding([6, 12])
+            .padding([6, 14])
             .style(danger_button)
             .on_press(Message::ResolveApproval(ApprovalAction::Deny)),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
     let card = container(
-        column![header, prompt, fb_input, buttons]
-            .spacing(8)
+        column![header, prompt_box, pattern_line, fb_box, buttons]
+            .spacing(10)
             .padding(14),
     )
     .max_width(760.0)
@@ -70,6 +100,17 @@ pub fn view_approval_banner(pending: &PendingApprovalPrompt) -> Element<'_, Mess
         .center_x(Length::Fill)
         .padding([6, 24])
         .into()
+}
+
+fn clip_label(raw: &str, max_chars: usize) -> String {
+    let single: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut iter = single.chars();
+    let head: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// Renders the interactive `ask_question` picker banner.

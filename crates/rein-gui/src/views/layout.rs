@@ -1,6 +1,6 @@
 // Author: Onogwu Franklin Kelechi (kelexine) <https://github.com/kelexine>
 // Date: 2026-11-23
-// Purpose: Minimalist top-level Iced view shell (sidebar + topbar + home/transcript + split inspector)
+// Purpose: Material 3 Expressive window shell (Nav Rail / Drawer + Floating Top App Bar + Side Sheet)
 
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length};
@@ -8,14 +8,16 @@ use rein_core::ModeId;
 
 use crate::app::{GuiApp, Message};
 use crate::theme::palette::{ACCENT_BLUE, ACCENT_CORAL, TEXT_DIM, TEXT_MUTED, TEXT_PRIMARY};
-use crate::theme::styles::{canvas_container, ghost_button, pill_button};
+use crate::theme::styles::{
+    canvas_container, floating_app_bar, ghost_button, pill_button, tonal_pill_button,
+};
 
 use super::{composer, home, inspector, modals, sidebar, transcript};
 
-/// Renders the complete Rein GUI window.
+/// Renders the complete Rein GUI window in M3 Expressive layout.
 #[must_use]
 pub fn view(app: &GuiApp) -> Element<'_, Message> {
-    let topbar = render_topbar(app);
+    let topbar = render_floating_topbar(app);
     let body: Element<'_, Message> = if app.items.is_empty() && !app.busy {
         home::view_home(app)
     } else {
@@ -42,11 +44,16 @@ pub fn view(app: &GuiApp) -> Element<'_, Message> {
         center_col = center_col.push(modals::view_question_banner(app, question));
     }
 
-    let mut root = row![].width(Length::Fill).height(Length::Fill);
-    if app.sidebar_open {
-        root = root.push(sidebar::view_sidebar(app));
-    }
-    root = root.push(center_col);
+    let nav = if app.sidebar_open {
+        sidebar::view_sidebar(app)
+    } else {
+        sidebar::view_nav_rail(app)
+    };
+
+    let mut root = row![nav, center_col]
+        .width(Length::Fill)
+        .height(Length::Fill);
+
     if let Some(pane) = &app.inspector {
         root = root.push(inspector::view_inspector_pane(pane));
     }
@@ -58,12 +65,7 @@ pub fn view(app: &GuiApp) -> Element<'_, Message> {
         .into()
 }
 
-fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
-    let sidebar_btn = button(text("◧").size(15).color(TEXT_MUTED))
-        .padding([5, 9])
-        .style(ghost_button)
-        .on_press(Message::ToggleSidebar);
-
+fn render_floating_topbar(app: &GuiApp) -> Element<'_, Message> {
     let session_label = if app.items.is_empty() {
         app.workspace_label.clone()
     } else {
@@ -83,13 +85,13 @@ fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
     let mode_pill = button(
         row![
             text("●").size(8).color(ACCENT_CORAL),
-            text(mode_label).size(12).color(TEXT_MUTED),
+            text(mode_label).size(12),
         ]
         .spacing(6)
         .align_y(Alignment::Center),
     )
-    .padding([4, 10])
-    .style(pill_button)
+    .padding([5, 14])
+    .style(tonal_pill_button)
     .on_press(Message::SwitchMode(next_mode));
 
     let running_tasks = app
@@ -104,18 +106,16 @@ fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
         String::new()
     };
 
-    let mut bar = row![
-        sidebar_btn,
+    let mut pill_row = row![
         text(session_label).size(13).color(TEXT_PRIMARY),
         text(&app.sandbox_label).size(11).color(ACCENT_BLUE),
         Space::new().width(Length::Fill),
     ]
-    .spacing(10)
-    .padding([10, 16])
+    .spacing(12)
     .align_y(Alignment::Center);
 
     if !tok_label.is_empty() {
-        bar = bar.push(text(tok_label).size(11).color(TEXT_DIM));
+        pill_row = pill_row.push(text(tok_label).size(11).color(TEXT_DIM));
     }
     if running_tasks > 0 || app.task_drawer_open {
         let label = if running_tasks > 0 {
@@ -123,12 +123,33 @@ fn render_topbar(app: &GuiApp) -> Element<'_, Message> {
         } else {
             "Tasks".to_owned()
         };
-        bar = bar.push(
+        pill_row = pill_row.push(
             button(text(label).size(12).color(TEXT_MUTED))
-                .padding([4, 9])
-                .style(ghost_button)
+                .padding([4, 12])
+                .style(if app.task_drawer_open {
+                    pill_button
+                } else {
+                    ghost_button
+                })
                 .on_press(Message::ToggleTaskDrawer),
         );
     }
-    bar.push(mode_pill).into()
+    pill_row = pill_row.push(mode_pill);
+
+    let bar_card = container(pill_row)
+        .max_width(820.0)
+        .width(Length::Fill)
+        .padding([8, 18])
+        .style(floating_app_bar);
+
+    container(bar_card)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding(iced::Padding {
+            top: 10.0,
+            right: 24.0,
+            bottom: 4.0,
+            left: 24.0,
+        })
+        .into()
 }
