@@ -48,6 +48,9 @@ pub fn app_subscription(
             {
                 return Some(Message::ToggleSidebar);
             }
+            if modifiers.control() && matches!(key, keyboard::Key::Character(ref c) if c == ",") {
+                return Some(Message::ToggleSettings);
+            }
             if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
                 return Some(Message::CancelTurn);
             }

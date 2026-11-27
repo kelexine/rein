@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use rein::agent::ApprovalDecision;
 use rein::config::{
-    build_provider, generate_session_uid, resolve_resume_session, save_cached_models,
-    save_provider_selection, write_latest_session_uid,
+    ProviderKind, apply_provider_switch, build_provider, generate_session_uid, load_cached_models,
+    resolve_resume_session, save_cached_models, save_config_file, save_provider_selection,
+    write_latest_session_uid,
 };
 use rein::runtime::ReinSession;
-use rein_core::{CoreError, EventLog, ModeId};
+use rein_core::{CoreError, EventLog, ModeId, login_with_browser};
 
 use super::events::{GuiAgentBridge, WorkerCommand, WorkerEvent};
 
@@ -205,6 +206,111 @@ fn handle_command(
                 Some(&model_id),
             );
             bridge.emit(WorkerEvent::ModelSelected(model_label));
+        }
+        WorkerCommand::SwitchProvider(kind) => {
+            apply_provider_switch(&mut session.loaded.config, kind, None);
+            session.provider_kind = kind;
+            let (new_provider, label) = build_provider(kind, &session.loaded.config);
+            session.provider = new_provider;
+            session.model_label = label.clone();
+            let _ = save_provider_selection(
+                &session.loaded.paths.global_config,
+                kind,
+                session.loaded.config.model.as_deref(),
+            );
+            let mut models = load_cached_models(&session.loaded.paths.global_dir, kind);
+            if models.is_empty()
+                && let Ok(live) = session.provider.list_models()
+            {
+                save_cached_models(&session.loaded.paths.global_dir, kind, &live);
+                models = live;
+            }
+            bridge.emit(WorkerEvent::ProviderUpdated {
+                provider_kind: kind,
+                model_label: label,
+                models,
+            });
+        }
+        WorkerCommand::ApplyConfig(new_cfg) => {
+            let kind = new_cfg.resolved_provider();
+            session.loaded.config = *new_cfg;
+            session.provider_kind = kind;
+            let (new_provider, label) = build_provider(kind, &session.loaded.config);
+            session.provider = new_provider;
+            session.model_label = label.clone();
+            let _ = save_config_file(&session.loaded.paths.global_config, &session.loaded.config);
+            let bypass = session.loaded.config.settings.default_permission_mode == "auto-bypass";
+            session.agent.set_bypass_permissions(bypass);
+            let models = load_cached_models(&session.loaded.paths.global_dir, kind);
+            bridge.emit(WorkerEvent::ProviderUpdated {
+                provider_kind: kind,
+                model_label: label,
+                models,
+            });
+        }
+        WorkerCommand::SyncPolicy {
+            allowed_commands,
+            bypass_permissions,
+        } => {
+            session
+                .loaded
+                .allowed_commands
+                .clone_from(&allowed_commands);
+            session.agent.set_allowed_commands(allowed_commands);
+            session.agent.set_bypass_permissions(bypass_permissions);
+        }
+        WorkerCommand::StartOAuthLogin => {
+            let token_path = session
+                .loaded
+                .config
+                .antigravity_token_path
+                .clone()
+                .unwrap_or_else(|| {
+                    session
+                        .loaded
+                        .paths
+                        .global_dir
+                        .join("antigravity-oauth.json")
+                });
+            match login_with_browser(&token_path, |_| {}) {
+                Ok(res) => {
+                    apply_provider_switch(
+                        &mut session.loaded.config,
+                        ProviderKind::Antigravity,
+                        None,
+                    );
+                    session.provider_kind = ProviderKind::Antigravity;
+                    let (new_provider, label) =
+                        build_provider(ProviderKind::Antigravity, &session.loaded.config);
+                    session.provider = new_provider;
+                    session.model_label = label.clone();
+                    let _ = save_provider_selection(
+                        &session.loaded.paths.global_config,
+                        ProviderKind::Antigravity,
+                        None,
+                    );
+                    let models = session.provider.list_models().unwrap_or_default();
+                    if !models.is_empty() {
+                        save_cached_models(
+                            &session.loaded.paths.global_dir,
+                            ProviderKind::Antigravity,
+                            &models,
+                        );
+                    }
+                    let who = res.email.unwrap_or_else(|| "Google account".to_owned());
+                    bridge.emit(WorkerEvent::ProviderUpdated {
+                        provider_kind: ProviderKind::Antigravity,
+                        model_label: label,
+                        models,
+                    });
+                    bridge.emit(WorkerEvent::Note(format!(
+                        "Authenticated Antigravity ({who})"
+                    )));
+                }
+                Err(err) => {
+                    bridge.emit(WorkerEvent::Error(format!("OAuth sign-in failed: {err}")));
+                }
+            }
         }
         WorkerCommand::Compact => {
             match session

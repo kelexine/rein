@@ -9,8 +9,11 @@ use std::time::Instant;
 
 use iced::widget::{Id, markdown};
 use rein::agent::HydratedEvent;
-use rein::config::{ReinPaths, SessionSummary, list_sessions};
+use rein::config::{
+    ProviderKind, ReinConfig, ReinPaths, SessionSummary, list_sessions, read_command_list,
+};
 use rein::modes::Profile;
+use rein::plugins::{DiscoverPluginEntry, InstalledPluginRecord, MarketplaceEntry, PluginManager};
 use rein_core::{AvailableModel, ModeId, ToolCall, ToolOutput, UsageStats};
 use rein_tools::{
     QuestionAnswer, TaskNotification, TaskRegistry, TaskSummary, TodoItem, TodoStore,
@@ -18,6 +21,175 @@ use rein_tools::{
 
 use crate::views::tool_card::{format_tool_title, summarize_done};
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt, WorkerHandle};
+
+/// Categorized tabs in the Material 3 Expressive Desktop Settings view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsCategory {
+    /// Cloud LLM provider, active model, OAuth login, endpoints, and token limits.
+    ProviderAndModels,
+    /// UI and runtime behavior toggles (`UiSettings`).
+    UiAndBehavior,
+    /// Permission policy mode, Landlock status, and workspace/global command allowlists.
+    SecurityAndAllowlists,
+    /// Stdio Model Context Protocol (MCP) servers and Claude-compatible plugins.
+    Integrations,
+    /// AutoDream memory consolidation and Personal mode calendar/maildir paths.
+    MemoryAndPersonal,
+}
+
+impl SettingsCategory {
+    /// All categories in display order.
+    pub const ALL: [Self; 5] = [
+        Self::ProviderAndModels,
+        Self::UiAndBehavior,
+        Self::SecurityAndAllowlists,
+        Self::Integrations,
+        Self::MemoryAndPersonal,
+    ];
+
+    /// Display title for the category rail pill.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ProviderAndModels => "Provider & Models",
+            Self::UiAndBehavior => "UI & Behavior",
+            Self::SecurityAndAllowlists => "Security & Policy",
+            Self::Integrations => "MCP & Plugins",
+            Self::MemoryAndPersonal => "Memory & Personal",
+        }
+    }
+
+    /// Leading icon glyph for the category rail pill.
+    #[must_use]
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::ProviderAndModels => "✦",
+            Self::UiAndBehavior => "⚙",
+            Self::SecurityAndAllowlists => "🛡",
+            Self::Integrations => "◫",
+            Self::MemoryAndPersonal => "◈",
+        }
+    }
+}
+
+/// Form and snapshot state for the M3 Expressive Settings view.
+#[derive(Debug, Clone)]
+pub struct SettingsState {
+    /// Active settings category.
+    pub category: SettingsCategory,
+    /// Draft `max_tokens` text.
+    pub max_tokens_input: String,
+    /// Draft `endpoint` text.
+    pub endpoint_input: String,
+    /// Draft `api_key_env` text.
+    pub api_key_env_input: String,
+    /// Draft `antigravity_base_url` text.
+    pub antigravity_base_url_input: String,
+    /// Draft `antigravity_project_id` text.
+    pub antigravity_project_id_input: String,
+    /// Workspace allowed command patterns (`<sessions_dir>/commands.json`).
+    pub repo_commands: Vec<String>,
+    /// Global allowed command patterns (`~/.rein/commands.json`).
+    pub global_commands: Vec<String>,
+    /// Draft pattern to add to workspace allowlist.
+    pub new_repo_command: String,
+    /// Draft pattern to add to global allowlist.
+    pub new_global_command: String,
+    /// Draft MCP server name.
+    pub mcp_name_input: String,
+    /// Draft MCP server command executable.
+    pub mcp_command_input: String,
+    /// Draft MCP server space-separated arguments.
+    pub mcp_args_input: String,
+    /// Draft plugin marketplace repo or git URL.
+    pub marketplace_input: String,
+    /// Cached registered plugin marketplaces.
+    pub marketplaces: Vec<MarketplaceEntry>,
+    /// Cached installed plugins.
+    pub installed_plugins: Vec<InstalledPluginRecord>,
+    /// Cached discoverable plugins from synced marketplaces.
+    pub discover_plugins: Vec<DiscoverPluginEntry>,
+    /// AutoDream `enabled` toggle.
+    pub dream_enabled: bool,
+    /// Draft AutoDream `min_hours`.
+    pub dream_min_hours_input: String,
+    /// Draft AutoDream `min_sessions`.
+    pub dream_min_sessions_input: String,
+    /// Draft AutoDream `max_turns`.
+    pub dream_max_turns_input: String,
+    /// Draft Personal mode `ics_dir`.
+    pub ics_dir_input: String,
+    /// Draft Personal mode `maildir`.
+    pub maildir_input: String,
+    /// Transient feedback banner shown after saving or updating settings.
+    pub status_notice: Option<String>,
+}
+
+impl SettingsState {
+    /// Initializes [`SettingsState`] from loaded [`ReinConfig`], [`ReinPaths`], and [`PluginManager`].
+    #[must_use]
+    pub fn from_config(cfg: &ReinConfig, paths: &ReinPaths, plugin_mgr: &PluginManager) -> Self {
+        let dream = cfg.dream.clone().unwrap_or_default();
+        let repo_commands = read_command_list(&paths.repo_commands).unwrap_or_default();
+        let global_commands = read_command_list(&paths.global_commands).unwrap_or_default();
+        Self {
+            category: SettingsCategory::ProviderAndModels,
+            max_tokens_input: cfg.max_tokens.map_or_else(String::new, |n| n.to_string()),
+            endpoint_input: cfg.endpoint.clone().unwrap_or_default(),
+            api_key_env_input: cfg
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_owned()),
+            antigravity_base_url_input: cfg.antigravity_base_url.clone().unwrap_or_default(),
+            antigravity_project_id_input: cfg.antigravity_project_id.clone().unwrap_or_default(),
+            repo_commands,
+            global_commands,
+            new_repo_command: String::new(),
+            new_global_command: String::new(),
+            mcp_name_input: String::new(),
+            mcp_command_input: String::new(),
+            mcp_args_input: String::new(),
+            marketplace_input: String::new(),
+            marketplaces: plugin_mgr.list_marketplaces(),
+            installed_plugins: plugin_mgr.installed_plugins(),
+            discover_plugins: plugin_mgr.discover_catalog(None),
+            dream_enabled: dream.enabled,
+            dream_min_hours_input: dream.min_hours.to_string(),
+            dream_min_sessions_input: dream.min_sessions.to_string(),
+            dream_max_turns_input: dream.max_turns.to_string(),
+            ics_dir_input: cfg
+                .ics_dir
+                .as_ref()
+                .map_or_else(String::new, |p| p.display().to_string()),
+            maildir_input: cfg
+                .maildir
+                .as_ref()
+                .map_or_else(String::new, |p| p.display().to_string()),
+            status_notice: None,
+        }
+    }
+
+    /// Reloads allowlist and plugin snapshots from disk.
+    pub fn refresh_disk_snapshots(&mut self, paths: &ReinPaths, plugin_mgr: &PluginManager) {
+        self.repo_commands = read_command_list(&paths.repo_commands).unwrap_or_default();
+        self.global_commands = read_command_list(&paths.global_commands).unwrap_or_default();
+        self.marketplaces = plugin_mgr.list_marketplaces();
+        self.installed_plugins = plugin_mgr.installed_plugins();
+        self.discover_plugins = plugin_mgr.discover_catalog(None);
+    }
+
+    /// Returns the deduplicated union of `global_commands` and `repo_commands`.
+    #[must_use]
+    pub fn merged_allowed_commands(&self) -> Vec<String> {
+        let mut out = self.global_commands.clone();
+        for cmd in &self.repo_commands {
+            if !out.contains(cmd) {
+                out.push(cmd.clone());
+            }
+        }
+        out
+    }
+}
 
 const USER_COLLAPSE_LINES: usize = 6;
 const USER_COLLAPSE_CHARS: usize = 420;
@@ -312,6 +484,16 @@ pub struct GuiApp {
     pub tasks_snapshot: Vec<TaskSummary>,
     /// Greeting user name (`$USER` fallback `kelexine`).
     pub user_name: String,
+    /// Loaded global + repo configuration mirror.
+    pub config: ReinConfig,
+    /// Active provider kind (`Anthropic` or `Antigravity`).
+    pub provider_kind: ProviderKind,
+    /// Plugin and marketplace manager.
+    pub plugin_manager: PluginManager,
+    /// Whether the M3 Expressive Settings view is currently open.
+    pub settings_open: bool,
+    /// Form and category state for the Settings view.
+    pub settings: SettingsState,
 }
 
 impl GuiApp {
@@ -333,6 +515,11 @@ impl GuiApp {
         let cached_models = session.cached_models.clone();
         let task_registry = session.task_registry.clone();
         let todo_store = session.todo_store.clone();
+        let config = session.loaded.config.clone();
+        let provider_kind = session.provider_kind;
+        let plugin_manager = session.plugin_manager.clone();
+        let settings = SettingsState::from_config(&config, &paths, &plugin_manager);
+        let auto_scroll = config.settings.auto_scroll;
         let sessions = list_sessions(&paths)
             .unwrap_or_default()
             .iter()
@@ -367,7 +554,7 @@ impl GuiApp {
             input: String::new(),
             items: Vec::new(),
             transcript_id: Id::unique(),
-            stick_to_bottom: true,
+            stick_to_bottom: auto_scroll,
             inspector: None,
             expanded_tool_groups: HashSet::new(),
             plus_menu_open: false,
@@ -391,6 +578,11 @@ impl GuiApp {
             task_drawer_open: false,
             tasks_snapshot: Vec::new(),
             user_name,
+            config,
+            provider_kind,
+            plugin_manager,
+            settings_open: false,
+            settings,
         };
         for notice in notices {
             app.items.push(TranscriptItem::System(notice));

@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::Result;
 use rein::agent::{ApprovalDecision, ApprovalPrompter, ApprovalRequest};
+use rein::config::{ProviderKind, ReinConfig};
 use rein::modes::Profile;
 use rein_core::{AvailableModel, ModeId, ToolCall, ToolOutput, UsageStats};
 use rein_tools::{QuestionAnswer, QuestionSpec};
@@ -26,6 +27,19 @@ pub enum WorkerCommand {
     FetchModels,
     /// Select a different model ID on the active provider.
     SelectModel(String),
+    /// Switch the active provider (`Anthropic` or `Antigravity`).
+    SwitchProvider(ProviderKind),
+    /// Apply and persist an updated global `ReinConfig` (rebuilding the active provider if needed).
+    ApplyConfig(Box<ReinConfig>),
+    /// Update the active merged allowed command patterns and runtime bypass flag on `AgentLoop`.
+    SyncPolicy {
+        /// Merged global + workspace allowed command patterns.
+        allowed_commands: Vec<String>,
+        /// Whether `default_permission_mode == "auto-bypass"` is active.
+        bypass_permissions: bool,
+    },
+    /// Run interactive Antigravity Google OAuth browser login.
+    StartOAuthLogin,
     /// Compact conversation history.
     Compact,
     /// Clear conversation state for a new session.
@@ -80,6 +94,15 @@ pub enum WorkerEvent {
     ModelsLoaded(Vec<AvailableModel>),
     /// Model switched successfully.
     ModelSelected(String),
+    /// Active provider or configuration updated (`(provider_kind, model_label, cached_models)`).
+    ProviderUpdated {
+        /// Active provider kind.
+        provider_kind: ProviderKind,
+        /// Active `<provider>/<model>` label.
+        model_label: String,
+        /// Cached models for this provider.
+        models: Vec<AvailableModel>,
+    },
     /// Session resumed with hydrated events and active profile.
     SessionHydrated {
         /// Resumed session UID.

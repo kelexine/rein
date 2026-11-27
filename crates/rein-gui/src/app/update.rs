@@ -2,6 +2,7 @@
 // Date: 2026-11-23
 // Purpose: Elm update() logic handling UI messages, worker events, auto-scroll, and inspector actions
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -10,13 +11,17 @@ use iced::clipboard;
 use iced::widget::markdown;
 use iced::widget::operation::{RelativeOffset, snap_to};
 use rein::agent::{ApprovalAction, ApprovalDecision};
+use rein::config::{
+    DreamConfig, append_allowed_command, apply_provider_switch, remove_allowed_command,
+    save_config_file, save_global_settings,
+};
 use rein_core::{ModeId, ToolCall, ToolOutput};
-use rein_tools::{QuestionAnswer, TaskNotification, TaskStatus};
+use rein_tools::{McpServerConfig, QuestionAnswer, TaskNotification, TaskStatus};
 
 use crate::views::tool_card::{format_tool_title, summarize_done};
 use crate::worker::{PendingApprovalPrompt, PendingQuestionPrompt, WorkerCommand, WorkerEvent};
 
-use super::message::Message;
+use super::message::{Message, SettingsMessage};
 use super::state::{
     GuiApp, InspectorPane, ToolItemState, TranscriptItem, collapse_preview, format_size_and_lines,
 };
@@ -88,6 +93,8 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             if app.busy {
                 app.worker.cancel_turn();
                 app.busy_status = "Stopping…".to_owned();
+            } else if app.settings_open {
+                app.settings_open = false;
             } else if app.plus_menu_open {
                 app.plus_menu_open = false;
             } else if app.model_picker_open {
@@ -108,6 +115,7 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
         }
         Message::NewSession => {
             if !app.busy {
+                app.settings_open = false;
                 app.inspector = None;
                 app.worker.send(WorkerCommand::NewSession);
             }
@@ -115,6 +123,7 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
         }
         Message::ResumeSession(uid) => {
             if !app.busy {
+                app.settings_open = false;
                 app.inspector = None;
                 app.worker.send(WorkerCommand::ResumeSession(uid));
             }
@@ -258,6 +267,21 @@ pub fn update(app: &mut GuiApp, message: Message) -> Task<Message> {
             app.tasks_snapshot = app.task_registry.list_tasks();
             Task::none()
         }
+        Message::ToggleSettings => {
+            app.settings_open = !app.settings_open;
+            if app.settings_open {
+                app.plus_menu_open = false;
+                app.model_picker_open = false;
+                app.settings
+                    .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                app.settings.status_notice = None;
+            }
+            Task::none()
+        }
+        Message::Settings(msg) => {
+            handle_settings_message(app, msg);
+            Task::none()
+        }
     }
 }
 
@@ -337,7 +361,23 @@ fn apply_worker_event(app: &mut GuiApp, ev: WorkerEvent) {
             app.question_custom_text.clear();
         }
         WorkerEvent::ModelsLoaded(models) => app.available_models = models,
-        WorkerEvent::ModelSelected(label) => app.model_label = label,
+        WorkerEvent::ModelSelected(label) => {
+            app.model_label.clone_from(&label);
+            if let Some((_, m)) = label.split_once('/') {
+                app.config.model = Some(m.to_owned());
+            }
+        }
+        WorkerEvent::ProviderUpdated {
+            provider_kind,
+            model_label,
+            models,
+        } => {
+            app.provider_kind = provider_kind;
+            app.model_label = model_label;
+            if !models.is_empty() {
+                app.available_models = models;
+            }
+        }
         WorkerEvent::SessionHydrated {
             session_uid,
             events,
@@ -476,7 +516,7 @@ fn push_tool_start(app: &mut GuiApp, call: &ToolCall) {
         state: ToolItemState::Running,
         background_task_id: None,
         output: String::new(),
-        expanded: false,
+        expanded: app.config.settings.verbose_output,
     });
 }
 
@@ -676,9 +716,337 @@ fn try_handle_slash_command(app: &mut GuiApp, input: &str) -> Option<Task<Messag
         "/compact" => Some(update(app, Message::CompactHistory)),
         "/tasks" => Some(update(app, Message::ToggleTaskDrawer)),
         "/model" => Some(update(app, Message::ToggleModelPicker)),
+        "/config" | "/settings" | "/plugins" | "/mcp" => Some(update(app, Message::ToggleSettings)),
         "/coding" | "/mode coding" => Some(update(app, Message::SwitchMode(ModeId::Coding))),
         "/plan" | "/mode plan" => Some(update(app, Message::SwitchMode(ModeId::Plan))),
         "/personal" | "/mode personal" => Some(update(app, Message::SwitchMode(ModeId::Personal))),
         _ => None,
     }
+}
+
+fn handle_settings_message(app: &mut GuiApp, msg: SettingsMessage) {
+    match msg {
+        SettingsMessage::SelectCategory(cat) => {
+            app.settings.category = cat;
+            app.settings.status_notice = None;
+        }
+        SettingsMessage::SelectProvider(kind) => {
+            apply_provider_switch(&mut app.config, kind, None);
+            app.provider_kind = kind;
+            app.worker.send(WorkerCommand::SwitchProvider(kind));
+            app.settings.status_notice =
+                Some(format!("Switched active provider to {}", kind.as_str()));
+        }
+        SettingsMessage::RefreshModels => {
+            app.worker.send(WorkerCommand::FetchModels);
+            app.settings.status_notice = Some("Refreshing model catalog from provider…".to_owned());
+        }
+        SettingsMessage::StartOAuthLogin => {
+            app.worker.send(WorkerCommand::StartOAuthLogin);
+            app.settings.status_notice =
+                Some("Opened Google Sign-In in browser for Antigravity…".to_owned());
+        }
+        SettingsMessage::MaxTokensChanged(v) => app.settings.max_tokens_input = v,
+        SettingsMessage::EndpointChanged(v) => app.settings.endpoint_input = v,
+        SettingsMessage::ApiKeyEnvChanged(v) => app.settings.api_key_env_input = v,
+        SettingsMessage::AntigravityBaseUrlChanged(v) => {
+            app.settings.antigravity_base_url_input = v;
+        }
+        SettingsMessage::AntigravityProjectIdChanged(v) => {
+            app.settings.antigravity_project_id_input = v;
+        }
+        SettingsMessage::SaveProviderConfig => {
+            let max_tok = app.settings.max_tokens_input.trim();
+            app.config.max_tokens = if max_tok.is_empty() {
+                None
+            } else {
+                max_tok.parse::<u32>().ok()
+            };
+            let ep = app.settings.endpoint_input.trim();
+            app.config.endpoint = (!ep.is_empty()).then(|| ep.to_owned());
+            let env_k = app.settings.api_key_env_input.trim();
+            app.config.api_key_env = (!env_k.is_empty()).then(|| env_k.to_owned());
+            let agy_url = app.settings.antigravity_base_url_input.trim();
+            app.config.antigravity_base_url = (!agy_url.is_empty()).then(|| agy_url.to_owned());
+            let agy_proj = app.settings.antigravity_project_id_input.trim();
+            app.config.antigravity_project_id = (!agy_proj.is_empty()).then(|| agy_proj.to_owned());
+            app.worker
+                .send(WorkerCommand::ApplyConfig(Box::new(app.config.clone())));
+            app.settings.status_notice =
+                Some("Saved provider & endpoint settings to ~/.rein/config.json".to_owned());
+        }
+        SettingsMessage::ToggleUiBool(key) => {
+            match key {
+                "thinking_mode" => {
+                    app.config.settings.thinking_mode = !app.config.settings.thinking_mode;
+                }
+                "auto_compact" => {
+                    app.config.settings.auto_compact = !app.config.settings.auto_compact;
+                }
+                "verbose_output" => {
+                    app.config.settings.verbose_output = !app.config.settings.verbose_output;
+                    let expand = app.config.settings.verbose_output;
+                    for item in &mut app.items {
+                        if let TranscriptItem::Tool { expanded, .. } = item {
+                            *expanded = expand;
+                        }
+                    }
+                }
+                "show_turn_duration" => {
+                    app.config.settings.show_turn_duration =
+                        !app.config.settings.show_turn_duration;
+                }
+                "auto_scroll" => {
+                    app.config.settings.auto_scroll = !app.config.settings.auto_scroll;
+                    app.stick_to_bottom = app.config.settings.auto_scroll;
+                }
+                "respect_gitignore_picker" => {
+                    app.config.settings.respect_gitignore_picker =
+                        !app.config.settings.respect_gitignore_picker;
+                }
+                "show_tips" => {
+                    app.config.settings.show_tips = !app.config.settings.show_tips;
+                }
+                _ => {}
+            }
+            let _ = save_global_settings(&app.paths.global_config, &app.config.settings);
+            app.settings.status_notice = Some(format!("Updated '{key}' in ~/.rein/config.json"));
+        }
+        SettingsMessage::CycleUiChoice(key) => {
+            match key {
+                "default_permission_mode" => {
+                    app.config.settings.default_permission_mode =
+                        if app.config.settings.default_permission_mode == "policy-gated" {
+                            "auto-bypass".to_owned()
+                        } else {
+                            "policy-gated".to_owned()
+                        };
+                    let bypass = app.config.settings.default_permission_mode == "auto-bypass";
+                    app.worker.send(WorkerCommand::SyncPolicy {
+                        allowed_commands: app.settings.merged_allowed_commands(),
+                        bypass_permissions: bypass,
+                    });
+                }
+                "editor_mode" => {
+                    app.config.settings.editor_mode = if app.config.settings.editor_mode == "normal"
+                    {
+                        "vi".to_owned()
+                    } else {
+                        "normal".to_owned()
+                    };
+                }
+                "queued_messages" => {
+                    app.config.settings.queued_messages =
+                        if app.config.settings.queued_messages == "queue" {
+                            "send_immediately".to_owned()
+                        } else {
+                            "queue".to_owned()
+                        };
+                }
+                _ => {}
+            }
+            let _ = save_global_settings(&app.paths.global_config, &app.config.settings);
+            app.settings.status_notice = Some(format!("Updated '{key}' in ~/.rein/config.json"));
+        }
+        SettingsMessage::RepoCommandInputChanged(v) => app.settings.new_repo_command = v,
+        SettingsMessage::AddRepoCommand => {
+            let pat = app.settings.new_repo_command.trim().to_owned();
+            if !pat.is_empty() {
+                let _ = append_allowed_command(&app.paths.repo_commands, &pat);
+                app.settings.new_repo_command.clear();
+                app.settings
+                    .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                sync_policy_to_worker(app);
+                app.settings.status_notice = Some(format!("Added '{pat}' to workspace allowlist"));
+            }
+        }
+        SettingsMessage::RemoveRepoCommand(pat) => {
+            let _ = remove_allowed_command(&app.paths.repo_commands, &pat);
+            app.settings
+                .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+            sync_policy_to_worker(app);
+            app.settings.status_notice = Some(format!("Removed '{pat}' from workspace allowlist"));
+        }
+        SettingsMessage::GlobalCommandInputChanged(v) => app.settings.new_global_command = v,
+        SettingsMessage::AddGlobalCommand => {
+            let pat = app.settings.new_global_command.trim().to_owned();
+            if !pat.is_empty() {
+                let _ = append_allowed_command(&app.paths.global_commands, &pat);
+                app.settings.new_global_command.clear();
+                app.settings
+                    .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                sync_policy_to_worker(app);
+                app.settings.status_notice = Some(format!("Added '{pat}' to global allowlist"));
+            }
+        }
+        SettingsMessage::RemoveGlobalCommand(pat) => {
+            let _ = remove_allowed_command(&app.paths.global_commands, &pat);
+            app.settings
+                .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+            sync_policy_to_worker(app);
+            app.settings.status_notice = Some(format!("Removed '{pat}' from global allowlist"));
+        }
+        SettingsMessage::McpNameChanged(v) => app.settings.mcp_name_input = v,
+        SettingsMessage::McpCommandChanged(v) => app.settings.mcp_command_input = v,
+        SettingsMessage::McpArgsChanged(v) => app.settings.mcp_args_input = v,
+        SettingsMessage::AddMcpServer => {
+            let name = app.settings.mcp_name_input.trim().to_owned();
+            let command = app.settings.mcp_command_input.trim().to_owned();
+            if !name.is_empty() && !command.is_empty() {
+                let args: Vec<String> = app
+                    .settings
+                    .mcp_args_input
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+                app.config.mcp_servers.retain(|s| s.name != name);
+                app.config.mcp_servers.push(McpServerConfig {
+                    name: name.clone(),
+                    command,
+                    args,
+                });
+                let _ = save_config_file(&app.paths.global_config, &app.config);
+                app.settings.mcp_name_input.clear();
+                app.settings.mcp_command_input.clear();
+                app.settings.mcp_args_input.clear();
+                app.settings.status_notice =
+                    Some(format!("Added MCP server '{name}' to ~/.rein/config.json"));
+            }
+        }
+        SettingsMessage::RemoveMcpServer(name) => {
+            app.config.mcp_servers.retain(|s| s.name != name);
+            let _ = save_config_file(&app.paths.global_config, &app.config);
+            app.settings.status_notice = Some(format!("Removed MCP server '{name}'"));
+        }
+        SettingsMessage::MarketplaceInputChanged(v) => app.settings.marketplace_input = v,
+        SettingsMessage::AddMarketplace => {
+            let spec = app.settings.marketplace_input.trim().to_owned();
+            if !spec.is_empty() {
+                match app.plugin_manager.add_marketplace(&spec) {
+                    Ok(mp) => {
+                        app.settings.marketplace_input.clear();
+                        app.settings
+                            .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                        app.settings.status_notice =
+                            Some(format!("Registered marketplace '{}'", mp.name));
+                    }
+                    Err(err) => {
+                        app.settings.status_notice = Some(format!("Error: {err}"));
+                    }
+                }
+            }
+        }
+        SettingsMessage::RefreshMarketplaces => {
+            let names: Vec<String> = app
+                .plugin_manager
+                .list_marketplaces()
+                .into_iter()
+                .map(|m| m.name)
+                .collect();
+            let mut total = 0usize;
+            for name in &names {
+                if let Ok(c) = app.plugin_manager.refresh_marketplace(name) {
+                    total += c;
+                }
+            }
+            app.settings
+                .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+            app.settings.status_notice = Some(format!(
+                "Synced {} marketplaces ({total} plugins available)",
+                names.len()
+            ));
+        }
+        SettingsMessage::RemoveMarketplace(name) => {
+            let _ = app.plugin_manager.remove_marketplace(&name);
+            app.settings
+                .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+            app.settings.status_notice = Some(format!("Removed marketplace '{name}'"));
+        }
+        SettingsMessage::InstallPlugin(name) => {
+            if let Some(entry) = app
+                .settings
+                .discover_plugins
+                .iter()
+                .find(|p| p.name == name)
+                .cloned()
+            {
+                match app.plugin_manager.install_plugin(&entry) {
+                    Ok(rec) => {
+                        app.settings
+                            .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                        app.settings.status_notice =
+                            Some(format!("Installed plugin '{}'", rec.name));
+                    }
+                    Err(err) => {
+                        app.settings.status_notice = Some(format!("Install failed: {err}"));
+                    }
+                }
+            }
+        }
+        SettingsMessage::TogglePlugin(name) => {
+            if let Ok(enabled) = app.plugin_manager.toggle_plugin_enabled(&name) {
+                app.settings
+                    .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+                app.settings.status_notice = Some(format!(
+                    "Plugin '{name}' {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ));
+            }
+        }
+        SettingsMessage::UninstallPlugin(name) => {
+            let _ = app.plugin_manager.uninstall_plugin(&name);
+            app.settings
+                .refresh_disk_snapshots(&app.paths, &app.plugin_manager);
+            app.settings.status_notice = Some(format!("Uninstalled plugin '{name}'"));
+        }
+        SettingsMessage::ToggleDreamEnabled => {
+            app.settings.dream_enabled = !app.settings.dream_enabled;
+        }
+        SettingsMessage::DreamMinHoursChanged(v) => app.settings.dream_min_hours_input = v,
+        SettingsMessage::DreamMinSessionsChanged(v) => app.settings.dream_min_sessions_input = v,
+        SettingsMessage::DreamMaxTurnsChanged(v) => app.settings.dream_max_turns_input = v,
+        SettingsMessage::IcsDirChanged(v) => app.settings.ics_dir_input = v,
+        SettingsMessage::MaildirChanged(v) => app.settings.maildir_input = v,
+        SettingsMessage::SaveMemoryAndPersonalConfig => {
+            let min_hours = app
+                .settings
+                .dream_min_hours_input
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(24);
+            let min_sessions = app
+                .settings
+                .dream_min_sessions_input
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(5);
+            let max_turns = app
+                .settings
+                .dream_max_turns_input
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(12);
+            app.config.dream = Some(DreamConfig {
+                enabled: app.settings.dream_enabled,
+                min_hours,
+                min_sessions,
+                max_turns,
+            });
+            let ics = app.settings.ics_dir_input.trim();
+            app.config.ics_dir = (!ics.is_empty()).then(|| PathBuf::from(ics));
+            let mail = app.settings.maildir_input.trim();
+            app.config.maildir = (!mail.is_empty()).then(|| PathBuf::from(mail));
+            let _ = save_config_file(&app.paths.global_config, &app.config);
+            app.settings.status_notice =
+                Some("Saved AutoDream & Personal paths to ~/.rein/config.json".to_owned());
+        }
+    }
+}
+
+fn sync_policy_to_worker(app: &GuiApp) {
+    let bypass = app.config.settings.default_permission_mode == "auto-bypass";
+    app.worker.send(WorkerCommand::SyncPolicy {
+        allowed_commands: app.settings.merged_allowed_commands(),
+        bypass_permissions: bypass,
+    });
 }

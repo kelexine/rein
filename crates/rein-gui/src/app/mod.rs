@@ -9,6 +9,9 @@ pub mod state;
 /// Elm update handler and worker event synchronization.
 pub mod update;
 
-pub use message::Message;
-pub use state::{GuiApp, InspectorPane, ToolItemState, TranscriptItem, format_size_and_lines};
+pub use message::{Message, SettingsMessage};
+pub use state::{
+    GuiApp, InspectorPane, SettingsCategory, SettingsState, SidebarSession, ToolItemState,
+    TranscriptItem, format_size_and_lines,
+};
 pub use update::update;

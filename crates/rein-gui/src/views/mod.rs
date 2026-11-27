@@ -12,6 +12,8 @@ pub mod inspector;
 pub mod layout;
 /// Policy approval modal, `ask_question` picker, and background task drawer.
 pub mod modals;
+/// Material 3 Expressive categorized Settings view.
+pub mod settings;
 /// Collapsible left sidebar with session list and quick actions.
 pub mod sidebar;
 /// Human-readable tool invocation cards (diffs, bash output, file/search results).

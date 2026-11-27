@@ -57,6 +57,19 @@ pub fn view_nav_rail(app: &GuiApp) -> Element<'_, Message> {
         .style(ghost_button)
         .on_press(Message::CompactHistory);
 
+    let settings_btn = button(text("⚙").size(15).color(if app.settings_open {
+        ON_SECONDARY_CONTAINER
+    } else {
+        TEXT_MUTED
+    }))
+    .padding([8, 12])
+    .style(if app.settings_open {
+        active_sidebar_button
+    } else {
+        ghost_button
+    })
+    .on_press(Message::ToggleSettings);
+
     let badge = render_user_monogram(&app.user_name, 32.0);
 
     let inner = column![
@@ -67,6 +80,7 @@ pub fn view_nav_rail(app: &GuiApp) -> Element<'_, Message> {
         mode_btn,
         tasks_btn,
         compact_btn,
+        settings_btn,
         Space::new().height(Length::Fill),
         badge,
     ]
@@ -142,6 +156,18 @@ pub fn view_sidebar(app: &GuiApp) -> Element<'_, Message> {
         ]
         .spacing(2),
         Space::new().width(Length::Fill),
+        button(text("⚙  Settings").size(12).color(if app.settings_open {
+            ON_SECONDARY_CONTAINER
+        } else {
+            TEXT_MUTED
+        }))
+        .padding([5, 10])
+        .style(if app.settings_open {
+            active_sidebar_button
+        } else {
+            ghost_button
+        })
+        .on_press(Message::ToggleSettings),
         text("●").size(8).color(ACCENT_CORAL),
     ]
     .spacing(10)

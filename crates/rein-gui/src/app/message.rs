@@ -4,7 +4,89 @@
 
 use iced::widget::scrollable;
 use rein::agent::ApprovalAction;
+use rein::config::ProviderKind;
 use rein_core::ModeId;
+
+use super::state::SettingsCategory;
+
+/// Settings view user interactions organized by category.
+#[derive(Debug, Clone)]
+pub enum SettingsMessage {
+    /// Switch active settings category tab.
+    SelectCategory(SettingsCategory),
+    /// Switch active provider (`Anthropic` or `Antigravity`).
+    SelectProvider(ProviderKind),
+    /// Trigger live model catalog refresh from active provider.
+    RefreshModels,
+    /// Start Antigravity Google OAuth browser sign-in.
+    StartOAuthLogin,
+    /// Edit `max_tokens` text input.
+    MaxTokensChanged(String),
+    /// Edit `endpoint` text input.
+    EndpointChanged(String),
+    /// Edit `api_key_env` text input.
+    ApiKeyEnvChanged(String),
+    /// Edit `antigravity_base_url` text input.
+    AntigravityBaseUrlChanged(String),
+    /// Edit `antigravity_project_id` text input.
+    AntigravityProjectIdChanged(String),
+    /// Save provider & endpoint fields to `~/.rein/config.json`.
+    SaveProviderConfig,
+    /// Toggle a boolean [`rein::config::UiSettings`] field by key.
+    ToggleUiBool(&'static str),
+    /// Cycle a multi-option [`rein::config::UiSettings`] field (`default_permission_mode`, `editor_mode`, `queued_messages`).
+    CycleUiChoice(&'static str),
+    /// Edit new workspace allowlist pattern draft.
+    RepoCommandInputChanged(String),
+    /// Add draft pattern to workspace allowlist.
+    AddRepoCommand,
+    /// Remove pattern from workspace allowlist.
+    RemoveRepoCommand(String),
+    /// Edit new global allowlist pattern draft.
+    GlobalCommandInputChanged(String),
+    /// Add draft pattern to global allowlist.
+    AddGlobalCommand,
+    /// Remove pattern from global allowlist.
+    RemoveGlobalCommand(String),
+    /// Edit new MCP server name draft.
+    McpNameChanged(String),
+    /// Edit new MCP server command draft.
+    McpCommandChanged(String),
+    /// Edit new MCP server args draft (space-separated).
+    McpArgsChanged(String),
+    /// Add draft stdio MCP server to `~/.rein/config.json`.
+    AddMcpServer,
+    /// Remove stdio MCP server by name.
+    RemoveMcpServer(String),
+    /// Edit new marketplace repo/URL draft.
+    MarketplaceInputChanged(String),
+    /// Register new plugin marketplace.
+    AddMarketplace,
+    /// Sync/refresh all registered plugin marketplaces via `git`.
+    RefreshMarketplaces,
+    /// Remove a registered plugin marketplace.
+    RemoveMarketplace(String),
+    /// Install a plugin by name from catalog.
+    InstallPlugin(String),
+    /// Toggle an installed plugin enabled/disabled.
+    TogglePlugin(String),
+    /// Uninstall an installed plugin.
+    UninstallPlugin(String),
+    /// Toggle AutoDream `dream.enabled`.
+    ToggleDreamEnabled,
+    /// Edit AutoDream `min_hours`.
+    DreamMinHoursChanged(String),
+    /// Edit AutoDream `min_sessions`.
+    DreamMinSessionsChanged(String),
+    /// Edit AutoDream `max_turns`.
+    DreamMaxTurnsChanged(String),
+    /// Edit Personal mode `ics_dir`.
+    IcsDirChanged(String),
+    /// Edit Personal mode `maildir`.
+    MaildirChanged(String),
+    /// Save Memory, AutoDream & Personal paths to `~/.rein/config.json`.
+    SaveMemoryAndPersonalConfig,
+}
 
 /// All UI and background events processed by [`crate::app::update`].
 #[derive(Debug, Clone)]
@@ -74,4 +156,8 @@ pub enum Message {
     ToggleTaskDrawer,
     /// Kill a background task by ID.
     KillBackgroundTask(String),
+    /// Toggle the Material 3 Expressive Settings view (`Ctrl+,` or nav rail button).
+    ToggleSettings,
+    /// Handle an interaction inside the Settings view.
+    Settings(SettingsMessage),
 }

@@ -12,13 +12,15 @@ use crate::theme::styles::{
     canvas_container, floating_app_bar, ghost_button, pill_button, tonal_pill_button,
 };
 
-use super::{composer, home, inspector, modals, sidebar, transcript};
+use super::{composer, home, inspector, modals, settings, sidebar, transcript};
 
 /// Renders the complete Rein GUI window in M3 Expressive layout.
 #[must_use]
 pub fn view(app: &GuiApp) -> Element<'_, Message> {
     let topbar = render_floating_topbar(app);
-    let body: Element<'_, Message> = if app.items.is_empty() && !app.busy {
+    let body: Element<'_, Message> = if app.settings_open {
+        settings::view_settings(app)
+    } else if app.items.is_empty() && !app.busy {
         home::view_home(app)
     } else {
         column![
@@ -135,6 +137,20 @@ fn render_floating_topbar(app: &GuiApp) -> Element<'_, Message> {
         );
     }
     pill_row = pill_row.push(mode_pill);
+    pill_row = pill_row.push(
+        button(text("⚙").size(13).color(if app.settings_open {
+            ACCENT_CORAL
+        } else {
+            TEXT_MUTED
+        }))
+        .padding([4, 10])
+        .style(if app.settings_open {
+            pill_button
+        } else {
+            ghost_button
+        })
+        .on_press(Message::ToggleSettings),
+    );
 
     let bar_card = container(pill_row)
         .max_width(820.0)
